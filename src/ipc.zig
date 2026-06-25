@@ -18,8 +18,11 @@ pub const Tag = enum(u8) {
     Switch = 11,
     Write = 12,
     TaskComplete = 13,
+    SessionEnd = 14,
+    CwdQuery = 15,
+    CwdResponse = 16,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
-    // @enumFromInt, so out-of-range values (14-255) are representable
+    // @enumFromInt, so out-of-range values (17-255) are representable
     // rather than UB. Switches must handle `_` (unknown tag).
     _,
 };
@@ -38,6 +41,61 @@ pub const Header = packed struct {
 pub const Resize = packed struct {
     rows: u16,
     cols: u16,
+};
+
+pub const SessionEndReason = enum(u8) {
+    shell_exit = 1,
+    detached = 2,
+    daemon_died = 3,
+    unknown = 4,
+
+    pub fn statusString(self: SessionEndReason) []const u8 {
+        return switch (self) {
+            .shell_exit => "shell-exit",
+            .detached => "detached",
+            .daemon_died => "daemon-died",
+            .unknown => "unknown",
+        };
+    }
+};
+
+pub const SessionEnd = extern struct {
+    reason: SessionEndReason,
+    code: i32,
+
+    pub fn init(reason: SessionEndReason, code: i32) SessionEnd {
+        var value = std.mem.zeroes(SessionEnd);
+        value.reason = reason;
+        value.code = code;
+        return value;
+    }
+};
+
+pub const CwdResponse = extern struct {
+    path_len: u16,
+    overflow: u8,
+    path: [MAX_CWD_LEN]u8,
+
+    pub fn empty() CwdResponse {
+        return std.mem.zeroes(CwdResponse);
+    }
+
+    pub fn fromPath(value: []const u8) CwdResponse {
+        var response = std.mem.zeroes(CwdResponse);
+        if (value.len > MAX_CWD_LEN) {
+            response.overflow = 1;
+            return response;
+        }
+
+        response.path_len = @intCast(value.len);
+        @memcpy(response.path[0..value.len], value);
+        return response;
+    }
+
+    pub fn pathSlice(self: *const CwdResponse) []const u8 {
+        if (self.overflow != 0) return "";
+        return self.path[0..self.path_len];
+    }
 };
 
 pub fn getTerminalSize(fd: i32) Resize {
@@ -262,12 +320,49 @@ test "Info wire size is frozen" {
 
 test "Tag wire values are frozen" {
     inline for (.{
-        .{ Tag.Input, 0 },  .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
-        .{ Tag.Detach, 3 }, .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
-        .{ Tag.Info, 6 },   .{ Tag.Init, 7 },          .{ Tag.History, 8 },
-        .{ Tag.Run, 9 },    .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
-        .{ Tag.Write, 12 }, .{ Tag.TaskComplete, 13 },
+        .{ Tag.Input, 0 },     .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
+        .{ Tag.Detach, 3 },    .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
+        .{ Tag.Info, 6 },      .{ Tag.Init, 7 },          .{ Tag.History, 8 },
+        .{ Tag.Run, 9 },       .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
+        .{ Tag.Write, 12 },    .{ Tag.TaskComplete, 13 }, .{ Tag.SessionEnd, 14 },
+        .{ Tag.CwdQuery, 15 }, .{ Tag.CwdResponse, 16 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
+}
+
+test "SessionEnd IPC payload round trips" {
+    const alloc = std.testing.allocator;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    const payload = SessionEnd.init(.shell_exit, 0);
+
+    try appendMessage(alloc, &buf, .SessionEnd, std.mem.asBytes(&payload));
+
+    var socket_buf = SocketBuffer{
+        .buf = buf,
+        .alloc = alloc,
+        .head = 0,
+    };
+    buf = .empty;
+    defer socket_buf.deinit();
+
+    const msg = socket_buf.next() orelse return error.MissingSessionEndMessage;
+    try std.testing.expectEqual(Tag.SessionEnd, msg.header.tag);
+    try std.testing.expectEqual(@sizeOf(SessionEnd), msg.payload.len);
+
+    const decoded = std.mem.bytesToValue(SessionEnd, msg.payload[0..@sizeOf(SessionEnd)]);
+    try std.testing.expectEqual(SessionEndReason.shell_exit, decoded.reason);
+    try std.testing.expectEqual(@as(i32, 0), decoded.code);
+}
+
+test "zeroed SessionEnd has no stack garbage in wire bytes" {
+    const payload = SessionEnd.init(.daemon_died, 9);
+    const bytes = std.mem.asBytes(&payload);
+
+    const reason_end = @offsetOf(SessionEnd, "reason") + @sizeOf(SessionEndReason);
+    const code_start = @offsetOf(SessionEnd, "code");
+    for (bytes[reason_end..code_start]) |b| try std.testing.expectEqual(@as(u8, 0), b);
 }
 
 test "zeroed Info has no stack garbage in wire bytes" {

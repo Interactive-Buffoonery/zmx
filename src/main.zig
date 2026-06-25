@@ -8,6 +8,9 @@ const completions = @import("completions.zig");
 const util = @import("util.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
+const status = @import("status.zig");
+const darwin_proc = @import("darwin_proc.zig");
+const cwd_mod = @import("cwd.zig");
 
 pub const version = build_options.version;
 pub const ghostty_version = build_options.ghostty_version;
@@ -35,6 +38,7 @@ var sig_pipe: [2]posix.fd_t = .{ -1, -1 };
 
 // https://github.com/ziglang/zig/blob/738d2be9d6b6ef3ff3559130c05159ef53336224/lib/std/posix.zig#L3505
 const O_NONBLOCK: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
+const CWD_RESPONSE_TIMEOUT_MS: i32 = 500;
 
 const SessionMatch = struct {
     name: []const u8,
@@ -133,6 +137,21 @@ pub fn main() !void {
         const sesh = try socket.getSeshName(alloc, session_name orelse sesh_env);
         defer alloc.free(sesh);
         return history(&cfg, sesh, format);
+    } else if (std.mem.eql(u8, cmd, "cwd")) {
+        const session_name = args.next() orelse "";
+        if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
+            return help();
+        }
+        if (session_name.len == 0) return error.SessionNameRequired;
+
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+        const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
+            error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
+            error.OutOfMemory => return err,
+        };
+        defer alloc.free(socket_path);
+        return cwdCommand(&cfg, sesh, socket_path);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -602,6 +621,11 @@ const Daemon = struct {
         is_daemon: bool,
     };
 
+    const AttachedStatusIdentity = struct {
+        daemon_pid: i32,
+        daemon_created_at: u64,
+    };
+
     pub fn deinit(self: *Daemon) void {
         self.clients.deinit(self.alloc);
         self.pty_write_buf.deinit(self.alloc);
@@ -638,6 +662,42 @@ const Daemon = struct {
             return true;
         }
         return false;
+    }
+
+    fn sendSessionEndToClient(
+        self: *Daemon,
+        client: *Client,
+        reason: ipc.SessionEndReason,
+        code: i32,
+    ) void {
+        const payload = ipc.SessionEnd.init(reason, code);
+        ipc.send(client.socket_fd, .SessionEnd, std.mem.asBytes(&payload)) catch |err| {
+            std.log.warn(
+                "failed to send SessionEnd reason={s} fd={d}: {s}",
+                .{ reason.statusString(), client.socket_fd, @errorName(err) },
+            );
+        };
+        _ = self;
+    }
+
+    fn broadcastSessionEnd(self: *Daemon, reason: ipc.SessionEndReason, code: i32) void {
+        for (self.clients.items) |client| {
+            self.sendSessionEndToClient(client, reason, code);
+        }
+    }
+
+    fn attachedStatusIdentity(self: *Daemon) AttachedStatusIdentity {
+        // Intentional redundant probe for now; failure emits daemon_pid/created_at as 0 so chrome-clear falls back safely.
+        const probe = ipc.probeSession(self.alloc, self.socket_path) catch |err| {
+            std.log.warn("status identity probe failed: {s}", .{@errorName(err)});
+            return .{ .daemon_pid = 0, .daemon_created_at = 0 };
+        };
+        defer posix.close(probe.fd);
+
+        return .{
+            .daemon_pid = darwin_proc.parentPid(probe.info.pid) orelse 0,
+            .daemon_created_at = probe.info.created_at,
+        };
     }
 
     fn setLeader(self: *Daemon, client: *Client) !void {
@@ -736,6 +796,8 @@ const Daemon = struct {
     /// ensureSession "upserts" a session by checking if the unix socket exists already.
     /// If not it creates one and spawns the daemon.
     fn ensureSession(self: *Daemon) !EnsureSessionResult {
+        status.clearEnvForDaemonCreation();
+
         var dir = try std.fs.openDirAbsolute(self.cfg.socket_dir, .{});
         defer dir.close();
 
@@ -743,29 +805,56 @@ const Daemon = struct {
         var should_create = !exists;
 
         if (exists) {
-            if (ipc.connectSession(self.socket_path)) |fd| {
-                posix.close(fd);
-                if (self.command != null) {
+            // A socket FILE existing does not mean a live daemon is behind it.
+            // A just-killed daemon's socket lingers (the kernel hasn't torn down
+            // the listener yet), and connect() can even succeed against it — so
+            // deciding create-vs-attach on connect() alone attaches to a DEAD
+            // daemon during the runtime-respawn window. Decide on a real liveness
+            // HANDSHAKE instead: probeSession does a connect + Info round-trip
+            // with a bounded timeout. A live daemon answers fast; a stale/zombie
+            // socket times out (or connect refuses). ANY probe failure means the
+            // daemon is gone, so clean up and recreate — that way a runtime
+            // daemon-death respawn re-attaches to a FRESH daemon rather than a
+            // dead socket. (Previously only ConnectionRefused recreated; a
+            // connect-succeeds-but-no-response zombie, or any other connect
+            // error, wrongly "proceeded to attach".)
+            // ConnectionRefused is unambiguous death (no listener) -> recreate at
+            // once. A Timeout (socket connects but the daemon doesn't answer Info
+            // in time) is AMBIGUOUS: it's usually a dead zombie socket, but it can
+            // also be a LIVE daemon briefly unresponsive (mid VT-parse of a big
+            // burst, or swapped out under memory pressure). Tearing down a live
+            // daemon would destroy its scrollback + running agent — the exact data
+            // loss the bridge exists to prevent. So retry the probe a few times
+            // before condemning: a slow-but-live daemon answers on a later attempt;
+            // a true zombie keeps timing out (and usually decays to
+            // ConnectionRefused) and is then recreated.
+            const max_probe_attempts: u8 = 3;
+            var probe_attempt: u8 = 0;
+            while (true) {
+                if (ipc.probeSession(self.alloc, self.socket_path)) |probe| {
+                    posix.close(probe.fd);
+                    if (self.command != null) {
+                        std.log.warn(
+                            "session already exists, ignoring command session={s}",
+                            .{self.session_name},
+                        );
+                    }
+                    break;
+                } else |err| {
+                    const ambiguous = err != error.ConnectionRefused;
+                    probe_attempt += 1;
+                    if (ambiguous and probe_attempt < max_probe_attempts) {
+                        std.Thread.sleep(150 * std.time.ns_per_ms);
+                        continue;
+                    }
                     std.log.warn(
-                        "session already exists, ignoring command session={s}",
-                        .{self.session_name},
+                        "session probe failed ({s}, attempts={d}), recreating session={s}",
+                        .{ @errorName(err), probe_attempt, self.session_name },
                     );
-                }
-            } else |err| switch (err) {
-                // Daemon is definitively gone: safe to replace.
-                error.ConnectionRefused => {
                     socket.cleanupStaleSocket(dir, self.session_name);
                     should_create = true;
-                },
-                // Connect failed for an unusual reason. The check is only to
-                // decide create-vs-attach; the socket file exists, so proceed
-                // to attach rather than fail or orphan.
-                else => {
-                    std.log.warn(
-                        "connect failed ({s}), proceeding to attach session={s}",
-                        .{ @errorName(err), self.session_name },
-                    );
-                },
+                    break;
+                }
             }
         }
 
@@ -1031,12 +1120,14 @@ const Daemon = struct {
 
     pub fn handleDetach(self: *Daemon, client: *Client, i: usize) void {
         std.log.info("client detach session={s} fd={d}", .{ self.session_name, client.socket_fd });
+        self.sendSessionEndToClient(client, .detached, 0);
         _ = self.closeClient(client, i, false);
     }
 
     pub fn handleDetachAll(self: *Daemon) void {
         std.log.info("detach all clients={d}", .{self.clients.items.len});
         for (self.clients.items) |client_to_close| {
+            self.sendSessionEndToClient(client_to_close, .detached, 0);
             client_to_close.deinit();
             self.alloc.destroy(client_to_close);
         }
@@ -1126,6 +1217,19 @@ const Daemon = struct {
             try ipc.appendMessage(self.alloc, &client.write_buf, .History, "");
             client.has_pending_output = true;
         }
+    }
+
+    pub fn handleCwd(self: *Daemon, client: *Client) !void {
+        const resolved = cwd_mod.cwdForPid(self.alloc, self.pid) catch null;
+        defer if (resolved) |path| self.alloc.free(path);
+
+        const response = if (resolved) |path|
+            ipc.CwdResponse.fromPath(path)
+        else
+            ipc.CwdResponse.empty();
+
+        try ipc.appendMessage(self.alloc, &client.write_buf, .CwdResponse, std.mem.asBytes(&response));
+        client.has_pending_output = true;
     }
 
     pub fn handleRun(self: *Daemon, client: *Client, payload: []const u8) !void {
@@ -1260,6 +1364,7 @@ fn help() !void {
         \\  [l]ist|ls [--short]                      List active sessions
         \\  [k]ill <name>... [--force]               Kill session and all attached clients
         \\  [hi]story <name> [--vt|--html]           Output session scrollback
+        \\  cwd <name>                               Print session root shell cwd
         \\  [w]ait <name>...                         Wait for session tasks to complete
         \\  [t]ail <name>...                         Follow session output
         \\  [c]ompletions <shell>                    Shell completions (bash, zsh, fish, nu)
@@ -1919,6 +2024,189 @@ fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !voi
     }
 }
 
+fn cwdCommand(cfg: *Cfg, session_name: []const u8, socket_path: []const u8) !void {
+    const alloc = std.heap.c_allocator;
+    var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+    defer dir.close();
+
+    const exists = try socket.sessionExists(dir, session_name);
+    if (!exists) {
+        std.process.exit(1);
+    }
+
+    const fd = ipc.connectSession(socket_path) catch |err| {
+        if (err == error.ConnectionRefused) socket.cleanupStaleSocket(dir, session_name);
+        std.process.exit(1);
+    };
+    defer posix.close(fd);
+
+    ipc.send(fd, .CwdQuery, "") catch |err| switch (err) {
+        error.BrokenPipe, error.ConnectionResetByPeer => std.process.exit(1),
+        else => return err,
+    };
+
+    const response = readCwdResponseWithDeadline(alloc, fd, CWD_RESPONSE_TIMEOUT_MS) catch |err| switch (err) {
+        error.CwdResponseTimeout => std.process.exit(2),
+        error.CwdResponseProtocolMismatch, error.ConnectionClosed => std.process.exit(1),
+        else => return err,
+    };
+    const path = response.pathSlice();
+    if (path.len > 0) {
+        var stdout_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+        try stdout_writer.interface.print("{s}\n", .{path});
+        try stdout_writer.interface.flush();
+    }
+}
+
+fn readCwdResponseWithDeadline(
+    alloc: std.mem.Allocator,
+    fd: posix.fd_t,
+    timeout_ms: i32,
+) !ipc.CwdResponse {
+    var sb = try ipc.SocketBuffer.init(alloc);
+    defer sb.deinit();
+
+    const deadline_ms = std.time.milliTimestamp() + @as(i64, timeout_ms);
+
+    while (true) {
+        while (sb.next()) |msg| {
+            if (msg.header.tag != .CwdResponse) continue;
+            if (msg.payload.len != @sizeOf(ipc.CwdResponse)) return error.CwdResponseProtocolMismatch;
+
+            return std.mem.bytesToValue(
+                ipc.CwdResponse,
+                msg.payload[0..@sizeOf(ipc.CwdResponse)],
+            );
+        }
+
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms >= deadline_ms) return error.CwdResponseTimeout;
+        const remaining_ms = deadline_ms - now_ms;
+        const poll_timeout: i32 = if (remaining_ms > std.math.maxInt(i32))
+            std.math.maxInt(i32)
+        else
+            @intCast(remaining_ms);
+
+        var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        const poll_result = try posix.poll(&poll_fds, poll_timeout);
+        if (poll_result == 0) return error.CwdResponseTimeout;
+
+        const revents = poll_fds[0].revents;
+        if (revents & posix.POLL.IN != 0) {
+            const n = sb.read(fd) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            if (n == 0) return error.ConnectionClosed;
+            continue;
+        }
+
+        if (revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+            return error.ConnectionClosed;
+        }
+    }
+}
+
+fn writeSplitCwdTestStream(fd: posix.fd_t, first: []const u8, second: []const u8) void {
+    defer posix.close(fd);
+    writeAllForCwdTest(fd, first) catch unreachable;
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    writeAllForCwdTest(fd, second) catch unreachable;
+}
+
+fn writeAllForCwdTest(fd: posix.fd_t, bytes: []const u8) !void {
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const n = try posix.write(fd, bytes[index..]);
+        if (n == 0) return error.ShortWrite;
+        index += n;
+    }
+}
+
+test "ensureSession clears status env before a run-style creation path" {
+    const alloc = std.testing.allocator;
+
+    _ = cross.c.setenv("AMX_STATUS_FILE", "/tmp/x", 1);
+    _ = cross.c.setenv("AMX_STATUS_TOKEN", "tok", 1);
+    defer {
+        _ = cross.c.unsetenv("AMX_STATUS_FILE");
+        _ = cross.c.unsetenv("AMX_STATUS_TOKEN");
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(tmp_path);
+    const missing_socket_dir = try std.fs.path.join(alloc, &.{ tmp_path, "missing" });
+    defer alloc.free(missing_socket_dir);
+    const socket_path = try std.fs.path.join(alloc, &.{ missing_socket_dir, "run-style" });
+
+    const clients = try std.ArrayList(*Client).initCapacity(alloc, 0);
+    var cfg = Cfg{
+        .socket_dir = missing_socket_dir,
+        .log_dir = missing_socket_dir,
+    };
+    var daemon = Daemon{
+        .running = true,
+        .cfg = &cfg,
+        .alloc = alloc,
+        .clients = clients,
+        .session_name = "run-style",
+        .socket_path = socket_path,
+        .pid = undefined,
+        .created_at = 0,
+        .is_task_mode = true,
+        .leader_client_fd = null,
+    };
+    defer daemon.deinit();
+
+    try std.testing.expectError(error.FileNotFound, daemon.ensureSession());
+    try std.testing.expect(cross.c.getenv("AMX_STATUS_FILE") == null);
+    try std.testing.expect(cross.c.getenv("AMX_STATUS_TOKEN") == null);
+}
+
+test "cwd response reader drains interleaved output and split response until deadline" {
+    const alloc = std.testing.allocator;
+
+    const pipe_fds = try posix.pipe2(.{ .CLOEXEC = true });
+    defer posix.close(pipe_fds[0]);
+
+    const expected_path = "/tmp/awesomux-cwd";
+    var response = ipc.CwdResponse.fromPath(expected_path);
+
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(alloc);
+    try ipc.appendMessage(alloc, &stream, .Output, "ignored terminal bytes");
+    try ipc.appendMessage(alloc, &stream, .CwdResponse, std.mem.asBytes(&response));
+
+    const split_at = stream.items.len - 3;
+    const writer = try std.Thread.spawn(
+        .{},
+        writeSplitCwdTestStream,
+        .{ pipe_fds[1], stream.items[0..split_at], stream.items[split_at..] },
+    );
+    defer writer.join();
+
+    const actual = try readCwdResponseWithDeadline(alloc, pipe_fds[0], 1000);
+
+    try std.testing.expectEqualStrings(expected_path, actual.pathSlice());
+}
+
+test "cwd response reader uses one overall deadline" {
+    const alloc = std.testing.allocator;
+
+    const pipe_fds = try posix.pipe2(.{ .CLOEXEC = true });
+    defer posix.close(pipe_fds[0]);
+    defer posix.close(pipe_fds[1]);
+
+    try std.testing.expectError(
+        error.CwdResponseTimeout,
+        readCwdResponseWithDeadline(alloc, pipe_fds[0], 20),
+    );
+}
+
 fn switchSesh(daemon: *Daemon, current_sesh: []const u8) !void {
     // we want daemon.session_name because that's the session name the user provided during zmx attach
     // instead of the name of the session they are currently inside of.
@@ -1960,8 +2248,24 @@ fn attach(daemon: *Daemon) !void {
         return switchSesh(daemon, sesh);
     }
 
+    const status_cfg = try status.StatusConfig.takeFromEnv(daemon.alloc);
+    defer status_cfg.deinit(daemon.alloc);
+
     const result = try daemon.ensureSession();
     if (result.is_daemon) return;
+
+    const identity = daemon.attachedStatusIdentity();
+    status.StatusFile.emitAttached(
+        daemon.alloc,
+        status_cfg,
+        result.created,
+        identity.daemon_pid,
+        identity.daemon_created_at,
+        daemon.session_name,
+        @intCast(std.time.timestamp()),
+    ) catch |err| {
+        std.log.warn("failed to emit attached status: {s}", .{@errorName(err)});
+    };
 
     const client_sock = try socket.sessionConnect(daemon.socket_path);
     std.log.info("attached session={s}", .{daemon.session_name});
@@ -2011,7 +2315,7 @@ fn attach(daemon: *Daemon) !void {
     const clear_seq = "\x1b[2J\x1b[H";
     _ = try posix.write(posix.STDOUT_FILENO, clear_seq);
 
-    const looper = try clientLoop(client_sock);
+    const looper = try clientLoop(client_sock, status_cfg, daemon.session_name);
     switch (looper.kind) {
         .detach => return,
         .switch_session => {
@@ -2303,7 +2607,7 @@ const ClientResult = struct {
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
-fn clientLoop(client_sock_fd: i32) !ClientResult {
+fn clientLoop(client_sock_fd: i32, status_cfg: status.StatusConfig, session_name: []const u8) !ClientResult {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
     const alloc = std.heap.c_allocator;
     defer posix.close(client_sock_fd);
@@ -2334,6 +2638,31 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
     defer stdout_buf.deinit(alloc);
 
     const stdin_fd = posix.STDIN_FILENO;
+    var saw_session_end = false;
+
+    const emitSessionEnd = struct {
+        fn call(
+            alloc_inner: std.mem.Allocator,
+            cfg: status.StatusConfig,
+            session: []const u8,
+            reason: ipc.SessionEndReason,
+            code: i32,
+            emitted: *bool,
+        ) void {
+            if (emitted.*) return;
+            status.StatusFile.emitSessionEnd(
+                alloc_inner,
+                cfg,
+                reason.statusString(),
+                code,
+                session,
+                @intCast(std.time.timestamp()),
+            ) catch |err| {
+                std.log.warn("failed to emit session-end status: {s}", .{@errorName(err)});
+            };
+            emitted.* = true;
+        }
+    }.call;
 
     // Make stdin non-blocking. O_NONBLOCK is set on the open file description,
     // which is shared with the parent shell; restore on exit to avoid
@@ -2409,6 +2738,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
             const n = read_buf.read(client_sock_fd) catch |err| {
                 if (err == error.WouldBlock) continue;
                 if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
+                    emitSessionEnd(alloc, status_cfg, session_name, .unknown, 0, &saw_session_end);
                     return ClientResult{ .kind = .detach, .session_name = null };
                 }
                 std.log.err("daemon read err={s}", .{@errorName(err)});
@@ -2416,6 +2746,10 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
             };
             if (n == 0) {
                 // Server closed connection
+                // A SIGKILL'd daemon cannot deliver SessionEnd; it is gone before
+                // it can write. Raw EOF/HUP without a prior SessionEnd is therefore
+                // deliberately reported as "unknown", not "daemon-died".
+                emitSessionEnd(alloc, status_cfg, session_name, .unknown, 0, &saw_session_end);
                 return ClientResult{ .kind = .detach, .session_name = null };
             }
 
@@ -2440,6 +2774,18 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
                     .Switch => {
                         return ClientResult{ .kind = .switch_session, .session_name = try alloc.dupe(u8, msg.payload) };
                     },
+                    .SessionEnd => {
+                        if (msg.payload.len == @sizeOf(ipc.SessionEnd)) {
+                            const end = std.mem.bytesToValue(
+                                ipc.SessionEnd,
+                                msg.payload[0..@sizeOf(ipc.SessionEnd)],
+                            );
+                            emitSessionEnd(alloc, status_cfg, session_name, end.reason, end.code, &saw_session_end);
+                        } else {
+                            emitSessionEnd(alloc, status_cfg, session_name, .unknown, 0, &saw_session_end);
+                        }
+                        return ClientResult{ .kind = .detach, .session_name = null };
+                    },
                     else => {},
                 }
             }
@@ -2451,6 +2797,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
                 const n = posix.write(client_sock_fd, sock_write_buf.items) catch |err| blk: {
                     if (err == error.WouldBlock) break :blk 0;
                     if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
+                        emitSessionEnd(alloc, status_cfg, session_name, .unknown, 0, &saw_session_end);
                         return ClientResult{ .kind = .detach, .session_name = null };
                     }
                     return err;
@@ -2472,6 +2819,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
         }
 
         if (poll_fds.items[1].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+            emitSessionEnd(alloc, status_cfg, session_name, .unknown, 0, &saw_session_end);
             return ClientResult{ .kind = .detach, .session_name = null };
         }
     }
@@ -2538,6 +2886,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 "SIGTERM received, shutting down gracefully session={s}",
                 .{daemon.session_name},
             );
+            daemon.broadcastSessionEnd(.daemon_died, 0);
             break :daemon_loop;
         }
 
@@ -2586,6 +2935,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 if (n == 0) {
                     // EOF: Shell exited
                     std.log.info("shell exited pty_fd={d}", .{pty_fd});
+                    daemon.broadcastSessionEnd(.shell_exit, 0);
                     break :daemon_loop;
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
@@ -2704,12 +3054,14 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                             break :clients_loop;
                         },
                         .Kill => {
+                            daemon.broadcastSessionEnd(.daemon_died, 0);
                             break :daemon_loop;
                         },
                         .Info => try daemon.handleInfo(client),
                         .History => try daemon.handleHistory(client, &term, msg.payload),
+                        .CwdQuery => try daemon.handleCwd(client),
                         .Run => try daemon.handleRun(client, msg.payload),
-                        .Ack, .TaskComplete => {},
+                        .Ack, .TaskComplete, .SessionEnd, .CwdResponse => {},
                         .Write => try daemon.handleWrite(client, msg.payload),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
