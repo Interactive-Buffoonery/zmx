@@ -8,6 +8,9 @@ const completions = @import("completions.zig");
 const util = @import("util.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
+const status = @import("status.zig");
+const darwin_proc = @import("darwin_proc.zig");
+const cwd_mod = @import("cwd.zig");
 
 pub const version = build_options.version;
 pub const ghostty_version = build_options.ghostty_version;
@@ -133,6 +136,21 @@ pub fn main() !void {
         const sesh = try socket.getSeshName(alloc, session_name orelse sesh_env);
         defer alloc.free(sesh);
         return history(&cfg, sesh, format);
+    } else if (std.mem.eql(u8, cmd, "cwd")) {
+        const session_name = args.next() orelse "";
+        if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
+            return help();
+        }
+        if (session_name.len == 0) return error.SessionNameRequired;
+
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+        const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
+            error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
+            error.OutOfMemory => return err,
+        };
+        defer alloc.free(socket_path);
+        return cwdCommand(&cfg, sesh, socket_path);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -602,6 +620,11 @@ const Daemon = struct {
         is_daemon: bool,
     };
 
+    const AttachedStatusIdentity = struct {
+        daemon_pid: i32,
+        daemon_created_at: u64,
+    };
+
     pub fn deinit(self: *Daemon) void {
         self.clients.deinit(self.alloc);
         self.pty_write_buf.deinit(self.alloc);
@@ -638,6 +661,44 @@ const Daemon = struct {
             return true;
         }
         return false;
+    }
+
+    fn sendSessionEndToClient(
+        self: *Daemon,
+        client: *Client,
+        reason: ipc.SessionEndReason,
+        code: i32,
+    ) void {
+        const payload = ipc.SessionEnd{
+            .reason = reason,
+            .code = code,
+        };
+        ipc.send(client.socket_fd, .SessionEnd, std.mem.asBytes(&payload)) catch |err| {
+            std.log.warn(
+                "failed to send SessionEnd reason={s} fd={d}: {s}",
+                .{ reason.statusString(), client.socket_fd, @errorName(err) },
+            );
+        };
+        _ = self;
+    }
+
+    fn broadcastSessionEnd(self: *Daemon, reason: ipc.SessionEndReason, code: i32) void {
+        for (self.clients.items) |client| {
+            self.sendSessionEndToClient(client, reason, code);
+        }
+    }
+
+    fn attachedStatusIdentity(self: *Daemon) ?AttachedStatusIdentity {
+        const probe = ipc.probeSession(self.alloc, self.socket_path) catch |err| {
+            std.log.warn("status identity probe failed: {s}", .{@errorName(err)});
+            return null;
+        };
+        defer posix.close(probe.fd);
+
+        return .{
+            .daemon_pid = darwin_proc.parentPid(probe.info.pid) orelse 0,
+            .daemon_created_at = probe.info.created_at,
+        };
     }
 
     fn setLeader(self: *Daemon, client: *Client) !void {
@@ -1031,12 +1092,14 @@ const Daemon = struct {
 
     pub fn handleDetach(self: *Daemon, client: *Client, i: usize) void {
         std.log.info("client detach session={s} fd={d}", .{ self.session_name, client.socket_fd });
+        self.sendSessionEndToClient(client, .detached, 0);
         _ = self.closeClient(client, i, false);
     }
 
     pub fn handleDetachAll(self: *Daemon) void {
         std.log.info("detach all clients={d}", .{self.clients.items.len});
         for (self.clients.items) |client_to_close| {
+            self.sendSessionEndToClient(client_to_close, .detached, 0);
             client_to_close.deinit();
             self.alloc.destroy(client_to_close);
         }
@@ -1126,6 +1189,19 @@ const Daemon = struct {
             try ipc.appendMessage(self.alloc, &client.write_buf, .History, "");
             client.has_pending_output = true;
         }
+    }
+
+    pub fn handleCwd(self: *Daemon, client: *Client) !void {
+        const resolved = cwd_mod.cwdForPid(self.alloc, self.pid) catch null;
+        defer if (resolved) |path| self.alloc.free(path);
+
+        const response = if (resolved) |path|
+            ipc.CwdResponse.fromPath(path)
+        else
+            ipc.CwdResponse.empty();
+
+        try ipc.appendMessage(self.alloc, &client.write_buf, .CwdResponse, std.mem.asBytes(&response));
+        client.has_pending_output = true;
     }
 
     pub fn handleRun(self: *Daemon, client: *Client, payload: []const u8) !void {
@@ -1260,6 +1336,7 @@ fn help() !void {
         \\  [l]ist|ls [--short]                      List active sessions
         \\  [k]ill <name>... [--force]               Kill session and all attached clients
         \\  [hi]story <name> [--vt|--html]           Output session scrollback
+        \\  cwd <name>                               Print session root shell cwd
         \\  [w]ait <name>...                         Wait for session tasks to complete
         \\  [t]ail <name>...                         Follow session output
         \\  [c]ompletions <shell>                    Shell completions (bash, zsh, fish, nu)
@@ -1919,6 +1996,60 @@ fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !voi
     }
 }
 
+fn cwdCommand(cfg: *Cfg, session_name: []const u8, socket_path: []const u8) !void {
+    const alloc = std.heap.c_allocator;
+    var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+    defer dir.close();
+
+    const exists = try socket.sessionExists(dir, session_name);
+    if (!exists) {
+        std.process.exit(1);
+    }
+
+    const fd = ipc.connectSession(socket_path) catch |err| {
+        if (err == error.ConnectionRefused) socket.cleanupStaleSocket(dir, session_name);
+        std.process.exit(1);
+    };
+    defer posix.close(fd);
+
+    ipc.send(fd, .CwdQuery, "") catch |err| switch (err) {
+        error.BrokenPipe, error.ConnectionResetByPeer => std.process.exit(1),
+        else => return err,
+    };
+
+    var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    const poll_result = posix.poll(&poll_fds, 250) catch std.process.exit(1);
+    if (poll_result == 0) {
+        std.process.exit(2);
+    }
+
+    var sb = try ipc.SocketBuffer.init(alloc);
+    defer sb.deinit();
+
+    const n = sb.read(fd) catch std.process.exit(1);
+    if (n == 0) std.process.exit(1);
+
+    while (sb.next()) |msg| {
+        if (msg.header.tag != .CwdResponse) continue;
+        if (msg.payload.len != @sizeOf(ipc.CwdResponse)) std.process.exit(1);
+
+        const response = std.mem.bytesToValue(
+            ipc.CwdResponse,
+            msg.payload[0..@sizeOf(ipc.CwdResponse)],
+        );
+        const path = response.pathSlice();
+        if (path.len > 0) {
+            var stdout_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
+            var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+            try stdout_writer.interface.print("{s}\n", .{path});
+            try stdout_writer.interface.flush();
+        }
+        return;
+    }
+
+    std.process.exit(2);
+}
+
 fn switchSesh(daemon: *Daemon, current_sesh: []const u8) !void {
     // we want daemon.session_name because that's the session name the user provided during zmx attach
     // instead of the name of the session they are currently inside of.
@@ -1960,8 +2091,25 @@ fn attach(daemon: *Daemon) !void {
         return switchSesh(daemon, sesh);
     }
 
+    const status_cfg = try status.StatusConfig.takeFromEnv(daemon.alloc);
+    defer status_cfg.deinit(daemon.alloc);
+
     const result = try daemon.ensureSession();
     if (result.is_daemon) return;
+
+    if (daemon.attachedStatusIdentity()) |identity| {
+        status.StatusFile.emitAttached(
+            daemon.alloc,
+            status_cfg,
+            result.created,
+            identity.daemon_pid,
+            identity.daemon_created_at,
+            daemon.session_name,
+            @intCast(std.time.timestamp()),
+        ) catch |err| {
+            std.log.warn("failed to emit attached status: {s}", .{@errorName(err)});
+        };
+    }
 
     const client_sock = try socket.sessionConnect(daemon.socket_path);
     std.log.info("attached session={s}", .{daemon.session_name});
@@ -2011,7 +2159,7 @@ fn attach(daemon: *Daemon) !void {
     const clear_seq = "\x1b[2J\x1b[H";
     _ = try posix.write(posix.STDOUT_FILENO, clear_seq);
 
-    const looper = try clientLoop(client_sock);
+    const looper = try clientLoop(client_sock, status_cfg, daemon.session_name);
     switch (looper.kind) {
         .detach => return,
         .switch_session => {
@@ -2303,7 +2451,7 @@ const ClientResult = struct {
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
-fn clientLoop(client_sock_fd: i32) !ClientResult {
+fn clientLoop(client_sock_fd: i32, status_cfg: status.StatusConfig, session_name: []const u8) !ClientResult {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
     const alloc = std.heap.c_allocator;
     defer posix.close(client_sock_fd);
@@ -2334,6 +2482,31 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
     defer stdout_buf.deinit(alloc);
 
     const stdin_fd = posix.STDIN_FILENO;
+    var saw_session_end = false;
+
+    const emitSessionEnd = struct {
+        fn call(
+            alloc_inner: std.mem.Allocator,
+            cfg: status.StatusConfig,
+            session: []const u8,
+            reason: ipc.SessionEndReason,
+            code: i32,
+            emitted: *bool,
+        ) void {
+            if (emitted.*) return;
+            status.StatusFile.emitSessionEnd(
+                alloc_inner,
+                cfg,
+                reason.statusString(),
+                code,
+                session,
+                @intCast(std.time.timestamp()),
+            ) catch |err| {
+                std.log.warn("failed to emit session-end status: {s}", .{@errorName(err)});
+            };
+            emitted.* = true;
+        }
+    }.call;
 
     // Make stdin non-blocking. O_NONBLOCK is set on the open file description,
     // which is shared with the parent shell; restore on exit to avoid
@@ -2409,6 +2582,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
             const n = read_buf.read(client_sock_fd) catch |err| {
                 if (err == error.WouldBlock) continue;
                 if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
+                    emitSessionEnd(alloc, status_cfg, session_name, .unknown, 0, &saw_session_end);
                     return ClientResult{ .kind = .detach, .session_name = null };
                 }
                 std.log.err("daemon read err={s}", .{@errorName(err)});
@@ -2416,6 +2590,10 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
             };
             if (n == 0) {
                 // Server closed connection
+                // A SIGKILL'd daemon cannot deliver SessionEnd; it is gone before
+                // it can write. Raw EOF/HUP without a prior SessionEnd is therefore
+                // deliberately reported as "unknown", not "daemon-died".
+                emitSessionEnd(alloc, status_cfg, session_name, .unknown, 0, &saw_session_end);
                 return ClientResult{ .kind = .detach, .session_name = null };
             }
 
@@ -2440,6 +2618,18 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
                     .Switch => {
                         return ClientResult{ .kind = .switch_session, .session_name = try alloc.dupe(u8, msg.payload) };
                     },
+                    .SessionEnd => {
+                        if (msg.payload.len == @sizeOf(ipc.SessionEnd)) {
+                            const end = std.mem.bytesToValue(
+                                ipc.SessionEnd,
+                                msg.payload[0..@sizeOf(ipc.SessionEnd)],
+                            );
+                            emitSessionEnd(alloc, status_cfg, session_name, end.reason, end.code, &saw_session_end);
+                        } else {
+                            emitSessionEnd(alloc, status_cfg, session_name, .unknown, 0, &saw_session_end);
+                        }
+                        return ClientResult{ .kind = .detach, .session_name = null };
+                    },
                     else => {},
                 }
             }
@@ -2451,6 +2641,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
                 const n = posix.write(client_sock_fd, sock_write_buf.items) catch |err| blk: {
                     if (err == error.WouldBlock) break :blk 0;
                     if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
+                        emitSessionEnd(alloc, status_cfg, session_name, .unknown, 0, &saw_session_end);
                         return ClientResult{ .kind = .detach, .session_name = null };
                     }
                     return err;
@@ -2472,6 +2663,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
         }
 
         if (poll_fds.items[1].revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+            emitSessionEnd(alloc, status_cfg, session_name, .unknown, 0, &saw_session_end);
             return ClientResult{ .kind = .detach, .session_name = null };
         }
     }
@@ -2538,6 +2730,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 "SIGTERM received, shutting down gracefully session={s}",
                 .{daemon.session_name},
             );
+            daemon.broadcastSessionEnd(.daemon_died, 0);
             break :daemon_loop;
         }
 
@@ -2586,6 +2779,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 if (n == 0) {
                     // EOF: Shell exited
                     std.log.info("shell exited pty_fd={d}", .{pty_fd});
+                    daemon.broadcastSessionEnd(.shell_exit, 0);
                     break :daemon_loop;
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
@@ -2704,12 +2898,14 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                             break :clients_loop;
                         },
                         .Kill => {
+                            daemon.broadcastSessionEnd(.daemon_died, 0);
                             break :daemon_loop;
                         },
                         .Info => try daemon.handleInfo(client),
                         .History => try daemon.handleHistory(client, &term, msg.payload),
+                        .CwdQuery => try daemon.handleCwd(client),
                         .Run => try daemon.handleRun(client, msg.payload),
-                        .Ack, .TaskComplete => {},
+                        .Ack, .TaskComplete, .SessionEnd, .CwdResponse => {},
                         .Write => try daemon.handleWrite(client, msg.payload),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
