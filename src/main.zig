@@ -818,21 +818,43 @@ const Daemon = struct {
             // dead socket. (Previously only ConnectionRefused recreated; a
             // connect-succeeds-but-no-response zombie, or any other connect
             // error, wrongly "proceeded to attach".)
-            if (ipc.probeSession(self.alloc, self.socket_path)) |probe| {
-                posix.close(probe.fd);
-                if (self.command != null) {
+            // ConnectionRefused is unambiguous death (no listener) -> recreate at
+            // once. A Timeout (socket connects but the daemon doesn't answer Info
+            // in time) is AMBIGUOUS: it's usually a dead zombie socket, but it can
+            // also be a LIVE daemon briefly unresponsive (mid VT-parse of a big
+            // burst, or swapped out under memory pressure). Tearing down a live
+            // daemon would destroy its scrollback + running agent — the exact data
+            // loss the bridge exists to prevent. So retry the probe a few times
+            // before condemning: a slow-but-live daemon answers on a later attempt;
+            // a true zombie keeps timing out (and usually decays to
+            // ConnectionRefused) and is then recreated.
+            const max_probe_attempts: u8 = 3;
+            var probe_attempt: u8 = 0;
+            while (true) {
+                if (ipc.probeSession(self.alloc, self.socket_path)) |probe| {
+                    posix.close(probe.fd);
+                    if (self.command != null) {
+                        std.log.warn(
+                            "session already exists, ignoring command session={s}",
+                            .{self.session_name},
+                        );
+                    }
+                    break;
+                } else |err| {
+                    const ambiguous = err != error.ConnectionRefused;
+                    probe_attempt += 1;
+                    if (ambiguous and probe_attempt < max_probe_attempts) {
+                        std.Thread.sleep(150 * std.time.ns_per_ms);
+                        continue;
+                    }
                     std.log.warn(
-                        "session already exists, ignoring command session={s}",
-                        .{self.session_name},
+                        "session probe failed ({s}, attempts={d}), recreating session={s}",
+                        .{ @errorName(err), probe_attempt, self.session_name },
                     );
+                    socket.cleanupStaleSocket(dir, self.session_name);
+                    should_create = true;
+                    break;
                 }
-            } else |err| {
-                std.log.warn(
-                    "session probe failed ({s}), recreating session={s}",
-                    .{ @errorName(err), self.session_name },
-                );
-                socket.cleanupStaleSocket(dir, self.session_name);
-                should_create = true;
             }
         }
 
