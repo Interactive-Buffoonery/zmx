@@ -805,29 +805,34 @@ const Daemon = struct {
         var should_create = !exists;
 
         if (exists) {
-            if (ipc.connectSession(self.socket_path)) |fd| {
-                posix.close(fd);
+            // A socket FILE existing does not mean a live daemon is behind it.
+            // A just-killed daemon's socket lingers (the kernel hasn't torn down
+            // the listener yet), and connect() can even succeed against it — so
+            // deciding create-vs-attach on connect() alone attaches to a DEAD
+            // daemon during the runtime-respawn window. Decide on a real liveness
+            // HANDSHAKE instead: probeSession does a connect + Info round-trip
+            // with a bounded timeout. A live daemon answers fast; a stale/zombie
+            // socket times out (or connect refuses). ANY probe failure means the
+            // daemon is gone, so clean up and recreate — that way a runtime
+            // daemon-death respawn re-attaches to a FRESH daemon rather than a
+            // dead socket. (Previously only ConnectionRefused recreated; a
+            // connect-succeeds-but-no-response zombie, or any other connect
+            // error, wrongly "proceeded to attach".)
+            if (ipc.probeSession(self.alloc, self.socket_path)) |probe| {
+                posix.close(probe.fd);
                 if (self.command != null) {
                     std.log.warn(
                         "session already exists, ignoring command session={s}",
                         .{self.session_name},
                     );
                 }
-            } else |err| switch (err) {
-                // Daemon is definitively gone: safe to replace.
-                error.ConnectionRefused => {
-                    socket.cleanupStaleSocket(dir, self.session_name);
-                    should_create = true;
-                },
-                // Connect failed for an unusual reason. The check is only to
-                // decide create-vs-attach; the socket file exists, so proceed
-                // to attach rather than fail or orphan.
-                else => {
-                    std.log.warn(
-                        "connect failed ({s}), proceeding to attach session={s}",
-                        .{ @errorName(err), self.session_name },
-                    );
-                },
+            } else |err| {
+                std.log.warn(
+                    "session probe failed ({s}), recreating session={s}",
+                    .{ @errorName(err), self.session_name },
+                );
+                socket.cleanupStaleSocket(dir, self.session_name);
+                should_create = true;
             }
         }
 
