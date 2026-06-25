@@ -59,9 +59,16 @@ pub const SessionEndReason = enum(u8) {
     }
 };
 
-pub const SessionEnd = packed struct {
+pub const SessionEnd = extern struct {
     reason: SessionEndReason,
     code: i32,
+
+    pub fn init(reason: SessionEndReason, code: i32) SessionEnd {
+        var value = std.mem.zeroes(SessionEnd);
+        value.reason = reason;
+        value.code = code;
+        return value;
+    }
 };
 
 pub const CwdResponse = extern struct {
@@ -328,10 +335,7 @@ test "SessionEnd IPC payload round trips" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
 
-    const payload = SessionEnd{
-        .reason = .shell_exit,
-        .code = 0,
-    };
+    const payload = SessionEnd.init(.shell_exit, 0);
 
     try appendMessage(alloc, &buf, .SessionEnd, std.mem.asBytes(&payload));
 
@@ -350,6 +354,15 @@ test "SessionEnd IPC payload round trips" {
     const decoded = std.mem.bytesToValue(SessionEnd, msg.payload[0..@sizeOf(SessionEnd)]);
     try std.testing.expectEqual(SessionEndReason.shell_exit, decoded.reason);
     try std.testing.expectEqual(@as(i32, 0), decoded.code);
+}
+
+test "zeroed SessionEnd has no stack garbage in wire bytes" {
+    const payload = SessionEnd.init(.daemon_died, 9);
+    const bytes = std.mem.asBytes(&payload);
+
+    const reason_end = @offsetOf(SessionEnd, "reason") + @sizeOf(SessionEndReason);
+    const code_start = @offsetOf(SessionEnd, "code");
+    for (bytes[reason_end..code_start]) |b| try std.testing.expectEqual(@as(u8, 0), b);
 }
 
 test "zeroed Info has no stack garbage in wire bytes" {

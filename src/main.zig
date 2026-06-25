@@ -38,6 +38,7 @@ var sig_pipe: [2]posix.fd_t = .{ -1, -1 };
 
 // https://github.com/ziglang/zig/blob/738d2be9d6b6ef3ff3559130c05159ef53336224/lib/std/posix.zig#L3505
 const O_NONBLOCK: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
+const CWD_RESPONSE_TIMEOUT_MS: i32 = 500;
 
 const SessionMatch = struct {
     name: []const u8,
@@ -669,10 +670,7 @@ const Daemon = struct {
         reason: ipc.SessionEndReason,
         code: i32,
     ) void {
-        const payload = ipc.SessionEnd{
-            .reason = reason,
-            .code = code,
-        };
+        const payload = ipc.SessionEnd.init(reason, code);
         ipc.send(client.socket_fd, .SessionEnd, std.mem.asBytes(&payload)) catch |err| {
             std.log.warn(
                 "failed to send SessionEnd reason={s} fd={d}: {s}",
@@ -688,10 +686,11 @@ const Daemon = struct {
         }
     }
 
-    fn attachedStatusIdentity(self: *Daemon) ?AttachedStatusIdentity {
+    fn attachedStatusIdentity(self: *Daemon) AttachedStatusIdentity {
+        // Intentional redundant probe for now; failure emits daemon_pid/created_at as 0 so chrome-clear falls back safely.
         const probe = ipc.probeSession(self.alloc, self.socket_path) catch |err| {
             std.log.warn("status identity probe failed: {s}", .{@errorName(err)});
-            return null;
+            return .{ .daemon_pid = 0, .daemon_created_at = 0 };
         };
         defer posix.close(probe.fd);
 
@@ -797,6 +796,8 @@ const Daemon = struct {
     /// ensureSession "upserts" a session by checking if the unix socket exists already.
     /// If not it creates one and spawns the daemon.
     fn ensureSession(self: *Daemon) !EnsureSessionResult {
+        status.clearEnvForDaemonCreation();
+
         var dir = try std.fs.openDirAbsolute(self.cfg.socket_dir, .{});
         defer dir.close();
 
@@ -2017,37 +2018,166 @@ fn cwdCommand(cfg: *Cfg, session_name: []const u8, socket_path: []const u8) !voi
         else => return err,
     };
 
-    var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    const poll_result = posix.poll(&poll_fds, 250) catch std.process.exit(1);
-    if (poll_result == 0) {
-        std.process.exit(2);
+    const response = readCwdResponseWithDeadline(alloc, fd, CWD_RESPONSE_TIMEOUT_MS) catch |err| switch (err) {
+        error.CwdResponseTimeout => std.process.exit(2),
+        error.CwdResponseProtocolMismatch, error.ConnectionClosed => std.process.exit(1),
+        else => return err,
+    };
+    const path = response.pathSlice();
+    if (path.len > 0) {
+        var stdout_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+        try stdout_writer.interface.print("{s}\n", .{path});
+        try stdout_writer.interface.flush();
     }
+}
 
+fn readCwdResponseWithDeadline(
+    alloc: std.mem.Allocator,
+    fd: posix.fd_t,
+    timeout_ms: i32,
+) !ipc.CwdResponse {
     var sb = try ipc.SocketBuffer.init(alloc);
     defer sb.deinit();
 
-    const n = sb.read(fd) catch std.process.exit(1);
-    if (n == 0) std.process.exit(1);
+    const deadline_ms = std.time.milliTimestamp() + @as(i64, timeout_ms);
 
-    while (sb.next()) |msg| {
-        if (msg.header.tag != .CwdResponse) continue;
-        if (msg.payload.len != @sizeOf(ipc.CwdResponse)) std.process.exit(1);
+    while (true) {
+        while (sb.next()) |msg| {
+            if (msg.header.tag != .CwdResponse) continue;
+            if (msg.payload.len != @sizeOf(ipc.CwdResponse)) return error.CwdResponseProtocolMismatch;
 
-        const response = std.mem.bytesToValue(
-            ipc.CwdResponse,
-            msg.payload[0..@sizeOf(ipc.CwdResponse)],
-        );
-        const path = response.pathSlice();
-        if (path.len > 0) {
-            var stdout_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
-            var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-            try stdout_writer.interface.print("{s}\n", .{path});
-            try stdout_writer.interface.flush();
+            return std.mem.bytesToValue(
+                ipc.CwdResponse,
+                msg.payload[0..@sizeOf(ipc.CwdResponse)],
+            );
         }
-        return;
+
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms >= deadline_ms) return error.CwdResponseTimeout;
+        const remaining_ms = deadline_ms - now_ms;
+        const poll_timeout: i32 = if (remaining_ms > std.math.maxInt(i32))
+            std.math.maxInt(i32)
+        else
+            @intCast(remaining_ms);
+
+        var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        const poll_result = try posix.poll(&poll_fds, poll_timeout);
+        if (poll_result == 0) return error.CwdResponseTimeout;
+
+        const revents = poll_fds[0].revents;
+        if (revents & posix.POLL.IN != 0) {
+            const n = sb.read(fd) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            if (n == 0) return error.ConnectionClosed;
+            continue;
+        }
+
+        if (revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+            return error.ConnectionClosed;
+        }
+    }
+}
+
+fn writeSplitCwdTestStream(fd: posix.fd_t, first: []const u8, second: []const u8) void {
+    defer posix.close(fd);
+    writeAllForCwdTest(fd, first) catch unreachable;
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    writeAllForCwdTest(fd, second) catch unreachable;
+}
+
+fn writeAllForCwdTest(fd: posix.fd_t, bytes: []const u8) !void {
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const n = try posix.write(fd, bytes[index..]);
+        if (n == 0) return error.ShortWrite;
+        index += n;
+    }
+}
+
+test "ensureSession clears status env before a run-style creation path" {
+    const alloc = std.testing.allocator;
+
+    _ = cross.c.setenv("AMX_STATUS_FILE", "/tmp/x", 1);
+    _ = cross.c.setenv("AMX_STATUS_TOKEN", "tok", 1);
+    defer {
+        _ = cross.c.unsetenv("AMX_STATUS_FILE");
+        _ = cross.c.unsetenv("AMX_STATUS_TOKEN");
     }
 
-    std.process.exit(2);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(tmp_path);
+    const missing_socket_dir = try std.fs.path.join(alloc, &.{ tmp_path, "missing" });
+    defer alloc.free(missing_socket_dir);
+    const socket_path = try std.fs.path.join(alloc, &.{ missing_socket_dir, "run-style" });
+
+    const clients = try std.ArrayList(*Client).initCapacity(alloc, 0);
+    var cfg = Cfg{
+        .socket_dir = missing_socket_dir,
+        .log_dir = missing_socket_dir,
+    };
+    var daemon = Daemon{
+        .running = true,
+        .cfg = &cfg,
+        .alloc = alloc,
+        .clients = clients,
+        .session_name = "run-style",
+        .socket_path = socket_path,
+        .pid = undefined,
+        .created_at = 0,
+        .is_task_mode = true,
+        .leader_client_fd = null,
+    };
+    defer daemon.deinit();
+
+    try std.testing.expectError(error.FileNotFound, daemon.ensureSession());
+    try std.testing.expect(cross.c.getenv("AMX_STATUS_FILE") == null);
+    try std.testing.expect(cross.c.getenv("AMX_STATUS_TOKEN") == null);
+}
+
+test "cwd response reader drains interleaved output and split response until deadline" {
+    const alloc = std.testing.allocator;
+
+    const pipe_fds = try posix.pipe2(.{ .CLOEXEC = true });
+    defer posix.close(pipe_fds[0]);
+
+    const expected_path = "/tmp/awesomux-cwd";
+    var response = ipc.CwdResponse.fromPath(expected_path);
+
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(alloc);
+    try ipc.appendMessage(alloc, &stream, .Output, "ignored terminal bytes");
+    try ipc.appendMessage(alloc, &stream, .CwdResponse, std.mem.asBytes(&response));
+
+    const split_at = stream.items.len - 3;
+    const writer = try std.Thread.spawn(
+        .{},
+        writeSplitCwdTestStream,
+        .{ pipe_fds[1], stream.items[0..split_at], stream.items[split_at..] },
+    );
+    defer writer.join();
+
+    const actual = try readCwdResponseWithDeadline(alloc, pipe_fds[0], 1000);
+
+    try std.testing.expectEqualStrings(expected_path, actual.pathSlice());
+}
+
+test "cwd response reader uses one overall deadline" {
+    const alloc = std.testing.allocator;
+
+    const pipe_fds = try posix.pipe2(.{ .CLOEXEC = true });
+    defer posix.close(pipe_fds[0]);
+    defer posix.close(pipe_fds[1]);
+
+    try std.testing.expectError(
+        error.CwdResponseTimeout,
+        readCwdResponseWithDeadline(alloc, pipe_fds[0], 20),
+    );
 }
 
 fn switchSesh(daemon: *Daemon, current_sesh: []const u8) !void {
@@ -2097,19 +2227,18 @@ fn attach(daemon: *Daemon) !void {
     const result = try daemon.ensureSession();
     if (result.is_daemon) return;
 
-    if (daemon.attachedStatusIdentity()) |identity| {
-        status.StatusFile.emitAttached(
-            daemon.alloc,
-            status_cfg,
-            result.created,
-            identity.daemon_pid,
-            identity.daemon_created_at,
-            daemon.session_name,
-            @intCast(std.time.timestamp()),
-        ) catch |err| {
-            std.log.warn("failed to emit attached status: {s}", .{@errorName(err)});
-        };
-    }
+    const identity = daemon.attachedStatusIdentity();
+    status.StatusFile.emitAttached(
+        daemon.alloc,
+        status_cfg,
+        result.created,
+        identity.daemon_pid,
+        identity.daemon_created_at,
+        daemon.session_name,
+        @intCast(std.time.timestamp()),
+    ) catch |err| {
+        std.log.warn("failed to emit attached status: {s}", .{@errorName(err)});
+    };
 
     const client_sock = try socket.sessionConnect(daemon.socket_path);
     std.log.info("attached session={s}", .{daemon.session_name});

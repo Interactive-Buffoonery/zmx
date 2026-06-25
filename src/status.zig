@@ -20,9 +20,6 @@ pub const StatusConfig = struct {
         else
             null;
 
-        _ = cross.c.unsetenv("AMX_STATUS_FILE");
-        _ = cross.c.unsetenv("AMX_STATUS_TOKEN");
-
         return .{ .path = path, .token = token };
     }
 
@@ -31,6 +28,11 @@ pub const StatusConfig = struct {
         if (self.token) |token| alloc.free(token);
     }
 };
+
+pub fn clearEnvForDaemonCreation() void {
+    _ = cross.c.unsetenv("AMX_STATUS_FILE");
+    _ = cross.c.unsetenv("AMX_STATUS_TOKEN");
+}
 
 pub const StatusFile = struct {
     pub fn emitAttached(
@@ -148,7 +150,7 @@ fn appendJsonString(
     try line.append(alloc, '"');
 }
 
-test "status env is consumed and unset before spawn" {
+test "status env is copied without consuming attach parent state" {
     const alloc = std.testing.allocator;
 
     _ = cross.c.setenv("AMX_STATUS_FILE", "/tmp/x", 1);
@@ -163,6 +165,20 @@ test "status env is consumed and unset before spawn" {
 
     try std.testing.expectEqualStrings("/tmp/x", cfg.path.?);
     try std.testing.expectEqualStrings("tok", cfg.token.?);
+    try std.testing.expect(cross.c.getenv("AMX_STATUS_FILE") != null);
+    try std.testing.expect(cross.c.getenv("AMX_STATUS_TOKEN") != null);
+}
+
+test "status env clear covers daemon creation without StatusConfig copy" {
+    _ = cross.c.setenv("AMX_STATUS_FILE", "/tmp/x", 1);
+    _ = cross.c.setenv("AMX_STATUS_TOKEN", "tok", 1);
+    defer {
+        _ = cross.c.unsetenv("AMX_STATUS_FILE");
+        _ = cross.c.unsetenv("AMX_STATUS_TOKEN");
+    }
+
+    clearEnvForDaemonCreation();
+
     try std.testing.expect(cross.c.getenv("AMX_STATUS_FILE") == null);
     try std.testing.expect(cross.c.getenv("AMX_STATUS_TOKEN") == null);
 }
