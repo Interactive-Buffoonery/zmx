@@ -983,8 +983,36 @@ const Daemon = struct {
         };
     }
 
-    pub fn handleInput(self: *Daemon, client: *Client, payload: []const u8) !void {
-        std.log.debug("buffering pty input data={x}", .{payload});
+    /// True when the inner app currently has ANY mouse event-tracking mode on.
+    ///
+    /// Uses the terminal's EFFECTIVE mouse event mode (`flags.mouse_event`),
+    /// not the raw DEC mode bits (`modes.get(.mouse_event_*)`). The bits are
+    /// independently settable and Ghostty's own `Terminal.flags` doc explains
+    /// why: "you can't get the right event/format to use based on modes
+    /// alone because modes don't show you what order this was called" — a
+    /// program can set mode 1000 then 1003 without 1000 ever clearing, and
+    /// the raw OR stays true forever even after the app's actual intent
+    /// (tracked in `flags.mouse_event`) has gone back to `.none`. Ghostty's
+    /// own `.mouse_tracking` C getter (terminal/c/terminal.zig) DOES use the
+    /// raw OR — that API answers "is any tracking mode bit set," a different
+    /// question from "what does the terminal currently use to encode
+    /// reports," which is what this gate needs.
+    fn terminalMouseTrackingEnabled(term: *const ghostty_vt.Terminal) bool {
+        return term.flags.mouse_event != .none;
+    }
+
+    pub fn handleInput(self: *Daemon, client: *Client, term: *const ghostty_vt.Terminal, payload: []const u8) !void {
+        // Drop stale mouse reports: with a multiplexer in the path the host
+        // terminal and the inner app's vt can briefly disagree on mouse mode
+        // (rapid wheel up-then-down). The host fires a report while the app has
+        // already turned mouse tracking off, and without this gate that report
+        // would land in the app's readline as literal `<64;..M` text. Only drop
+        // when the WHOLE payload is complete mouse reports AND the inner app's vt
+        // mouse mode is fully off; everything else forwards unchanged.
+        if (util.isMouseReport(payload) and !terminalMouseTrackingEnabled(term)) {
+            std.log.debug("dropping stale mouse report bytes={d}", .{payload.len});
+            return;
+        }
         // client is leader, send entire payload (ansi escape codes + text)
         if (self.leader_client_fd == client.socket_fd) {
             self.queuePtyInput(payload);
@@ -3040,7 +3068,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
 
                 while (client.read_buf.next()) |msg| {
                     switch (msg.header.tag) {
-                        .Input => try daemon.handleInput(client, msg.payload),
+                        .Input => try daemon.handleInput(client, &term, msg.payload),
                         .Output => try daemon.handleOutput(msg.payload, &vt_stream),
                         .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload),
                         .Switch => try daemon.handleSwitch(msg.payload),

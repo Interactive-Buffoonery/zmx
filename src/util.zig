@@ -478,6 +478,53 @@ fn parseDecimal(buf: []const u8, pos: *usize) ?u32 {
     return value;
 }
 
+/// True when `payload` consists ENTIRELY of one or more complete mouse reports
+/// (SGR `CSI < ... M/m` or legacy `CSI M Cb Cx Cy`). Used to drop stale host
+/// mouse reports when the inner app's vt mouse mode is off. Intentionally
+/// conservative: a split (partial) report or any payload mixing a report with
+/// real keys/text returns false, so user input is never dropped.
+pub fn isMouseReport(payload: []const u8) bool {
+    if (payload.len == 0) return false;
+
+    var pos: usize = 0;
+    while (pos < payload.len) {
+        if (consumeSgrMouseReport(payload[pos..])) |n| {
+            pos += n;
+        } else if (consumeLegacyMouseReport(payload[pos..])) |n| {
+            pos += n;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn consumeSgrMouseReport(payload: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, payload, "\x1b[<")) return null;
+
+    var pos: usize = 3;
+    var saw_digit = false;
+    var semicolons: usize = 0;
+    while (pos < payload.len) : (pos += 1) {
+        switch (payload[pos]) {
+            '0'...'9' => saw_digit = true,
+            // SGR-pixels (mode 1016) emits signed pixel coordinates that can be
+            // negative; accept a leading '-' so those reports are still detected.
+            '-' => {},
+            ';' => semicolons += 1,
+            'M', 'm' => return if (saw_digit and semicolons >= 2) pos + 1 else null,
+            else => return null,
+        }
+    }
+    return null;
+}
+
+fn consumeLegacyMouseReport(payload: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, payload, "\x1b[M")) return null;
+    if (payload.len < 6) return null;
+    return 6;
+}
+
 /// Detect if the payload contains user input that should be printed to the screen or
 /// is a key combination like up-arrow, backspace, enter, ctrl+f, etc.
 pub fn isUserInput(payload: []const u8) bool {
@@ -1439,6 +1486,21 @@ test "isUserInput: mouse events SGR mode CSI < excluded" {
     // Mouse events should NOT trigger leader switch
     try testing.expect(!isUserInput("\x1b[<0;1;1M")); // button release
     try testing.expect(!isUserInput("\x1b[<64;1;1M")); // button press
+}
+
+test "isMouseReport: complete SGR and legacy reports" {
+    try testing.expect(isMouseReport("\x1b[<35;116;62M"));
+    try testing.expect(isMouseReport("\x1b[<0;1;1m"));
+    try testing.expect(isMouseReport("\x1b[M !!"));
+    try testing.expect(isMouseReport("\x1b[<64;1;1M\x1b[<65;1;1M"));
+}
+
+test "isMouseReport: partial or mixed payloads forward conservatively" {
+    try testing.expect(!isMouseReport(""));
+    try testing.expect(!isMouseReport("\x1b[<35;116;62"));
+    try testing.expect(!isMouseReport("\x1b[M "));
+    try testing.expect(!isMouseReport("x\x1b[<35;116;62M"));
+    try testing.expect(!isMouseReport("\x1b[<35;116;62Mx"));
 }
 
 test "isUserInput: focus events excluded" {
