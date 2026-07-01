@@ -483,6 +483,16 @@ fn parseDecimal(buf: []const u8, pos: *usize) ?u32 {
 /// mouse reports when the inner app's vt mouse mode is off. Intentionally
 /// conservative: a split (partial) report or any payload mixing a report with
 /// real keys/text returns false, so user input is never dropped.
+///
+/// Ceiling: this is a byte-shape heuristic, not protocol-aware — it can't
+/// distinguish "the host terminal generated this as a wheel event" from
+/// "the user pasted or typed this exact escape sequence as literal text."
+/// A paste containing a complete, isolated mouse-report-shaped sequence
+/// while mouse mode happens to be off would be silently dropped. Accepted
+/// tradeoff given how rare that input shape is in practice; revisit if it
+/// ever surfaces. Only recognizes SGR and legacy X10 formats — a stale
+/// report in another Ghostty-supported mouse encoding (e.g. URXVT, mode
+/// 1015) would not be caught by this gate.
 pub fn isMouseReport(payload: []const u8) bool {
     if (payload.len == 0) return false;
 
@@ -499,29 +509,47 @@ pub fn isMouseReport(payload: []const u8) bool {
     return true;
 }
 
+/// Parses `<button>;<x>;<y>M/m` — three non-empty numeric fields separated
+/// by exactly two semicolons, terminated by M or m. Requiring exact field
+/// structure (not just "some digit and >=2 semicolons somewhere") matters:
+/// a looser check accepts malformed lookalikes like `\x1b[<1;;M` (empty
+/// field) or `\x1b[<64;1-2;3M` (garbage mid-field) as complete reports,
+/// which would wrongly drop real, non-mouse input that merely resembles
+/// one.
 fn consumeSgrMouseReport(payload: []const u8) ?usize {
     if (!std.mem.startsWith(u8, payload, "\x1b[<")) return null;
 
     var pos: usize = 3;
-    var saw_digit = false;
-    var semicolons: usize = 0;
-    while (pos < payload.len) : (pos += 1) {
-        switch (payload[pos]) {
-            '0'...'9' => saw_digit = true,
-            // SGR-pixels (mode 1016) emits signed pixel coordinates that can be
-            // negative; accept a leading '-' so those reports are still detected.
-            '-' => {},
-            ';' => semicolons += 1,
-            'M', 'm' => return if (saw_digit and semicolons >= 2) pos + 1 else null,
-            else => return null,
+    var field: usize = 0;
+    while (field < 3) : (field += 1) {
+        // SGR-pixels (mode 1016) emits signed pixel coordinates that can be
+        // negative; accept a leading '-' so those reports are still detected.
+        if (pos < payload.len and payload[pos] == '-') pos += 1;
+        const digits_start = pos;
+        while (pos < payload.len and payload[pos] >= '0' and payload[pos] <= '9') : (pos += 1) {}
+        if (pos == digits_start) return null;
+        if (field < 2) {
+            if (pos >= payload.len or payload[pos] != ';') return null;
+            pos += 1;
         }
     }
-    return null;
+    if (pos >= payload.len) return null;
+    return switch (payload[pos]) {
+        'M', 'm' => pos + 1,
+        else => null,
+    };
 }
 
 fn consumeLegacyMouseReport(payload: []const u8) ?usize {
     if (!std.mem.startsWith(u8, payload, "\x1b[M")) return null;
     if (payload.len < 6) return null;
+    // Legacy X10 Cb/Cx/Cy are always emitted as a value + 32, so each byte
+    // is guaranteed >= 0x20; reject anything that couldn't plausibly be an
+    // encoded coordinate rather than treating arbitrary bytes (e.g. pasted
+    // binary content) as a mouse report.
+    for (payload[3..6]) |b| {
+        if (b < 0x20) return null;
+    }
     return 6;
 }
 
@@ -1501,6 +1529,28 @@ test "isMouseReport: partial or mixed payloads forward conservatively" {
     try testing.expect(!isMouseReport("\x1b[M "));
     try testing.expect(!isMouseReport("x\x1b[<35;116;62M"));
     try testing.expect(!isMouseReport("\x1b[<35;116;62Mx"));
+}
+
+test "isMouseReport: SGR-pixels negative coordinates still match" {
+    try testing.expect(isMouseReport("\x1b[<0;-5;10M"));
+    try testing.expect(isMouseReport("\x1b[<0;5;-10m"));
+}
+
+test "isMouseReport: malformed SGR-shaped payloads are rejected, not dropped" {
+    // Empty coordinate field between semicolons.
+    try testing.expect(!isMouseReport("\x1b[<1;;M"));
+    // Stray '-' mid-digit-run rather than as a field prefix.
+    try testing.expect(!isMouseReport("\x1b[<64;1-2;3M"));
+    // Only two fields instead of three.
+    try testing.expect(!isMouseReport("\x1b[<64;1M"));
+    // Trailing junk after the third field's digits, before the terminator.
+    try testing.expect(!isMouseReport("\x1b[<64;1;1xM"));
+}
+
+test "isMouseReport: legacy report rejects sub-0x20 coordinate bytes" {
+    // Byte 0x00 in the coordinate range can't be a real X10-encoded value
+    // (always emitted as value + 32) — should forward, not drop.
+    try testing.expect(!isMouseReport("\x1b[M\x00\x00\x00"));
 }
 
 test "isUserInput: focus events excluded" {

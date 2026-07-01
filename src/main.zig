@@ -997,6 +997,15 @@ const Daemon = struct {
     /// raw OR — that API answers "is any tracking mode bit set," a different
     /// question from "what does the terminal currently use to encode
     /// reports," which is what this gate needs.
+    ///
+    /// This reads whatever `flags.mouse_event` currently holds after the
+    /// daemon's last processed chunk of PTY output — there's a narrow
+    /// ordering window where a client's very first scroll after a TUI
+    /// enables mouse mode can arrive before the daemon has parsed that
+    /// enable sequence out of the output stream, reading `.none` and
+    /// getting dropped as "stale." Self-heals on the next scroll tick.
+    /// Accepted: the alternative (forwarding on ambiguous state) is exactly
+    /// the leak this gate exists to prevent.
     fn terminalMouseTrackingEnabled(term: *const ghostty_vt.Terminal) bool {
         return term.flags.mouse_event != .none;
     }
@@ -1008,9 +1017,10 @@ const Daemon = struct {
         // already turned mouse tracking off, and without this gate that report
         // would land in the app's readline as literal `<64;..M` text. Only drop
         // when the WHOLE payload is complete mouse reports AND the inner app's vt
-        // mouse mode is fully off; everything else forwards unchanged.
-        if (util.isMouseReport(payload) and !terminalMouseTrackingEnabled(term)) {
-            std.log.debug("dropping stale mouse report bytes={d}", .{payload.len});
+        // mouse mode is fully off; everything else forwards unchanged. Checks the
+        // cheap mode flag before the O(n) payload scan — this runs on every
+        // input message, including every tick of an active scroll gesture.
+        if (!terminalMouseTrackingEnabled(term) and util.isMouseReport(payload)) {
             return;
         }
         // client is leader, send entire payload (ansi escape codes + text)
