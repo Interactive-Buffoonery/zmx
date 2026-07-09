@@ -615,6 +615,10 @@ const Daemon = struct {
     task_ended_at: ?u64 = null, // timestamp when task exited
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     pty_write_buf: std.ArrayList(u8) = .empty,
+    // Set once the pty child is reaped on the EOF path in daemonLoop, so the
+    // startOrAttach defer skips its own waitpid — a second reap hits
+    // posix.waitpid's `.CHILD => unreachable` and panics.
+    child_reaped: bool = false,
 
     const EnsureSessionResult = struct {
         created: bool,
@@ -936,10 +940,21 @@ const Daemon = struct {
                 };
 
                 defer {
-                    self.handleKill();
+                    // When the EOF path already reaped the child, only tear down
+                    // clients — do NOT signal -self.pid (handleKill) or waitpid
+                    // again: the pid is reaped and possibly reused, so a kill
+                    // could hit an unrelated process group and a second waitpid
+                    // hits posix.waitpid's `.CHILD => unreachable`. Otherwise the
+                    // child is still live; handleKill SIGKILLs it and the reap
+                    // below collects it.
+                    if (self.child_reaped) {
+                        self.shutdown();
+                    } else {
+                        self.handleKill();
+                    }
                     self.deinit();
                     posix.close(pty_fd);
-                    _ = posix.waitpid(self.pid, 0);
+                    if (!self.child_reaped) _ = posix.waitpid(self.pid, 0);
                     posix.close(server_sock_fd);
                     std.log.info("deleting socket file session={s}", .{self.session_name});
                     dir.deleteFile(self.session_name) catch |err| {
@@ -2863,6 +2878,12 @@ fn clientLoop(client_sock_fd: i32, status_cfg: status.StatusConfig, session_name
     }
 }
 
+/// Max 1ms polls to wait for a mid-exit pty child to become reapable on the EOF
+/// path before force-killing it (~100ms grace). A normally-exiting child is
+/// waitable within microseconds; only one that closed stdio yet kept running
+/// spins the full window and is then SIGKILLed.
+const child_reap_grace_polls: u8 = 100;
+
 /// dameonLoop is what the daemon runs to send and receive ipc commands from its corresponding
 /// clients.  It uses poll() as its non-blocking mechanism.
 fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
@@ -2971,9 +2992,45 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
 
             if (n_opt) |n| {
                 if (n == 0) {
-                    // EOF: Shell exited
-                    std.log.info("shell exited pty_fd={d}", .{pty_fd});
-                    daemon.broadcastSessionEnd(.shell_exit, 0);
+                    // EOF: the pty slave closed. Normally the session's
+                    // foreground process (a login shell, or the exec'd trailing
+                    // command such as `ssh`) exited and is a reapable zombie —
+                    // reap it for its real exit status, which awesoMux's
+                    // remote-pane close policy branches on (clean `exit`/`exit 1`
+                    // close the pane; ssh's 255 on a dropped connection latches
+                    // an error). Broadcasting a hardcoded 0 flattened every exit
+                    // and made a dropped connection look like a clean exit.
+                    //
+                    // But EOF only proves the slave fds are closed, not that the
+                    // process is waitable: it may be mid-exit (the kernel tears
+                    // down its fds — so the master sees EOF — before it becomes a
+                    // reapable zombie), or it may have closed stdio and kept
+                    // running. A blocking waitpid in the latter case would hang
+                    // the daemon forever, so poll with a short grace window first.
+                    // The grace matters: force-killing on the first WNOHANG miss
+                    // could turn a normal `exit 0` that is merely mid-teardown
+                    // into a SIGKILL (137). Only a child still alive after the
+                    // window is force-killed — the pty is gone, the session is
+                    // over regardless — and then reaped.
+                    var wait_result = posix.waitpid(daemon.pid, posix.W.NOHANG);
+                    var reap_polls: u8 = 0;
+                    while (wait_result.pid != daemon.pid and reap_polls < child_reap_grace_polls) : (reap_polls += 1) {
+                        std.Thread.sleep(std.time.ns_per_ms);
+                        wait_result = posix.waitpid(daemon.pid, posix.W.NOHANG);
+                    }
+                    if (wait_result.pid != daemon.pid) {
+                        posix.kill(-daemon.pid, posix.SIG.KILL) catch {};
+                        wait_result = posix.waitpid(daemon.pid, 0);
+                    }
+                    daemon.child_reaped = true;
+                    const code: i32 = if (posix.W.IFEXITED(wait_result.status))
+                        @intCast(posix.W.EXITSTATUS(wait_result.status))
+                    else if (posix.W.IFSIGNALED(wait_result.status))
+                        128 + @as(i32, @intCast(posix.W.TERMSIG(wait_result.status)))
+                    else
+                        255;
+                    std.log.info("shell exited pty_fd={d} code={d}", .{ pty_fd, code });
+                    daemon.broadcastSessionEnd(.shell_exit, code);
                     break :daemon_loop;
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
