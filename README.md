@@ -13,6 +13,24 @@
   Sponsored by <a href="https://pico.sh">pico.sh</a>
 </p>
 
+> [!NOTE]
+> This is an [awesoMux](https://github.com/Interactive-Buffoonery/awesomux)-maintained
+> fork of [`neurosnap/zmx`](https://github.com/neurosnap/zmx), vendored as the
+> `amx` persistent-session backend. Fork additions on top of upstream:
+>
+> - **AMX out-of-band protocol** — a status channel (`AMX_STATUS_FILE`/`AMX_STATUS_TOKEN`),
+>   `attached`/`session-end` events, and a cwd query, so the parent app can observe
+>   sessions without scraping the PTY.
+> - **Daemon-liveness verification** in `ensureSession`, with probe retry, so a stale
+>   socket is recreated instead of hanging.
+> - **Mouse-report gating fixes** — stale SGR mouse reports are dropped when the
+>   effective mouse mode disagrees, instead of landing as literal text.
+> - **Real session-end exit codes** — the daemon reports the trailing command's actual
+>   exit status instead of a hardcoded `0`.
+>
+> Upstream's MIT license is retained (see [`LICENSE`](./LICENSE)). General fixes may be
+> proposed upstream; the AMX protocol is awesoMux-specific and stays a fork feature.
+
 ## features
 
 - Persist terminal shell sessions
