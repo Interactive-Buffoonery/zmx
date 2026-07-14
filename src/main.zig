@@ -1332,6 +1332,17 @@ const Daemon = struct {
         client.has_pending_output = true;
     }
 
+    pub fn handleForegroundProcessQuery(self: *Daemon, client: *Client) !void {
+        const response = foregroundProcessResponse(self.alloc, self.pty_fd);
+        try ipc.appendMessage(
+            self.alloc,
+            &client.write_buf,
+            .ForegroundProcessResponse,
+            std.mem.asBytes(&response),
+        );
+        client.has_pending_output = true;
+    }
+
     pub fn handleRun(self: *Daemon, client: *Client, payload: []const u8) !void {
         // Reset task tracking so the new command's exit marker is detected.
         // Without this, a second `zmx run` on the same session is ignored
@@ -2235,6 +2246,54 @@ fn writeAllForCwdTest(fd: posix.fd_t, bytes: []const u8) !void {
     }
 }
 
+fn foregroundProcessResponseFrom(
+    process_group_id: i32,
+    executable: ?[]const u8,
+) ipc.ForegroundProcessResponse {
+    if (process_group_id < 0) return .unavailable();
+    if (process_group_id == 0) return .noForeground();
+    const name = executable orelse return .unavailable();
+    if (name.len == 0) return .unavailable();
+    return .foreground(process_group_id, name);
+}
+
+fn foregroundProcessResponse(
+    alloc: std.mem.Allocator,
+    pty_fd: i32,
+) ipc.ForegroundProcessResponse {
+    const process_group_id = cross.c.tcgetpgrp(pty_fd);
+    if (process_group_id <= 0) {
+        return foregroundProcessResponseFrom(process_group_id, null);
+    }
+
+    const executable = foregroundExecutableName(alloc, process_group_id) orelse
+        return .unavailable();
+    defer alloc.free(executable);
+    return foregroundProcessResponseFrom(process_group_id, executable);
+}
+
+fn foregroundExecutableName(alloc: std.mem.Allocator, pid: i32) ?[]u8 {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .macos) {
+        var buffer: [ipc.MAX_EXECUTABLE_LEN]u8 = undefined;
+        const length = cross.c.proc_name(pid, &buffer, buffer.len);
+        if (length <= 0) return null;
+        return alloc.dupe(u8, buffer[0..@intCast(length)]) catch null;
+    }
+    if (builtin.os.tag == .linux) {
+        const path = std.fmt.allocPrint(alloc, "/proc/{d}/comm", .{pid}) catch return null;
+        defer alloc.free(path);
+        const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+        defer file.close();
+        var buffer: [ipc.MAX_EXECUTABLE_LEN]u8 = undefined;
+        const length = file.readAll(&buffer) catch return null;
+        const name = std.mem.trimRight(u8, buffer[0..length], "\r\n");
+        if (name.len == 0) return null;
+        return alloc.dupe(u8, name) catch null;
+    }
+    return null;
+}
+
 test "ensureSession clears status env before a run-style creation path" {
     const alloc = std.testing.allocator;
 
@@ -2316,6 +2375,21 @@ test "cwd response reader uses one overall deadline" {
         error.CwdResponseTimeout,
         readCwdResponseWithDeadline(alloc, pipe_fds[0], 20),
     );
+}
+
+test "foreground response fails closed without process identity" {
+    var foreground = foregroundProcessResponseFrom(9001, "ssh");
+    try std.testing.expectEqual(ipc.ForegroundProcessState.foreground, foreground.state);
+    try std.testing.expectEqualStrings("ssh", foreground.executableSlice());
+
+    const missing_name = foregroundProcessResponseFrom(9001, null);
+    try std.testing.expectEqual(ipc.ForegroundProcessState.unavailable, missing_name.state);
+
+    const no_foreground = foregroundProcessResponseFrom(0, null);
+    try std.testing.expectEqual(ipc.ForegroundProcessState.no_foreground, no_foreground.state);
+
+    const unavailable = foregroundProcessResponseFrom(-1, null);
+    try std.testing.expectEqual(ipc.ForegroundProcessState.unavailable, unavailable.state);
 }
 
 fn switchSesh(daemon: *Daemon, current_sesh: []const u8) !void {
@@ -2426,7 +2500,13 @@ fn attach(daemon: *Daemon) !void {
     const clear_seq = "\x1b[2J\x1b[H";
     _ = try posix.write(posix.STDOUT_FILENO, clear_seq);
 
-    const looper = try clientLoop(client_sock, status_cfg, daemon.session_name);
+    const looper = try clientLoop(
+        client_sock,
+        status_cfg,
+        identity.daemon_pid,
+        identity.daemon_created_at,
+        daemon.session_name,
+    );
     switch (looper.kind) {
         .detach => return,
         .switch_session => {
@@ -2718,7 +2798,13 @@ const ClientResult = struct {
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
-fn clientLoop(client_sock_fd: i32, status_cfg: status.StatusConfig, session_name: []const u8) !ClientResult {
+fn clientLoop(
+    client_sock_fd: i32,
+    status_cfg: status.StatusConfig,
+    daemon_pid: i32,
+    daemon_created_at: u64,
+    session_name: []const u8,
+) !ClientResult {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
     const alloc = std.heap.c_allocator;
     defer posix.close(client_sock_fd);
@@ -2750,6 +2836,10 @@ fn clientLoop(client_sock_fd: i32, status_cfg: status.StatusConfig, session_name
 
     const stdin_fd = posix.STDIN_FILENO;
     var saw_session_end = false;
+    var foreground_sequence: u64 = 0;
+    var last_foreground: ?ipc.ForegroundProcessResponse = null;
+    var next_foreground_query_ms = std.time.milliTimestamp();
+    const foreground_query_interval_ms: i64 = 250;
 
     const emitSessionEnd = struct {
         fn call(
@@ -2783,6 +2873,12 @@ fn clientLoop(client_sock_fd: i32, status_cfg: status.StatusConfig, session_name
     defer _ = posix.fcntl(stdin_fd, posix.F.SETFL, stdin_orig_flags) catch {};
 
     while (true) {
+        const before_poll_ms = std.time.milliTimestamp();
+        if (status_cfg.isEnabled() and before_poll_ms >= next_foreground_query_ms) {
+            try ipc.appendMessage(alloc, &sock_write_buf, .ForegroundProcessQuery, "");
+            next_foreground_query_ms = before_poll_ms + foreground_query_interval_ms;
+        }
+
         poll_fds.clearRetainingCapacity();
 
         try poll_fds.append(alloc, .{
@@ -2812,7 +2908,11 @@ fn clientLoop(client_sock_fd: i32, status_cfg: status.StatusConfig, session_name
             });
         }
 
-        _ = try posix.poll(poll_fds.items, -1);
+        const poll_timeout: i32 = if (status_cfg.isEnabled())
+            @intCast(@max(@as(i64, 0), next_foreground_query_ms - before_poll_ms))
+        else
+            -1;
+        _ = try posix.poll(poll_fds.items, poll_timeout);
 
         if (poll_fds.items[2].revents & posix.POLL.IN != 0) {
             drainSignalPipe();
@@ -2891,6 +2991,32 @@ fn clientLoop(client_sock_fd: i32, status_cfg: status.StatusConfig, session_name
                             emitSessionEnd(alloc, status_cfg, session_name, .unknown, 0, &saw_session_end);
                         }
                         return ClientResult{ .kind = .detach, .session_name = null };
+                    },
+                    .ForegroundProcessResponse => {
+                        if (msg.payload.len != @sizeOf(ipc.ForegroundProcessResponse)) continue;
+                        const observation = std.mem.bytesToValue(
+                            ipc.ForegroundProcessResponse,
+                            msg.payload[0..@sizeOf(ipc.ForegroundProcessResponse)],
+                        );
+                        if (observation.executable_len > ipc.MAX_EXECUTABLE_LEN) continue;
+                        if (last_foreground != null and std.meta.eql(last_foreground.?, observation)) continue;
+
+                        foreground_sequence +%= 1;
+                        status.StatusFile.emitForeground(
+                            alloc,
+                            status_cfg,
+                            daemon_pid,
+                            daemon_created_at,
+                            foreground_sequence,
+                            observation.state.statusString(),
+                            observation.process_group_id,
+                            observation.executableSlice(),
+                            session_name,
+                            @intCast(std.time.timestamp()),
+                        ) catch |err| {
+                            std.log.warn("failed to emit foreground status: {s}", .{@errorName(err)});
+                        };
+                        last_foreground = observation;
                     },
                     else => {},
                 }
@@ -3209,8 +3335,14 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Info => try daemon.handleInfo(client),
                         .History => try daemon.handleHistory(client, &term, msg.payload),
                         .CwdQuery => try daemon.handleCwd(client),
+                        .ForegroundProcessQuery => try daemon.handleForegroundProcessQuery(client),
                         .Run => try daemon.handleRun(client, msg.payload),
-                        .Ack, .TaskComplete, .SessionEnd, .CwdResponse => {},
+                        .Ack,
+                        .TaskComplete,
+                        .SessionEnd,
+                        .CwdResponse,
+                        .ForegroundProcessResponse,
+                        => {},
                         .Write => try daemon.handleWrite(client, msg.payload),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",

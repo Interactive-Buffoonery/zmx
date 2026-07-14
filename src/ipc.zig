@@ -22,8 +22,10 @@ pub const Tag = enum(u8) {
     CwdQuery = 15,
     CwdResponse = 16,
     ResizePixels = 17,
+    ForegroundProcessQuery = 18,
+    ForegroundProcessResponse = 19,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
-    // @enumFromInt, so out-of-range values (18-255) are representable
+    // @enumFromInt, so out-of-range values (20-255) are representable
     // rather than UB. Switches must handle `_` (unknown tag).
     _,
 };
@@ -108,6 +110,57 @@ pub const CwdResponse = extern struct {
     pub fn pathSlice(self: *const CwdResponse) []const u8 {
         if (self.overflow != 0) return "";
         return self.path[0..self.path_len];
+    }
+};
+
+pub const MAX_EXECUTABLE_LEN = 256;
+
+pub const ForegroundProcessState = enum(u8) {
+    foreground = 1,
+    no_foreground = 2,
+    unavailable = 3,
+    _,
+
+    pub fn statusString(self: ForegroundProcessState) []const u8 {
+        return switch (self) {
+            .foreground => "foreground",
+            .no_foreground => "no-foreground",
+            .unavailable => "unavailable",
+            _ => "unavailable",
+        };
+    }
+};
+
+pub const ForegroundProcessResponse = extern struct {
+    state: ForegroundProcessState,
+    process_group_id: i32,
+    executable_len: u16,
+    executable: [MAX_EXECUTABLE_LEN]u8,
+
+    pub fn foreground(process_group_id: i32, executable: []const u8) ForegroundProcessResponse {
+        var response = std.mem.zeroes(ForegroundProcessResponse);
+        response.state = .foreground;
+        response.process_group_id = process_group_id;
+        const length = @min(executable.len, MAX_EXECUTABLE_LEN);
+        response.executable_len = @intCast(length);
+        @memcpy(response.executable[0..length], executable[0..length]);
+        return response;
+    }
+
+    pub fn noForeground() ForegroundProcessResponse {
+        var response = std.mem.zeroes(ForegroundProcessResponse);
+        response.state = .no_foreground;
+        return response;
+    }
+
+    pub fn unavailable() ForegroundProcessResponse {
+        var response = std.mem.zeroes(ForegroundProcessResponse);
+        response.state = .unavailable;
+        return response;
+    }
+
+    pub fn executableSlice(self: *const ForegroundProcessResponse) []const u8 {
+        return self.executable[0..@min(self.executable_len, MAX_EXECUTABLE_LEN)];
     }
 };
 
@@ -398,7 +451,18 @@ test "Tag wire values are frozen" {
         .{ Tag.Run, 9 },       .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
         .{ Tag.Write, 12 },    .{ Tag.TaskComplete, 13 }, .{ Tag.SessionEnd, 14 },
         .{ Tag.CwdQuery, 15 }, .{ Tag.CwdResponse, 16 },  .{ Tag.ResizePixels, 17 },
+        .{ Tag.ForegroundProcessQuery, 18 },
+        .{ Tag.ForegroundProcessResponse, 19 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
+}
+
+test "foreground process response round trips" {
+    var payload = ForegroundProcessResponse.foreground(9001, "ssh");
+    try std.testing.expectEqual(ForegroundProcessState.foreground, payload.state);
+    try std.testing.expectEqual(@as(i32, 9001), payload.process_group_id);
+    try std.testing.expectEqualStrings("ssh", payload.executableSlice());
+    try std.testing.expectEqual(@as(u8, 18), @intFromEnum(Tag.ForegroundProcessQuery));
+    try std.testing.expectEqual(@as(u8, 19), @intFromEnum(Tag.ForegroundProcessResponse));
 }
 
 test "SessionEnd IPC payload round trips" {

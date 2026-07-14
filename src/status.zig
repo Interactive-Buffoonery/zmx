@@ -27,6 +27,10 @@ pub const StatusConfig = struct {
         if (self.path) |path| alloc.free(path);
         if (self.token) |token| alloc.free(token);
     }
+
+    pub fn isEnabled(self: StatusConfig) bool {
+        return self.path != null and self.token != null;
+    }
 };
 
 pub fn clearEnvForDaemonCreation() void {
@@ -89,6 +93,46 @@ pub const StatusFile = struct {
         try line.appendSlice(alloc, ",\"reason\":");
         try appendJsonString(alloc, &line, reason);
         try line.writer(alloc).print(",\"code\":{d},\"session\":", .{code});
+        try appendJsonString(alloc, &line, session);
+        try line.writer(alloc).print(",\"ts\":{d}}}\n", .{ts});
+
+        if (line.items.len > MAX_STATUS_LINE_LEN) return error.StatusLineTooLong;
+
+        const fd = try openAppend(path);
+        defer posix.close(fd);
+
+        const written = try posix.write(fd, line.items);
+        if (written != line.items.len) return error.ShortWrite;
+    }
+
+    pub fn emitForeground(
+        alloc: std.mem.Allocator,
+        cfg: StatusConfig,
+        daemon_pid: i32,
+        daemon_created_at: u64,
+        sequence: u64,
+        state: []const u8,
+        process_group_id: i32,
+        executable: []const u8,
+        session: []const u8,
+        ts: i64,
+    ) !void {
+        const path = cfg.path orelse return;
+        const token = cfg.token orelse return;
+
+        var line = std.ArrayList(u8).empty;
+        defer line.deinit(alloc);
+
+        try line.appendSlice(alloc, "{\"event\":\"foreground-process\",\"token\":");
+        try appendJsonString(alloc, &line, token);
+        try line.writer(alloc).print(
+            ",\"daemon_pid\":{d},\"daemon_created_at\":{d},\"sequence\":{d},\"state\":",
+            .{ daemon_pid, daemon_created_at, sequence },
+        );
+        try appendJsonString(alloc, &line, state);
+        try line.writer(alloc).print(",\"process_group_id\":{d},\"executable\":", .{process_group_id});
+        try appendJsonString(alloc, &line, executable);
+        try line.appendSlice(alloc, ",\"session\":");
         try appendJsonString(alloc, &line, session);
         try line.writer(alloc).print(",\"ts\":{d}}}\n", .{ts});
 
@@ -217,4 +261,41 @@ test "emitAttached writes one JSON line with incarnation identity" {
     try std.testing.expect(std.mem.indexOf(u8, line, "\"daemon_created_at\":1777000111") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"session\":\"sesh-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"ts\":1777000222") != null);
+}
+
+test "emitForeground writes an incarnation-fenced observation" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(tmp_path);
+    const path = try std.fs.path.join(alloc, &.{ tmp_path, "status.jsonl" });
+    defer alloc.free(path);
+
+    const cfg = StatusConfig{ .path = path, .token = "tok-123" };
+    try StatusFile.emitForeground(
+        alloc,
+        cfg,
+        4242,
+        1_777_000_111,
+        7,
+        "foreground",
+        9001,
+        "ssh",
+        "sesh-1",
+        1_777_000_222,
+    );
+
+    const contents = try tmp.dir.readFileAlloc(alloc, "status.jsonl", 4096);
+    defer alloc.free(contents);
+
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\"event\":\"foreground-process\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\"daemon_pid\":4242") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\"daemon_created_at\":1777000111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\"sequence\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\"state\":\"foreground\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\"process_group_id\":9001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\"executable\":\"ssh\"") != null);
 }

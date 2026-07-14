@@ -4,6 +4,7 @@ const posix = std.posix;
 
 pub const c = switch (builtin.os.tag) {
     .macos => @cImport({
+        @cInclude("libproc.h");
         @cInclude("sys/ioctl.h"); // ioctl and constants
         @cInclude("termios.h");
         @cInclude("stdlib.h");
