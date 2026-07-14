@@ -41,8 +41,6 @@ pub const Header = packed struct {
 pub const Resize = packed struct {
     rows: u16,
     cols: u16,
-    xpixel: u16 = 0,
-    ypixel: u16 = 0,
 };
 
 pub const SessionEndReason = enum(u8) {
@@ -103,7 +101,7 @@ pub const CwdResponse = extern struct {
 pub fn getTerminalSize(fd: i32) Resize {
     var ws: cross.c.struct_winsize = undefined;
     if (cross.c.ioctl(fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
-        return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
+        return .{ .rows = ws.ws_row, .cols = ws.ws_col };
     }
     return .{ .rows = 24, .cols = 160 };
 }
@@ -318,6 +316,10 @@ test "Info wire size is frozen" {
     try std.testing.expectEqual(@as(usize, 552), @sizeOf(Info));
     // packed struct{u8,u32} backs to u40 → @sizeOf rounds to 8, not 5.
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(Header));
+}
+
+test "Init and Resize wire size is frozen" {
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(Resize));
 }
 
 test "Tag wire values are frozen" {

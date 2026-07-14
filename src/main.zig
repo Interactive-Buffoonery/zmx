@@ -792,8 +792,8 @@ const Daemon = struct {
         var ws: cross.c.struct_winsize = .{
             .ws_row = size.rows,
             .ws_col = size.cols,
-            .ws_xpixel = size.xpixel,
-            .ws_ypixel = size.ypixel,
+            .ws_xpixel = 0,
+            .ws_ypixel = 0,
         };
 
         var master_fd: c_int = undefined;
@@ -1150,8 +1150,8 @@ const Daemon = struct {
             var ws: cross.c.struct_winsize = .{
                 .ws_row = resize.rows,
                 .ws_col = resize.cols,
-                .ws_xpixel = resize.xpixel,
-                .ws_ypixel = resize.ypixel,
+                .ws_xpixel = 0,
+                .ws_ypixel = 0,
             };
             _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
             // Disable prompt_redraw before resize. The daemon's internal terminal
@@ -1189,8 +1189,8 @@ const Daemon = struct {
         var ws: cross.c.struct_winsize = .{
             .ws_row = resize.rows,
             .ws_col = resize.cols,
-            .ws_xpixel = resize.xpixel,
-            .ws_ypixel = resize.ypixel,
+            .ws_xpixel = 0,
+            .ws_ypixel = 0,
         };
         _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
         // Disable prompt_redraw before resize (same rationale as handleInit).
