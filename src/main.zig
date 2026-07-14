@@ -792,8 +792,8 @@ const Daemon = struct {
         var ws: cross.c.struct_winsize = .{
             .ws_row = size.rows,
             .ws_col = size.cols,
-            .ws_xpixel = 0,
-            .ws_ypixel = 0,
+            .ws_xpixel = size.xpixel,
+            .ws_ypixel = size.ypixel,
         };
 
         var master_fd: c_int = undefined;
@@ -1199,6 +1199,23 @@ const Daemon = struct {
         defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
         try term.resize(self.alloc, resize.cols, resize.rows);
         std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
+    }
+
+    pub fn handleResizePixels(
+        self: *Daemon,
+        client: *Client,
+        pty_fd: i32,
+        payload: []const u8,
+    ) void {
+        if (payload.len != @sizeOf(ipc.ResizePixels)) return;
+        if (self.leader_client_fd != client.socket_fd) return;
+
+        const pixels = std.mem.bytesToValue(ipc.ResizePixels, payload);
+        var ws: cross.c.struct_winsize = undefined;
+        if (cross.c.ioctl(pty_fd, cross.c.TIOCGWINSZ, &ws) != 0) return;
+        ws.ws_xpixel = pixels.xpixel;
+        ws.ws_ypixel = pixels.ypixel;
+        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
     }
 
     pub fn handleDetach(self: *Daemon, client: *Client, i: usize) void {
@@ -2720,7 +2737,7 @@ fn clientLoop(client_sock_fd: i32, status_cfg: status.StatusConfig, session_name
 
     // Send init message with terminal size (buffered)
     const size = ipc.getTerminalSize(posix.STDOUT_FILENO);
-    try ipc.appendMessage(alloc, &sock_write_buf, .Init, std.mem.asBytes(&size));
+    try ipc.appendTerminalSizeMessages(alloc, &sock_write_buf, .Init, size);
 
     var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(alloc, 4);
     defer poll_fds.deinit(alloc);
@@ -2800,7 +2817,7 @@ fn clientLoop(client_sock_fd: i32, status_cfg: status.StatusConfig, session_name
         if (poll_fds.items[2].revents & posix.POLL.IN != 0) {
             drainSignalPipe();
             const next_size = ipc.getTerminalSize(posix.STDOUT_FILENO);
-            try ipc.appendMessage(alloc, &sock_write_buf, .Resize, std.mem.asBytes(&next_size));
+            try ipc.appendTerminalSizeMessages(alloc, &sock_write_buf, .Resize, next_size);
         }
 
         // Handle stdin -> socket (Input)
@@ -2858,12 +2875,7 @@ fn clientLoop(client_sock_fd: i32, status_cfg: status.StatusConfig, session_name
                         // daemon is asking for the client's window size usually in response
                         // to this client being set as leader.
                         const next_size = ipc.getTerminalSize(posix.STDOUT_FILENO);
-                        try ipc.appendMessage(
-                            alloc,
-                            &sock_write_buf,
-                            .Resize,
-                            std.mem.asBytes(&next_size),
-                        );
+                        try ipc.appendTerminalSizeMessages(alloc, &sock_write_buf, .Resize, next_size);
                     },
                     .Switch => {
                         return ClientResult{ .kind = .switch_session, .session_name = try alloc.dupe(u8, msg.payload) };
@@ -3181,6 +3193,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload),
                         .Switch => try daemon.handleSwitch(msg.payload),
                         .Resize => try daemon.handleResize(client, pty_fd, &term, msg.payload),
+                        .ResizePixels => daemon.handleResizePixels(client, pty_fd, msg.payload),
                         .Detach => {
                             daemon.handleDetach(client, i);
                             break :clients_loop;

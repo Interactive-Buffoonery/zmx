@@ -21,8 +21,9 @@ pub const Tag = enum(u8) {
     SessionEnd = 14,
     CwdQuery = 15,
     CwdResponse = 16,
+    ResizePixels = 17,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
-    // @enumFromInt, so out-of-range values (17-255) are representable
+    // @enumFromInt, so out-of-range values (18-255) are representable
     // rather than UB. Switches must handle `_` (unknown tag).
     _,
 };
@@ -41,6 +42,18 @@ pub const Header = packed struct {
 pub const Resize = packed struct {
     rows: u16,
     cols: u16,
+};
+
+pub const ResizePixels = packed struct {
+    xpixel: u16,
+    ypixel: u16,
+};
+
+pub const TerminalSize = packed struct {
+    rows: u16,
+    cols: u16,
+    xpixel: u16,
+    ypixel: u16,
 };
 
 pub const SessionEndReason = enum(u8) {
@@ -98,12 +111,17 @@ pub const CwdResponse = extern struct {
     }
 };
 
-pub fn getTerminalSize(fd: i32) Resize {
+pub fn getTerminalSize(fd: i32) TerminalSize {
     var ws: cross.c.struct_winsize = undefined;
     if (cross.c.ioctl(fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
-        return .{ .rows = ws.ws_row, .cols = ws.ws_col };
+        return .{
+            .rows = ws.ws_row,
+            .cols = ws.ws_col,
+            .xpixel = ws.ws_xpixel,
+            .ypixel = ws.ws_ypixel,
+        };
     }
-    return .{ .rows = 24, .cols = 160 };
+    return .{ .rows = 24, .cols = 160, .xpixel = 0, .ypixel = 0 };
 }
 
 pub const MAX_CMD_LEN = 256;
@@ -161,6 +179,18 @@ pub fn appendMessage(
     if (data.len > 0) {
         list.appendSliceAssumeCapacity(data);
     }
+}
+
+pub fn appendTerminalSizeMessages(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    tag: Tag,
+    size: TerminalSize,
+) !void {
+    const cells = Resize{ .rows = size.rows, .cols = size.cols };
+    const pixels = ResizePixels{ .xpixel = size.xpixel, .ypixel = size.ypixel };
+    try appendMessage(alloc, list, tag, std.mem.asBytes(&cells));
+    try appendMessage(alloc, list, .ResizePixels, std.mem.asBytes(&pixels));
 }
 
 fn writeAll(fd: i32, data: []const u8) !void {
@@ -322,6 +352,44 @@ test "Init and Resize wire size is frozen" {
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(Resize));
 }
 
+test "terminal size messages preserve legacy cells and extend pixels" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    const size = TerminalSize{ .rows = 42, .cols = 120, .xpixel = 1440, .ypixel = 900 };
+    try appendTerminalSizeMessages(alloc, &buf, .Init, size);
+
+    var socket_buf = SocketBuffer{
+        .buf = buf,
+        .alloc = alloc,
+        .head = 0,
+    };
+    buf = .empty;
+    defer socket_buf.deinit();
+
+    const init = socket_buf.next() orelse return error.MissingInitMessage;
+    try std.testing.expectEqual(Tag.Init, init.header.tag);
+    try std.testing.expectEqual(@as(usize, 4), init.payload.len);
+    try std.testing.expectEqual(
+        Resize{ .rows = 42, .cols = 120 },
+        std.mem.bytesToValue(Resize, init.payload),
+    );
+
+    const pixels = socket_buf.next() orelse return error.MissingResizePixelsMessage;
+    try std.testing.expectEqual(Tag.ResizePixels, pixels.header.tag);
+    try std.testing.expectEqual(@as(usize, 4), pixels.payload.len);
+    try std.testing.expectEqual(
+        ResizePixels{ .xpixel = 1440, .ypixel = 900 },
+        std.mem.bytesToValue(ResizePixels, pixels.payload),
+    );
+
+    try appendTerminalSizeMessages(alloc, &socket_buf.buf, .Resize, size);
+    const resize = socket_buf.next() orelse return error.MissingResizeMessage;
+    try std.testing.expectEqual(Tag.Resize, resize.header.tag);
+    try std.testing.expectEqual(@as(usize, 4), resize.payload.len);
+}
+
 test "Tag wire values are frozen" {
     inline for (.{
         .{ Tag.Input, 0 },     .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
@@ -329,7 +397,7 @@ test "Tag wire values are frozen" {
         .{ Tag.Info, 6 },      .{ Tag.Init, 7 },          .{ Tag.History, 8 },
         .{ Tag.Run, 9 },       .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
         .{ Tag.Write, 12 },    .{ Tag.TaskComplete, 13 }, .{ Tag.SessionEnd, 14 },
-        .{ Tag.CwdQuery, 15 }, .{ Tag.CwdResponse, 16 },
+        .{ Tag.CwdQuery, 15 }, .{ Tag.CwdResponse, 16 },  .{ Tag.ResizePixels, 17 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 
