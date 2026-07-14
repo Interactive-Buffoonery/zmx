@@ -649,11 +649,8 @@ const Daemon = struct {
     const EnsureSessionResult = struct {
         created: bool,
         is_daemon: bool,
-    };
-
-    const AttachedStatusIdentity = struct {
-        daemon_pid: i32,
-        daemon_created_at: u64,
+        daemon_pid: i32 = 0,
+        daemon_created_at: u64 = 0,
     };
 
     pub fn deinit(self: *Daemon) void {
@@ -714,20 +711,6 @@ const Daemon = struct {
         for (self.clients.items) |client| {
             self.sendSessionEndToClient(client, reason, code);
         }
-    }
-
-    fn attachedStatusIdentity(self: *Daemon) AttachedStatusIdentity {
-        // Intentional redundant probe for now; failure emits daemon_pid/created_at as 0 so chrome-clear falls back safely.
-        const probe = ipc.probeSession(self.alloc, self.socket_path) catch |err| {
-            std.log.warn("status identity probe failed: {s}", .{@errorName(err)});
-            return .{ .daemon_pid = 0, .daemon_created_at = 0 };
-        };
-        defer posix.close(probe.fd);
-
-        return .{
-            .daemon_pid = darwin_proc.parentPid(probe.info.pid) orelse 0,
-            .daemon_created_at = probe.info.created_at,
-        };
     }
 
     fn setLeader(self: *Daemon, client: *Client) !void {
@@ -833,6 +816,8 @@ const Daemon = struct {
 
         const exists = try socket.sessionExists(dir, self.session_name);
         var should_create = !exists;
+        var daemon_pid: i32 = 0;
+        var daemon_created_at: u64 = 0;
 
         if (exists) {
             // A socket FILE existing does not mean a live daemon is behind it.
@@ -862,6 +847,8 @@ const Daemon = struct {
             var probe_attempt: u8 = 0;
             while (true) {
                 if (ipc.probeSession(self.alloc, self.socket_path)) |probe| {
+                    daemon_pid = darwin_proc.parentPid(probe.info.pid) orelse 0;
+                    daemon_created_at = probe.info.created_at;
                     posix.close(probe.fd);
                     if (self.command != null) {
                         std.log.warn(
@@ -997,10 +984,20 @@ const Daemon = struct {
             }
             posix.close(server_sock_fd);
             std.Thread.sleep(10 * std.time.ns_per_ms);
-            return .{ .created = true, .is_daemon = false };
+            return .{
+                .created = true,
+                .is_daemon = false,
+                .daemon_pid = pid,
+                .daemon_created_at = self.created_at,
+            };
         }
 
-        return .{ .created = false, .is_daemon = false };
+        return .{
+            .created = false,
+            .is_daemon = false,
+            .daemon_pid = daemon_pid,
+            .daemon_created_at = daemon_created_at,
+        };
     }
 
     const PTY_WRITE_BUF_MAX = 256 * 1024;
@@ -2439,13 +2436,12 @@ fn attach(daemon: *Daemon) !void {
     const result = try daemon.ensureSession();
     if (result.is_daemon) return;
 
-    const identity = daemon.attachedStatusIdentity();
     status.StatusFile.emitAttached(
         daemon.alloc,
         status_cfg,
         result.created,
-        identity.daemon_pid,
-        identity.daemon_created_at,
+        result.daemon_pid,
+        result.daemon_created_at,
         daemon.session_name,
         @intCast(std.time.timestamp()),
     ) catch |err| {
@@ -2503,8 +2499,8 @@ fn attach(daemon: *Daemon) !void {
     const looper = try clientLoop(
         client_sock,
         status_cfg,
-        identity.daemon_pid,
-        identity.daemon_created_at,
+        result.daemon_pid,
+        result.daemon_created_at,
         daemon.session_name,
     );
     switch (looper.kind) {
