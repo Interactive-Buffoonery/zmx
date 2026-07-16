@@ -392,34 +392,46 @@ pub fn probeSession(
     alloc: std.mem.Allocator,
     socket_path: []const u8,
 ) SessionProbeError!SessionProbeResult {
-    const timeout_ms = 1000;
     const fd = try connectSession(socket_path);
     errdefer posix.close(fd);
 
-    send(fd, .Info, "") catch return error.Unexpected;
+    return .{
+        .fd = fd,
+        .info = try requestSessionInfo(alloc, fd, 1000),
+    };
+}
 
-    var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    const poll_result = posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
-    if (poll_result == 0) {
-        return error.Timeout;
-    }
+pub fn requestSessionInfo(
+    alloc: std.mem.Allocator,
+    fd: i32,
+    timeout_ms: u64,
+) SessionProbeError!Info {
+    var timer = std.time.Timer.start() catch return error.Unexpected;
+
+    send(fd, .Info, "") catch return error.Unexpected;
 
     var sb = SocketBuffer.init(alloc) catch return error.Unexpected;
     defer sb.deinit();
 
-    const n = sb.read(fd) catch return error.Unexpected;
-    if (n == 0) return error.Unexpected;
-
-    while (sb.next()) |msg| {
-        if (msg.header.tag == .Info) {
-            if (msg.payload.len != @sizeOf(Info)) return error.InfoSizeMismatch;
-            return .{
-                .fd = fd,
-                .info = std.mem.bytesToValue(Info, msg.payload[0..@sizeOf(Info)]),
-            };
+    while (true) {
+        while (sb.next()) |msg| {
+            if (msg.header.tag == .Info) {
+                if (msg.payload.len != @sizeOf(Info)) return error.InfoSizeMismatch;
+                return std.mem.bytesToValue(Info, msg.payload[0..@sizeOf(Info)]);
+            }
         }
+
+        const elapsed_ms = timer.read() / std.time.ns_per_ms;
+        if (elapsed_ms >= timeout_ms) return error.Timeout;
+        const remaining_ms: i32 = @intCast(@min(timeout_ms - elapsed_ms, std.math.maxInt(i32)));
+        var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        const poll_result = posix.poll(&poll_fds, remaining_ms) catch return error.Unexpected;
+        if (poll_result == 0) return error.Timeout;
+        if (poll_fds[0].revents & posix.POLL.IN == 0) return error.Unexpected;
+
+        const n = sb.read(fd) catch return error.Unexpected;
+        if (n == 0) return error.Unexpected;
     }
-    return error.Unexpected;
 }
 
 //  WIRE PROTOCOL FREEZE — read before "fixing" any test below.

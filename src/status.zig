@@ -55,7 +55,7 @@ pub const StatusFile = struct {
         var line = std.ArrayList(u8).empty;
         defer line.deinit(alloc);
 
-        try line.appendSlice(alloc, "{\"event\":\"attached\",\"token\":");
+        try line.appendSlice(alloc, "\n{\"event\":\"attached\",\"token\":");
         try appendJsonString(alloc, &line, token);
         try line.appendSlice(alloc, ",\"created\":");
         try line.appendSlice(alloc, if (created) "true" else "false");
@@ -89,7 +89,7 @@ pub const StatusFile = struct {
         var line = std.ArrayList(u8).empty;
         defer line.deinit(alloc);
 
-        try line.appendSlice(alloc, "{\"event\":\"session-end\",\"token\":");
+        try line.appendSlice(alloc, "\n{\"event\":\"session-end\",\"token\":");
         try appendJsonString(alloc, &line, token);
         try line.appendSlice(alloc, ",\"reason\":");
         try appendJsonString(alloc, &line, reason);
@@ -126,7 +126,7 @@ pub const StatusFile = struct {
         var line = std.ArrayList(u8).empty;
         defer line.deinit(alloc);
 
-        try line.appendSlice(alloc, "{\"event\":\"foreground-process\",\"token\":");
+        try line.appendSlice(alloc, "\n{\"event\":\"foreground-process\",\"token\":");
         try appendJsonString(alloc, &line, token);
         try line.writer(alloc).print(
             ",\"daemon_pid\":{d},\"daemon_created_at\":{d},\"daemon_incarnation\":{d},\"transition_sequence\":{d},\"sample_sequence\":{d},\"state\":",
@@ -251,8 +251,10 @@ test "emitAttached writes one JSON line with incarnation identity" {
     const contents = try tmp.dir.readFileAlloc(alloc, "status.jsonl", 4096);
     defer alloc.free(contents);
 
+    try std.testing.expect(std.mem.startsWith(u8, contents, "\n"));
     try std.testing.expect(std.mem.endsWith(u8, contents, "\n"));
     var lines = std.mem.splitScalar(u8, contents, '\n');
+    try std.testing.expectEqual(@as(usize, 0), (lines.next() orelse "missing").len);
     const line = lines.next() orelse return error.MissingStatusLine;
     try std.testing.expectEqual(@as(usize, 0), (lines.next() orelse "").len);
     try std.testing.expect(lines.next() == null);
@@ -306,4 +308,46 @@ test "emitForeground writes an incarnation-fenced observation" {
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"state\":\"foreground\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"process_group_id\":9001") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"executable\":\"ssh\"") != null);
+}
+
+test "status records resynchronize after a partial prior append" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("status.jsonl", .{ .mode = 0o600 });
+    try file.writeAll("{\"event\":\"partial");
+    file.close();
+
+    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(tmp_path);
+    const path = try std.fs.path.join(alloc, &.{ tmp_path, "status.jsonl" });
+    defer alloc.free(path);
+
+    try StatusFile.emitSessionEnd(
+        alloc,
+        .{ .path = path, .token = "tok" },
+        "detached",
+        0,
+        "sesh-1",
+        1_777_000_222,
+    );
+
+    const contents = try tmp.dir.readFileAlloc(alloc, "status.jsonl", 4096);
+    defer alloc.free(contents);
+    try std.testing.expect(
+        std.mem.indexOf(u8, contents, "\"partial\n{\"event\":\"session-end\"") != null,
+    );
+
+    var valid_records: usize = 0;
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value.object.get("event")) |event| {
+            if (std.mem.eql(u8, event.string, "session-end")) valid_records += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), valid_records);
 }
