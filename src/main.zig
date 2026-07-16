@@ -9,7 +9,6 @@ const util = @import("util.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 const status = @import("status.zig");
-const darwin_proc = @import("darwin_proc.zig");
 const cwd_mod = @import("cwd.zig");
 
 pub const version = build_options.version;
@@ -641,6 +640,11 @@ const ForegroundProcessTracker = struct {
     }
 };
 
+fn randomDaemonIncarnation() u64 {
+    const value = std.crypto.random.int(u64) & std.math.maxInt(i64);
+    return if (value == 0) 1 else value;
+}
+
 const Daemon = struct {
     cfg: *Cfg,
     alloc: std.mem.Allocator,
@@ -658,6 +662,7 @@ const Daemon = struct {
     has_had_client: bool = false,
     has_terminal_client: bool = false, // true only after a real attach (.Init received)
     created_at: u64, // unix timestamp (ns)
+    incarnation: u64 = 0,
     is_task_mode: bool = false, // flag for when session is run as a task
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
     task_ended_at: ?u64 = null, // timestamp when task exited
@@ -672,8 +677,6 @@ const Daemon = struct {
     const EnsureSessionResult = struct {
         created: bool,
         is_daemon: bool,
-        daemon_pid: i32 = 0,
-        daemon_created_at: u64 = 0,
     };
 
     pub fn deinit(self: *Daemon) void {
@@ -839,8 +842,6 @@ const Daemon = struct {
 
         const exists = try socket.sessionExists(dir, self.session_name);
         var should_create = !exists;
-        var daemon_pid: i32 = 0;
-        var daemon_created_at: u64 = 0;
 
         if (exists) {
             // A socket FILE existing does not mean a live daemon is behind it.
@@ -870,8 +871,6 @@ const Daemon = struct {
             var probe_attempt: u8 = 0;
             while (true) {
                 if (ipc.probeSession(self.alloc, self.socket_path)) |probe| {
-                    daemon_pid = darwin_proc.parentPid(probe.info.pid) orelse 0;
-                    daemon_created_at = probe.info.created_at;
                     posix.close(probe.fd);
                     if (self.command != null) {
                         std.log.warn(
@@ -907,6 +906,7 @@ const Daemon = struct {
             if (pid == 0) { // child (daemon)
                 // becomes the session leader and detaches process from its controlling terminal
                 _ = try posix.setsid();
+                self.incarnation = randomDaemonIncarnation();
 
                 log_system.deinit();
 
@@ -1007,20 +1007,10 @@ const Daemon = struct {
             }
             posix.close(server_sock_fd);
             std.Thread.sleep(10 * std.time.ns_per_ms);
-            return .{
-                .created = true,
-                .is_daemon = false,
-                .daemon_pid = pid,
-                .daemon_created_at = self.created_at,
-            };
+            return .{ .created = true, .is_daemon = false };
         }
 
-        return .{
-            .created = false,
-            .is_daemon = false,
-            .daemon_pid = daemon_pid,
-            .daemon_created_at = daemon_created_at,
-        };
+        return .{ .created = false, .is_daemon = false };
     }
 
     const PTY_WRITE_BUF_MAX = 256 * 1024;
@@ -1353,9 +1343,12 @@ const Daemon = struct {
     }
 
     pub fn handleForegroundProcessQuery(self: *Daemon, client: *Client) !void {
-        const response = self.foreground_process_tracker.next(
+        var response = self.foreground_process_tracker.next(
             foregroundProcessResponse(self.alloc, self.pty_fd),
         );
+        response.daemon_pid = @intCast(std.c.getpid());
+        response.daemon_created_at = self.created_at;
+        response.daemon_incarnation = self.incarnation;
         try ipc.appendMessage(
             self.alloc,
             &client.write_buf,
@@ -2275,18 +2268,40 @@ fn foregroundProcessResponseFrom(
     if (process_group_id < 0) return .unavailable();
     if (process_group_id == 0) return .noForeground();
     const name = executable orelse return .unavailable();
-    if (name.len == 0) return .unavailable();
+    if (name.len == 0 or !std.unicode.utf8ValidateSlice(name)) return .unavailable();
     return .foreground(process_group_id, name);
 }
 
 const ForegroundProcessPayload = union(enum) {
     current: ipc.ForegroundProcessResponse,
+    identity_mismatch,
     malformed,
     stale: ipc.ForegroundProcessResponse,
 };
 
+const DaemonStatusIdentity = struct {
+    pid: i32,
+    created_at: u64,
+    incarnation: u64,
+
+    fn fromResponse(response: ipc.ForegroundProcessResponse) DaemonStatusIdentity {
+        return .{
+            .pid = response.daemon_pid,
+            .created_at = response.daemon_created_at,
+            .incarnation = response.daemon_incarnation,
+        };
+    }
+
+    fn matches(self: DaemonStatusIdentity, response: ipc.ForegroundProcessResponse) bool {
+        return self.pid == response.daemon_pid and
+            self.created_at == response.daemon_created_at and
+            self.incarnation == response.daemon_incarnation;
+    }
+};
+
 fn foregroundProcessPayload(
     payload: []const u8,
+    expected_identity: ?DaemonStatusIdentity,
     last_transition_sequence: u64,
     last_sample_sequence: u64,
 ) ForegroundProcessPayload {
@@ -2297,12 +2312,101 @@ fn foregroundProcessPayload(
         payload[0..@sizeOf(ipc.ForegroundProcessResponse)],
     );
     if (!response.isValid()) return .malformed;
+    if (expected_identity) |identity| {
+        if (!identity.matches(response)) return .identity_mismatch;
+    }
     if (response.transition_sequence < last_transition_sequence or
         response.sample_sequence <= last_sample_sequence)
     {
         return .{ .stale = response };
     }
     return .{ .current = response };
+}
+
+const ForegroundStatusPublication = struct {
+    kind: enum { observation, malformed, stale },
+    response: ipc.ForegroundProcessResponse,
+
+    fn observation(response: ipc.ForegroundProcessResponse) ForegroundStatusPublication {
+        return .{ .kind = .observation, .response = response };
+    }
+
+    fn fault(
+        kind: enum { malformed, stale },
+        identity: DaemonStatusIdentity,
+        transition_sequence: u64,
+        sample_sequence: u64,
+    ) ForegroundStatusPublication {
+        var response = std.mem.zeroes(ipc.ForegroundProcessResponse);
+        response.daemon_pid = identity.pid;
+        response.daemon_created_at = identity.created_at;
+        response.daemon_incarnation = identity.incarnation;
+        response.transition_sequence = transition_sequence;
+        response.sample_sequence = sample_sequence;
+        return .{
+            .kind = switch (kind) {
+                .malformed => .malformed,
+                .stale => .stale,
+            },
+            .response = response,
+        };
+    }
+
+    fn stateString(self: ForegroundStatusPublication) []const u8 {
+        return switch (self.kind) {
+            .observation => self.response.state.statusString(),
+            .malformed => "malformed",
+            .stale => "stale",
+        };
+    }
+
+    fn sameMeaning(
+        self: ForegroundStatusPublication,
+        other: ForegroundStatusPublication,
+    ) bool {
+        if (self.kind != other.kind or
+            self.response.daemon_pid != other.response.daemon_pid or
+            self.response.daemon_created_at != other.response.daemon_created_at or
+            self.response.daemon_incarnation != other.response.daemon_incarnation or
+            self.response.transition_sequence != other.response.transition_sequence)
+        {
+            return false;
+        }
+        if (self.kind != .observation) return true;
+        return self.response.sameObservation(&other.response);
+    }
+};
+
+fn publishForegroundStatus(
+    alloc: std.mem.Allocator,
+    cfg: status.StatusConfig,
+    session_name: []const u8,
+    last_published: *?ForegroundStatusPublication,
+    publication: ForegroundStatusPublication,
+) void {
+    if (last_published.*) |previous| {
+        if (previous.sameMeaning(publication)) return;
+    }
+
+    const response = publication.response;
+    status.StatusFile.emitForeground(
+        alloc,
+        cfg,
+        response.daemon_pid,
+        response.daemon_created_at,
+        response.daemon_incarnation,
+        response.transition_sequence,
+        response.sample_sequence,
+        publication.stateString(),
+        if (publication.kind == .observation) response.process_group_id else 0,
+        if (publication.kind == .observation) response.executableSlice() else "",
+        session_name,
+        @intCast(std.time.timestamp()),
+    ) catch |err| {
+        std.log.warn("failed to emit foreground status: {s}", .{@errorName(err)});
+        return;
+    };
+    last_published.* = publication;
 }
 
 fn foregroundProcessResponse(
@@ -2438,6 +2542,9 @@ test "foreground response fails closed without process identity" {
 
     const unavailable = foregroundProcessResponseFrom(-1, null);
     try std.testing.expectEqual(ipc.ForegroundProcessState.unavailable, unavailable.state);
+
+    const invalid_utf8 = foregroundProcessResponseFrom(9001, &.{0xff});
+    try std.testing.expectEqual(ipc.ForegroundProcessState.unavailable, invalid_utf8.state);
 }
 
 test "foreground tracker records shell ssh shell transitions" {
@@ -2452,6 +2559,12 @@ test "foreground tracker records shell ssh shell transitions" {
     try std.testing.expectEqual(@as(u64, 3), returned_shell.transition_sequence);
     try std.testing.expect(shell.sample_sequence < ssh.sample_sequence);
     try std.testing.expect(ssh.sample_sequence < returned_shell.sample_sequence);
+}
+
+test "daemon incarnation is nonzero and JSON integer safe" {
+    const incarnation = randomDaemonIncarnation();
+    try std.testing.expect(incarnation > 0);
+    try std.testing.expect(incarnation <= std.math.maxInt(i64));
 }
 
 test "background ssh does not change the foreground shell observation" {
@@ -2480,27 +2593,107 @@ test "detach reattach keeps daemon sequence and respawn starts a new incarnation
 
 test "foreground payload rejects malformed and replayed samples" {
     var current = ipc.ForegroundProcessResponse.foreground(101, "ssh");
+    current.daemon_pid = 4242;
+    current.daemon_created_at = 1_777_000_111;
+    current.daemon_incarnation = 0x1234;
     current.transition_sequence = 2;
     current.sample_sequence = 7;
+    const identity = DaemonStatusIdentity.fromResponse(current);
 
-    switch (foregroundProcessPayload(std.mem.asBytes(&current), 1, 6)) {
+    switch (foregroundProcessPayload(std.mem.asBytes(&current), identity, 1, 6)) {
         .current => {},
         else => return error.ExpectedCurrentForegroundSample,
     }
-    switch (foregroundProcessPayload(std.mem.asBytes(&current), 2, 7)) {
+    switch (foregroundProcessPayload(std.mem.asBytes(&current), identity, 2, 7)) {
         .stale => {},
         else => return error.ExpectedStaleForegroundSample,
     }
-    switch (foregroundProcessPayload(std.mem.asBytes(&current)[0..4], 0, 0)) {
+    switch (foregroundProcessPayload(std.mem.asBytes(&current)[0..4], identity, 0, 0)) {
         .malformed => {},
         else => return error.ExpectedMalformedForegroundSample,
     }
 
     current.state = @enumFromInt(99);
-    switch (foregroundProcessPayload(std.mem.asBytes(&current), 0, 0)) {
+    switch (foregroundProcessPayload(std.mem.asBytes(&current), identity, 0, 0)) {
         .malformed => {},
         else => return error.ExpectedMalformedForegroundState,
     }
+}
+
+test "foreground payload rejects another daemon incarnation and accepts respawn on reconnect" {
+    var response = ipc.ForegroundProcessResponse.foreground(101, "ssh");
+    response.daemon_pid = 4242;
+    response.daemon_created_at = 1_777_000_111;
+    response.daemon_incarnation = 0x1234;
+    response.transition_sequence = 1;
+    response.sample_sequence = 1;
+    const first_identity = DaemonStatusIdentity.fromResponse(response);
+
+    response.daemon_pid = 4343;
+    response.daemon_incarnation = 0x5678;
+    switch (foregroundProcessPayload(std.mem.asBytes(&response), first_identity, 0, 0)) {
+        .identity_mismatch => {},
+        else => return error.ExpectedForegroundIdentityMismatch,
+    }
+    switch (foregroundProcessPayload(std.mem.asBytes(&response), null, 0, 0)) {
+        .current => {},
+        else => return error.ExpectedFreshForegroundIncarnation,
+    }
+}
+
+test "foreground publication retries after a failed status write" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(tmp_path);
+    const missing_path = try std.fs.path.join(alloc, &.{ tmp_path, "missing", "status.jsonl" });
+    defer alloc.free(missing_path);
+    const valid_path = try std.fs.path.join(alloc, &.{ tmp_path, "status.jsonl" });
+    defer alloc.free(valid_path);
+
+    var response = ipc.ForegroundProcessResponse.foreground(101, "ssh");
+    response.daemon_pid = 4242;
+    response.daemon_created_at = 1_777_000_111;
+    response.daemon_incarnation = 0x1234;
+    response.transition_sequence = 1;
+    response.sample_sequence = 1;
+    const publication = ForegroundStatusPublication.observation(response);
+    var last_published: ?ForegroundStatusPublication = null;
+
+    publishForegroundStatus(
+        alloc,
+        .{ .path = missing_path, .token = "tok" },
+        "sesh-1",
+        &last_published,
+        publication,
+    );
+    try std.testing.expect(last_published == null);
+
+    publishForegroundStatus(
+        alloc,
+        .{ .path = valid_path, .token = "tok" },
+        "sesh-1",
+        &last_published,
+        publication,
+    );
+    try std.testing.expect(last_published != null);
+    const contents = try tmp.dir.readFileAlloc(alloc, "status.jsonl", 4096);
+    defer alloc.free(contents);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\"state\":\"foreground\"") != null);
+}
+
+test "foreground polling deadline uses monotonic elapsed nanoseconds" {
+    try std.testing.expectEqual(@as(i32, 0), foregroundPollTimeoutMs(500, 500));
+    try std.testing.expectEqual(
+        @as(i32, 250),
+        foregroundPollTimeoutMs(0, 250 * std.time.ns_per_ms),
+    );
+    try std.testing.expectEqual(
+        @as(i32, 1),
+        foregroundPollTimeoutMs(0, std.time.ns_per_ms - 1),
+    );
 }
 
 fn switchSesh(daemon: *Daemon, current_sesh: []const u8) !void {
@@ -2549,18 +2742,6 @@ fn attach(daemon: *Daemon) !void {
 
     const result = try daemon.ensureSession();
     if (result.is_daemon) return;
-
-    status.StatusFile.emitAttached(
-        daemon.alloc,
-        status_cfg,
-        result.created,
-        result.daemon_pid,
-        result.daemon_created_at,
-        daemon.session_name,
-        @intCast(std.time.timestamp()),
-    ) catch |err| {
-        std.log.warn("failed to emit attached status: {s}", .{@errorName(err)});
-    };
 
     const client_sock = try socket.sessionConnect(daemon.socket_path);
     std.log.info("attached session={s}", .{daemon.session_name});
@@ -2613,8 +2794,7 @@ fn attach(daemon: *Daemon) !void {
     const looper = try clientLoop(
         client_sock,
         status_cfg,
-        result.daemon_pid,
-        result.daemon_created_at,
+        result.created,
         daemon.session_name,
     );
     switch (looper.kind) {
@@ -2906,13 +3086,22 @@ const ClientResult = struct {
     session_name: ?[]const u8,
 };
 
+fn foregroundPollTimeoutMs(now_ns: u64, next_query_ns: u64) i32 {
+    if (now_ns >= next_query_ns) return 0;
+    const delay_ms = std.math.divCeil(
+        u64,
+        next_query_ns - now_ns,
+        std.time.ns_per_ms,
+    ) catch std.math.maxInt(u64);
+    return @intCast(@min(delay_ms, std.math.maxInt(i32)));
+}
+
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
 fn clientLoop(
     client_sock_fd: i32,
     status_cfg: status.StatusConfig,
-    daemon_pid: i32,
-    daemon_created_at: u64,
+    created: bool,
     session_name: []const u8,
 ) !ClientResult {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
@@ -2946,14 +3135,17 @@ fn clientLoop(
 
     const stdin_fd = posix.STDIN_FILENO;
     var saw_session_end = false;
+    var daemon_identity: ?DaemonStatusIdentity = null;
+    var attached_published = false;
     var last_foreground_transition_sequence: u64 = 0;
     var last_foreground_sample_sequence: u64 = 0;
-    var foreground_fault: ?enum { malformed, stale } = null;
-    const foreground_started_ms = std.time.milliTimestamp();
-    var last_foreground_response_ms = foreground_started_ms;
-    var next_foreground_query_ms = foreground_started_ms;
-    const foreground_query_interval_ms: i64 = 250;
-    const foreground_stale_after_ms: i64 = 1_000;
+    var desired_foreground_status: ?ForegroundStatusPublication = null;
+    var last_published_foreground_status: ?ForegroundStatusPublication = null;
+    var foreground_timer = try std.time.Timer.start();
+    var last_foreground_response_ns: u64 = 0;
+    var next_foreground_query_ns: u64 = 0;
+    const foreground_query_interval_ns = 250 * std.time.ns_per_ms;
+    const foreground_stale_after_ns = std.time.ns_per_s;
 
     const emitSessionEnd = struct {
         fn call(
@@ -2979,37 +3171,6 @@ fn clientLoop(
         }
     }.call;
 
-    const emitForeground = struct {
-        fn call(
-            alloc_inner: std.mem.Allocator,
-            cfg: status.StatusConfig,
-            daemon_pid_inner: i32,
-            daemon_created_at_inner: u64,
-            transition_sequence: u64,
-            sample_sequence: u64,
-            state: []const u8,
-            process_group_id: i32,
-            executable: []const u8,
-            session: []const u8,
-        ) void {
-            status.StatusFile.emitForeground(
-                alloc_inner,
-                cfg,
-                daemon_pid_inner,
-                daemon_created_at_inner,
-                transition_sequence,
-                sample_sequence,
-                state,
-                process_group_id,
-                executable,
-                session,
-                @intCast(std.time.timestamp()),
-            ) catch |err| {
-                std.log.warn("failed to emit foreground status: {s}", .{@errorName(err)});
-            };
-        }
-    }.call;
-
     // Make stdin non-blocking. O_NONBLOCK is set on the open file description,
     // which is shared with the parent shell; restore on exit to avoid
     // corrupting the parent's stdin.
@@ -3018,28 +3179,47 @@ fn clientLoop(
     defer _ = posix.fcntl(stdin_fd, posix.F.SETFL, stdin_orig_flags) catch {};
 
     while (true) {
-        const before_poll_ms = std.time.milliTimestamp();
-        if (status_cfg.isEnabled() and before_poll_ms >= next_foreground_query_ms) {
+        const before_poll_ns = foreground_timer.read();
+        if (status_cfg.isEnabled() and before_poll_ns >= next_foreground_query_ns) {
             try ipc.appendMessage(alloc, &sock_write_buf, .ForegroundProcessQuery, "");
-            next_foreground_query_ms = before_poll_ms + foreground_query_interval_ms;
+            next_foreground_query_ns = before_poll_ns + foreground_query_interval_ns;
         }
-        if (status_cfg.isEnabled() and
-            before_poll_ms - last_foreground_response_ms >= foreground_stale_after_ms and
-            foreground_fault != .stale)
-        {
-            emitForeground(
-                alloc,
-                status_cfg,
-                daemon_pid,
-                daemon_created_at,
-                last_foreground_transition_sequence,
-                last_foreground_sample_sequence,
-                "stale",
-                0,
-                "",
-                session_name,
-            );
-            foreground_fault = .stale;
+        if (daemon_identity) |identity| {
+            if (before_poll_ns - last_foreground_response_ns >= foreground_stale_after_ns) {
+                desired_foreground_status = ForegroundStatusPublication.fault(
+                    .stale,
+                    identity,
+                    last_foreground_transition_sequence,
+                    last_foreground_sample_sequence,
+                );
+            }
+            if (!attached_published) {
+                if (status.StatusFile.emitAttached(
+                    alloc,
+                    status_cfg,
+                    created,
+                    identity.pid,
+                    identity.created_at,
+                    identity.incarnation,
+                    session_name,
+                    @intCast(std.time.timestamp()),
+                )) |_| {
+                    attached_published = true;
+                } else |err| {
+                    std.log.warn("failed to emit attached status: {s}", .{@errorName(err)});
+                }
+            }
+        }
+        if (attached_published) {
+            if (desired_foreground_status) |publication| {
+                publishForegroundStatus(
+                    alloc,
+                    status_cfg,
+                    session_name,
+                    &last_published_foreground_status,
+                    publication,
+                );
+            }
         }
 
         poll_fds.clearRetainingCapacity();
@@ -3072,7 +3252,7 @@ fn clientLoop(
         }
 
         const poll_timeout: i32 = if (status_cfg.isEnabled())
-            @intCast(@max(@as(i64, 0), next_foreground_query_ms - before_poll_ms))
+            foregroundPollTimeoutMs(before_poll_ns, next_foreground_query_ns)
         else
             -1;
         _ = try posix.poll(poll_fds.items, poll_timeout);
@@ -3156,63 +3336,48 @@ fn clientLoop(
                         return ClientResult{ .kind = .detach, .session_name = null };
                     },
                     .ForegroundProcessResponse => {
-                        last_foreground_response_ms = std.time.milliTimestamp();
+                        last_foreground_response_ns = foreground_timer.read();
                         switch (foregroundProcessPayload(
                             msg.payload,
+                            daemon_identity,
                             last_foreground_transition_sequence,
                             last_foreground_sample_sequence,
                         )) {
                             .current => |observation| {
-                                const changed = foreground_fault != null or
-                                    observation.transition_sequence != last_foreground_transition_sequence;
+                                if (daemon_identity == null) {
+                                    daemon_identity = DaemonStatusIdentity.fromResponse(observation);
+                                }
                                 last_foreground_transition_sequence = observation.transition_sequence;
                                 last_foreground_sample_sequence = observation.sample_sequence;
-                                foreground_fault = null;
-                                if (!changed) continue;
-                                emitForeground(
-                                    alloc,
-                                    status_cfg,
-                                    daemon_pid,
-                                    daemon_created_at,
-                                    observation.transition_sequence,
-                                    observation.sample_sequence,
-                                    observation.state.statusString(),
-                                    observation.process_group_id,
-                                    observation.executableSlice(),
-                                    session_name,
+                                desired_foreground_status = .observation(observation);
+                            },
+                            .identity_mismatch => if (daemon_identity) |identity| {
+                                desired_foreground_status = ForegroundStatusPublication.fault(
+                                    .stale,
+                                    identity,
+                                    last_foreground_transition_sequence,
+                                    last_foreground_sample_sequence,
                                 );
                             },
                             .malformed => {
-                                if (foreground_fault == .malformed) continue;
-                                emitForeground(
-                                    alloc,
-                                    status_cfg,
-                                    daemon_pid,
-                                    daemon_created_at,
-                                    last_foreground_transition_sequence,
-                                    last_foreground_sample_sequence,
-                                    "malformed",
-                                    0,
-                                    "",
-                                    session_name,
-                                );
-                                foreground_fault = .malformed;
+                                if (daemon_identity) |identity| {
+                                    desired_foreground_status = ForegroundStatusPublication.fault(
+                                        .malformed,
+                                        identity,
+                                        last_foreground_transition_sequence,
+                                        last_foreground_sample_sequence,
+                                    );
+                                }
                             },
                             .stale => |observation| {
-                                if (foreground_fault == .stale) continue;
-                                emitForeground(
-                                    alloc,
-                                    status_cfg,
-                                    daemon_pid,
-                                    daemon_created_at,
-                                    observation.transition_sequence,
-                                    observation.sample_sequence,
-                                    "stale",
-                                    0,
-                                    "",
-                                    session_name,
-                                );
-                                foreground_fault = .stale;
+                                if (daemon_identity) |identity| {
+                                    desired_foreground_status = ForegroundStatusPublication.fault(
+                                        .stale,
+                                        identity,
+                                        observation.transition_sequence,
+                                        observation.sample_sequence,
+                                    );
+                                }
                             },
                         }
                     },

@@ -132,8 +132,11 @@ pub const ForegroundProcessState = enum(u8) {
 };
 
 pub const ForegroundProcessResponse = extern struct {
+    daemon_incarnation: u64,
+    daemon_created_at: u64,
     transition_sequence: u64,
     sample_sequence: u64,
+    daemon_pid: i32,
     state: ForegroundProcessState,
     process_group_id: i32,
     executable_len: u16,
@@ -175,7 +178,9 @@ pub const ForegroundProcessResponse = extern struct {
     }
 
     pub fn isValid(self: *const ForegroundProcessResponse) bool {
-        if (self.transition_sequence == 0 or
+        if (self.daemon_pid <= 0 or
+            self.daemon_incarnation == 0 or
+            self.transition_sequence == 0 or
             self.sample_sequence == 0 or
             self.transition_sequence > self.sample_sequence or
             self.executable_len > MAX_EXECUTABLE_LEN)
@@ -184,7 +189,9 @@ pub const ForegroundProcessResponse = extern struct {
         }
 
         return switch (self.state) {
-            .foreground => self.process_group_id > 0 and self.executable_len > 0,
+            .foreground => self.process_group_id > 0 and
+                self.executable_len > 0 and
+                std.unicode.utf8ValidateSlice(self.executableSlice()),
             .no_foreground, .unavailable => self.process_group_id == 0 and self.executable_len == 0,
             _ => false,
         };
@@ -483,9 +490,12 @@ test "Tag wire values are frozen" {
 }
 
 test "foreground process response round trips" {
-    try std.testing.expectEqual(@as(usize, 288), @sizeOf(ForegroundProcessResponse));
+    try std.testing.expectEqual(@as(usize, 304), @sizeOf(ForegroundProcessResponse));
 
     var payload = ForegroundProcessResponse.foreground(9001, "ssh");
+    payload.daemon_pid = 4242;
+    payload.daemon_incarnation = 0x1234;
+    payload.daemon_created_at = 1_777_000_111;
     payload.transition_sequence = 2;
     payload.sample_sequence = 7;
     try std.testing.expectEqual(ForegroundProcessState.foreground, payload.state);
@@ -498,15 +508,34 @@ test "foreground process response round trips" {
 
 test "foreground process response rejects malformed state combinations" {
     var missing_identity = ForegroundProcessResponse.foreground(9001, "");
+    missing_identity.daemon_pid = 4242;
+    missing_identity.daemon_incarnation = 1;
     missing_identity.transition_sequence = 1;
     missing_identity.sample_sequence = 1;
     try std.testing.expect(!missing_identity.isValid());
 
     var impossible_clear = ForegroundProcessResponse.noForeground();
+    impossible_clear.daemon_pid = 4242;
+    impossible_clear.daemon_incarnation = 1;
     impossible_clear.transition_sequence = 1;
     impossible_clear.sample_sequence = 1;
     impossible_clear.process_group_id = 9001;
     try std.testing.expect(!impossible_clear.isValid());
+}
+
+test "foreground process response requires platform-neutral daemon identity" {
+    var response = ForegroundProcessResponse.foreground(9001, "ssh");
+    response.daemon_pid = 4242;
+    response.daemon_incarnation = 0x1234;
+    response.transition_sequence = 1;
+    response.sample_sequence = 1;
+    try std.testing.expect(response.isValid());
+
+    response.daemon_pid = 0;
+    try std.testing.expect(!response.isValid());
+    response.daemon_pid = 4242;
+    response.daemon_incarnation = 0;
+    try std.testing.expect(!response.isValid());
 }
 
 test "SessionEnd IPC payload round trips" {

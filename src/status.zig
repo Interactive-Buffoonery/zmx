@@ -45,6 +45,7 @@ pub const StatusFile = struct {
         created: bool,
         daemon_pid: i32,
         daemon_created_at: u64,
+        daemon_incarnation: u64,
         session: []const u8,
         ts: i64,
     ) !void {
@@ -59,8 +60,8 @@ pub const StatusFile = struct {
         try line.appendSlice(alloc, ",\"created\":");
         try line.appendSlice(alloc, if (created) "true" else "false");
         try line.writer(alloc).print(
-            ",\"daemon_pid\":{d},\"daemon_created_at\":{d},\"session\":",
-            .{ daemon_pid, daemon_created_at },
+            ",\"daemon_pid\":{d},\"daemon_created_at\":{d},\"daemon_incarnation\":{d},\"session\":",
+            .{ daemon_pid, daemon_created_at, daemon_incarnation },
         );
         try appendJsonString(alloc, &line, session);
         try line.writer(alloc).print(",\"ts\":{d}}}\n", .{ts});
@@ -110,6 +111,7 @@ pub const StatusFile = struct {
         cfg: StatusConfig,
         daemon_pid: i32,
         daemon_created_at: u64,
+        daemon_incarnation: u64,
         transition_sequence: u64,
         sample_sequence: u64,
         state: []const u8,
@@ -127,8 +129,8 @@ pub const StatusFile = struct {
         try line.appendSlice(alloc, "{\"event\":\"foreground-process\",\"token\":");
         try appendJsonString(alloc, &line, token);
         try line.writer(alloc).print(
-            ",\"daemon_pid\":{d},\"daemon_created_at\":{d},\"transition_sequence\":{d},\"sample_sequence\":{d},\"state\":",
-            .{ daemon_pid, daemon_created_at, transition_sequence, sample_sequence },
+            ",\"daemon_pid\":{d},\"daemon_created_at\":{d},\"daemon_incarnation\":{d},\"transition_sequence\":{d},\"sample_sequence\":{d},\"state\":",
+            .{ daemon_pid, daemon_created_at, daemon_incarnation, transition_sequence, sample_sequence },
         );
         try appendJsonString(alloc, &line, state);
         try line.writer(alloc).print(",\"process_group_id\":{d},\"executable\":", .{process_group_id});
@@ -244,7 +246,7 @@ test "emitAttached writes one JSON line with incarnation identity" {
         .token = "tok-123",
     };
 
-    try StatusFile.emitAttached(alloc, cfg, true, 4242, 1_777_000_111, "sesh-1", 1_777_000_222);
+    try StatusFile.emitAttached(alloc, cfg, true, 4242, 1_777_000_111, 0x1234, "sesh-1", 1_777_000_222);
 
     const contents = try tmp.dir.readFileAlloc(alloc, "status.jsonl", 4096);
     defer alloc.free(contents);
@@ -260,6 +262,7 @@ test "emitAttached writes one JSON line with incarnation identity" {
     try std.testing.expect(std.mem.indexOf(u8, line, "\"created\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"daemon_pid\":4242") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"daemon_created_at\":1777000111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"daemon_incarnation\":4660") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"session\":\"sesh-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"ts\":1777000222") != null);
 }
@@ -281,6 +284,7 @@ test "emitForeground writes an incarnation-fenced observation" {
         cfg,
         4242,
         1_777_000_111,
+        0x1234,
         3,
         7,
         "foreground",
@@ -296,6 +300,7 @@ test "emitForeground writes an incarnation-fenced observation" {
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"event\":\"foreground-process\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"daemon_pid\":4242") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"daemon_created_at\":1777000111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\"daemon_incarnation\":4660") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"transition_sequence\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"sample_sequence\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"state\":\"foreground\"") != null);
