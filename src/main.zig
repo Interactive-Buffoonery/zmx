@@ -2427,6 +2427,31 @@ fn publishForegroundStatus(
     delivery_degraded.* = false;
 }
 
+fn publishAttachedStatus(
+    alloc: std.mem.Allocator,
+    cfg: status.StatusConfig,
+    created: bool,
+    identity: DaemonStatusIdentity,
+    session_name: []const u8,
+    published: *bool,
+) void {
+    if (published.*) return;
+    status.StatusFile.emitAttached(
+        alloc,
+        cfg,
+        created,
+        identity.pid,
+        identity.created_at,
+        identity.incarnation,
+        session_name,
+        @intCast(std.time.timestamp()),
+    ) catch |err| {
+        std.log.warn("failed to emit attached status: {s}", .{@errorName(err)});
+        return;
+    };
+    published.* = true;
+}
+
 fn foregroundProcessResponse(
     alloc: std.mem.Allocator,
     pty_fd: i32,
@@ -2740,6 +2765,44 @@ test "missed foreground transition publishes degradation before recovered shell"
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"executable\":\"ssh\"") == null);
 }
 
+test "attached publication remains pending until append succeeds" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(tmp_path);
+    const missing_path = try std.fs.path.join(alloc, &.{ tmp_path, "missing", "status.jsonl" });
+    defer alloc.free(missing_path);
+    const valid_path = try std.fs.path.join(alloc, &.{ tmp_path, "status.jsonl" });
+    defer alloc.free(valid_path);
+    const identity = DaemonStatusIdentity{ .pid = 4242, .created_at = 1_777_000_111, .incarnation = 0 };
+    var published = false;
+
+    publishAttachedStatus(
+        alloc,
+        .{ .path = missing_path, .token = "tok" },
+        true,
+        identity,
+        "sesh-1",
+        &published,
+    );
+    try std.testing.expect(!published);
+
+    publishAttachedStatus(
+        alloc,
+        .{ .path = valid_path, .token = "tok" },
+        true,
+        identity,
+        "sesh-1",
+        &published,
+    );
+    try std.testing.expect(published);
+    const contents = try tmp.dir.readFileAlloc(alloc, "status.jsonl", 4096);
+    defer alloc.free(contents);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\"event\":\"attached\"") != null);
+}
+
 test "foreground polling deadline uses monotonic elapsed nanoseconds" {
     try std.testing.expectEqual(@as(i32, 0), foregroundPollTimeoutMs(500, 500));
     try std.testing.expectEqual(
@@ -2758,6 +2821,14 @@ test "legacy peer without foreground response becomes explicitly stale" {
         .created_at = 1_777_000_111,
         .incarnation = 0,
     };
+    const old_shape = std.mem.zeroes([288]u8);
+    switch (foregroundProcessPayload(&old_shape, null, 0, 0)) {
+        .malformed => {},
+        else => return error.ExpectedOldShapeForegroundMalformed,
+    }
+    const malformed = ForegroundStatusPublication.fault(.malformed, attached_identity, 0, 0);
+    try std.testing.expectEqual(ForegroundStatusPublication.Kind.malformed, malformed.kind);
+
     try std.testing.expect(foregroundStaleAfterDeadline(
         attached_identity,
         null,
@@ -2830,7 +2901,12 @@ fn attach(daemon: *Daemon) !void {
     if (result.is_daemon) return;
 
     const client_sock = try socket.sessionConnect(daemon.socket_path);
-    const attached_info = ipc.requestSessionInfo(daemon.alloc, client_sock, 1000) catch |err| {
+    var initial_read_buf = ipc.SocketBuffer.init(daemon.alloc) catch |err| {
+        posix.close(client_sock);
+        return err;
+    };
+    defer initial_read_buf.deinit();
+    const attached_info = ipc.requestSessionInfo(client_sock, 1000, &initial_read_buf) catch |err| {
         posix.close(client_sock);
         return err;
     };
@@ -2838,18 +2914,6 @@ fn attach(daemon: *Daemon) !void {
         .pid = darwin_proc.parentPid(attached_info.pid) orelse 0,
         .created_at = attached_info.created_at,
         .incarnation = 0,
-    };
-    status.StatusFile.emitAttached(
-        daemon.alloc,
-        status_cfg,
-        result.created,
-        attached_identity.pid,
-        attached_identity.created_at,
-        attached_identity.incarnation,
-        daemon.session_name,
-        @intCast(std.time.timestamp()),
-    ) catch |err| {
-        std.log.warn("failed to emit attached status: {s}", .{@errorName(err)});
     };
     std.log.info("attached session={s}", .{daemon.session_name});
     //  This is typically used with tcsetattr() to modify terminal settings.
@@ -2901,7 +2965,9 @@ fn attach(daemon: *Daemon) !void {
     const looper = try clientLoop(
         client_sock,
         status_cfg,
+        result.created,
         attached_identity,
+        &initial_read_buf,
         daemon.session_name,
     );
     switch (looper.kind) {
@@ -3226,7 +3292,9 @@ fn foregroundStaleAfterDeadline(
 fn clientLoop(
     client_sock_fd: i32,
     status_cfg: status.StatusConfig,
+    created: bool,
     attached_identity: DaemonStatusIdentity,
+    read_buf: *ipc.SocketBuffer,
     session_name: []const u8,
 ) !ClientResult {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
@@ -3252,14 +3320,12 @@ fn clientLoop(
     var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(alloc, 4);
     defer poll_fds.deinit(alloc);
 
-    var read_buf = try ipc.SocketBuffer.init(alloc);
-    defer read_buf.deinit();
-
     var stdout_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
     defer stdout_buf.deinit(alloc);
 
     const stdin_fd = posix.STDIN_FILENO;
     var saw_session_end = false;
+    var attached_published = false;
     var foreground_identity: ?DaemonStatusIdentity = null;
     var last_foreground_transition_sequence: u64 = 0;
     var last_foreground_sample_sequence: u64 = 0;
@@ -3320,15 +3386,25 @@ fn clientLoop(
         )) |stale| {
             desired_foreground_status = stale;
         }
-        if (desired_foreground_status) |publication| {
-            publishForegroundStatus(
-                alloc,
-                status_cfg,
-                session_name,
-                &last_published_foreground_status,
-                &foreground_delivery_degraded,
-                publication,
-            );
+        publishAttachedStatus(
+            alloc,
+            status_cfg,
+            created,
+            attached_identity,
+            session_name,
+            &attached_published,
+        );
+        if (attached_published) {
+            if (desired_foreground_status) |publication| {
+                publishForegroundStatus(
+                    alloc,
+                    status_cfg,
+                    session_name,
+                    &last_published_foreground_status,
+                    &foreground_delivery_degraded,
+                    publication,
+                );
+            }
         }
 
         poll_fds.clearRetainingCapacity();
@@ -3364,7 +3440,12 @@ fn clientLoop(
             foregroundPollTimeoutMs(before_poll_ns, next_foreground_query_ns)
         else
             -1;
-        _ = try posix.poll(poll_fds.items, poll_timeout);
+        const has_buffered_socket_message = read_buf.hasCompleteMessage();
+        if (has_buffered_socket_message) {
+            poll_fds.items[1].revents = posix.POLL.IN;
+        } else {
+            _ = try posix.poll(poll_fds.items, poll_timeout);
+        }
 
         if (poll_fds.items[2].revents & posix.POLL.IN != 0) {
             drainSignalPipe();
@@ -3398,22 +3479,24 @@ fn clientLoop(
 
         // Handle socket read (incoming Output messages from daemon)
         if (poll_fds.items[1].revents & posix.POLL.IN != 0) {
-            const n = read_buf.read(client_sock_fd) catch |err| {
-                if (err == error.WouldBlock) continue;
-                if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
+            if (!has_buffered_socket_message) {
+                const n = read_buf.read(client_sock_fd) catch |err| {
+                    if (err == error.WouldBlock) continue;
+                    if (err == error.ConnectionResetByPeer or err == error.BrokenPipe) {
+                        emitSessionEnd(alloc, status_cfg, session_name, .unknown, 0, &saw_session_end);
+                        return ClientResult{ .kind = .detach, .session_name = null };
+                    }
+                    std.log.err("daemon read err={s}", .{@errorName(err)});
+                    return err;
+                };
+                if (n == 0) {
+                    // Server closed connection
+                    // A SIGKILL'd daemon cannot deliver SessionEnd; it is gone before
+                    // it can write. Raw EOF/HUP without a prior SessionEnd is therefore
+                    // deliberately reported as "unknown", not "daemon-died".
                     emitSessionEnd(alloc, status_cfg, session_name, .unknown, 0, &saw_session_end);
                     return ClientResult{ .kind = .detach, .session_name = null };
                 }
-                std.log.err("daemon read err={s}", .{@errorName(err)});
-                return err;
-            };
-            if (n == 0) {
-                // Server closed connection
-                // A SIGKILL'd daemon cannot deliver SessionEnd; it is gone before
-                // it can write. Raw EOF/HUP without a prior SessionEnd is therefore
-                // deliberately reported as "unknown", not "daemon-died".
-                emitSessionEnd(alloc, status_cfg, session_name, .unknown, 0, &saw_session_end);
-                return ClientResult{ .kind = .detach, .session_name = null };
             }
 
             while (read_buf.next()) |msg| {
@@ -3445,7 +3528,6 @@ fn clientLoop(
                         return ClientResult{ .kind = .detach, .session_name = null };
                     },
                     .ForegroundProcessResponse => {
-                        last_foreground_response_ns = foreground_timer.read();
                         switch (foregroundProcessPayload(
                             msg.payload,
                             foreground_identity,
@@ -3453,6 +3535,7 @@ fn clientLoop(
                             last_foreground_sample_sequence,
                         )) {
                             .current => |observation| {
+                                last_foreground_response_ns = foreground_timer.read();
                                 if (foreground_identity == null) {
                                     foreground_identity = DaemonStatusIdentity.fromResponse(observation);
                                 }
@@ -3469,14 +3552,12 @@ fn clientLoop(
                                 );
                             },
                             .malformed => {
-                                if (foreground_identity) |identity| {
-                                    desired_foreground_status = ForegroundStatusPublication.fault(
-                                        .malformed,
-                                        identity,
-                                        last_foreground_transition_sequence,
-                                        last_foreground_sample_sequence,
-                                    );
-                                }
+                                desired_foreground_status = ForegroundStatusPublication.fault(
+                                    .malformed,
+                                    foreground_identity orelse attached_identity,
+                                    last_foreground_transition_sequence,
+                                    last_foreground_sample_sequence,
+                                );
                             },
                             .stale => |observation| {
                                 if (foreground_identity) |identity| {

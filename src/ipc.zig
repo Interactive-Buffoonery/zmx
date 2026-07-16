@@ -360,6 +360,32 @@ pub const SocketBuffer = struct {
         self.head += total;
         return .{ .header = hdr, .payload = pay };
     }
+
+    pub fn hasCompleteMessage(self: *const SocketBuffer) bool {
+        const available = self.buf.items[self.head..];
+        const total = expectedLength(available) orelse return false;
+        return available.len >= total;
+    }
+
+    fn takeInfo(self: *SocketBuffer) !?Info {
+        var scan = self.head;
+        while (scan < self.buf.items.len) {
+            const available = self.buf.items[scan..];
+            const total = expectedLength(available) orelse return null;
+            if (available.len < total) return null;
+
+            const header = std.mem.bytesToValue(Header, available[0..@sizeOf(Header)]);
+            if (header.tag == .Info) {
+                const payload = available[@sizeOf(Header)..total];
+                if (payload.len != @sizeOf(Info)) return error.InfoSizeMismatch;
+                const info = std.mem.bytesToValue(Info, payload[0..@sizeOf(Info)]);
+                try self.buf.replaceRange(self.alloc, scan, total, &.{});
+                return info;
+            }
+            scan += total;
+        }
+        return null;
+    }
 };
 
 const ConnectError = error{
@@ -394,32 +420,29 @@ pub fn probeSession(
 ) SessionProbeError!SessionProbeResult {
     const fd = try connectSession(socket_path);
     errdefer posix.close(fd);
+    var read_buf = SocketBuffer.init(alloc) catch return error.Unexpected;
+    defer read_buf.deinit();
 
     return .{
         .fd = fd,
-        .info = try requestSessionInfo(alloc, fd, 1000),
+        .info = try requestSessionInfo(fd, 1000, &read_buf),
     };
 }
 
 pub fn requestSessionInfo(
-    alloc: std.mem.Allocator,
     fd: i32,
     timeout_ms: u64,
+    read_buf: *SocketBuffer,
 ) SessionProbeError!Info {
     var timer = std.time.Timer.start() catch return error.Unexpected;
 
     send(fd, .Info, "") catch return error.Unexpected;
 
-    var sb = SocketBuffer.init(alloc) catch return error.Unexpected;
-    defer sb.deinit();
-
     while (true) {
-        while (sb.next()) |msg| {
-            if (msg.header.tag == .Info) {
-                if (msg.payload.len != @sizeOf(Info)) return error.InfoSizeMismatch;
-                return std.mem.bytesToValue(Info, msg.payload[0..@sizeOf(Info)]);
-            }
-        }
+        if (read_buf.takeInfo() catch |err| switch (err) {
+            error.InfoSizeMismatch => return error.InfoSizeMismatch,
+            else => return error.Unexpected,
+        }) |info| return info;
 
         const elapsed_ms = timer.read() / std.time.ns_per_ms;
         if (elapsed_ms >= timeout_ms) return error.Timeout;
@@ -429,7 +452,7 @@ pub fn requestSessionInfo(
         if (poll_result == 0) return error.Timeout;
         if (poll_fds[0].revents & posix.POLL.IN == 0) return error.Unexpected;
 
-        const n = sb.read(fd) catch return error.Unexpected;
+        const n = read_buf.read(fd) catch return error.Unexpected;
         if (n == 0) return error.Unexpected;
     }
 }
@@ -487,6 +510,40 @@ test "terminal size messages preserve legacy cells and extend pixels" {
     const resize = socket_buf.next() orelse return error.MissingResizeMessage;
     try std.testing.expectEqual(Tag.Resize, resize.header.tag);
     try std.testing.expectEqual(@as(usize, 4), resize.payload.len);
+}
+
+test "Info handshake preserves output frames and partial trailing bytes" {
+    const alloc = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(alloc);
+
+    try appendMessage(alloc, &bytes, .Output, "START");
+    var info = std.mem.zeroes(Info);
+    info.pid = 4242;
+    info.created_at = 1_777_000_111;
+    try appendMessage(alloc, &bytes, .Info, std.mem.asBytes(&info));
+
+    var trailing: std.ArrayList(u8) = .empty;
+    defer trailing.deinit(alloc);
+    try appendMessage(alloc, &trailing, .Output, "END");
+    const split = @sizeOf(Header) + 1;
+    try bytes.appendSlice(alloc, trailing.items[0..split]);
+
+    var read_buf = SocketBuffer{ .buf = bytes, .alloc = alloc, .head = 0 };
+    bytes = .empty;
+    defer read_buf.deinit();
+
+    const received_info = (try read_buf.takeInfo()) orelse return error.MissingInfo;
+    try std.testing.expectEqual(info.pid, received_info.pid);
+    const start = read_buf.next() orelse return error.MissingStartOutput;
+    try std.testing.expectEqual(Tag.Output, start.header.tag);
+    try std.testing.expectEqualStrings("START", start.payload);
+    try std.testing.expect(read_buf.next() == null);
+
+    try read_buf.buf.appendSlice(alloc, trailing.items[split..]);
+    const end = read_buf.next() orelse return error.MissingEndOutput;
+    try std.testing.expectEqual(Tag.Output, end.header.tag);
+    try std.testing.expectEqualStrings("END", end.payload);
 }
 
 test "Tag wire values are frozen" {
