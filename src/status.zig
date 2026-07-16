@@ -110,7 +110,8 @@ pub const StatusFile = struct {
         cfg: StatusConfig,
         daemon_pid: i32,
         daemon_created_at: u64,
-        sequence: u64,
+        transition_sequence: u64,
+        sample_sequence: u64,
         state: []const u8,
         process_group_id: i32,
         executable: []const u8,
@@ -126,8 +127,8 @@ pub const StatusFile = struct {
         try line.appendSlice(alloc, "{\"event\":\"foreground-process\",\"token\":");
         try appendJsonString(alloc, &line, token);
         try line.writer(alloc).print(
-            ",\"daemon_pid\":{d},\"daemon_created_at\":{d},\"sequence\":{d},\"state\":",
-            .{ daemon_pid, daemon_created_at, sequence },
+            ",\"daemon_pid\":{d},\"daemon_created_at\":{d},\"transition_sequence\":{d},\"sample_sequence\":{d},\"state\":",
+            .{ daemon_pid, daemon_created_at, transition_sequence, sample_sequence },
         );
         try appendJsonString(alloc, &line, state);
         try line.writer(alloc).print(",\"process_group_id\":{d},\"executable\":", .{process_group_id});
@@ -280,6 +281,7 @@ test "emitForeground writes an incarnation-fenced observation" {
         cfg,
         4242,
         1_777_000_111,
+        3,
         7,
         "foreground",
         9001,
@@ -294,7 +296,8 @@ test "emitForeground writes an incarnation-fenced observation" {
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"event\":\"foreground-process\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"daemon_pid\":4242") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"daemon_created_at\":1777000111") != null);
-    try std.testing.expect(std.mem.indexOf(u8, contents, "\"sequence\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\"transition_sequence\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\"sample_sequence\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"state\":\"foreground\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"process_group_id\":9001") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"executable\":\"ssh\"") != null);

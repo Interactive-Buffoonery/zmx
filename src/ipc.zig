@@ -132,6 +132,8 @@ pub const ForegroundProcessState = enum(u8) {
 };
 
 pub const ForegroundProcessResponse = extern struct {
+    transition_sequence: u64,
+    sample_sequence: u64,
     state: ForegroundProcessState,
     process_group_id: i32,
     executable_len: u16,
@@ -161,6 +163,31 @@ pub const ForegroundProcessResponse = extern struct {
 
     pub fn executableSlice(self: *const ForegroundProcessResponse) []const u8 {
         return self.executable[0..@min(self.executable_len, MAX_EXECUTABLE_LEN)];
+    }
+
+    pub fn sameObservation(
+        self: *const ForegroundProcessResponse,
+        other: *const ForegroundProcessResponse,
+    ) bool {
+        return self.state == other.state and
+            self.process_group_id == other.process_group_id and
+            std.mem.eql(u8, self.executableSlice(), other.executableSlice());
+    }
+
+    pub fn isValid(self: *const ForegroundProcessResponse) bool {
+        if (self.transition_sequence == 0 or
+            self.sample_sequence == 0 or
+            self.transition_sequence > self.sample_sequence or
+            self.executable_len > MAX_EXECUTABLE_LEN)
+        {
+            return false;
+        }
+
+        return switch (self.state) {
+            .foreground => self.process_group_id > 0 and self.executable_len > 0,
+            .no_foreground, .unavailable => self.process_group_id == 0 and self.executable_len == 0,
+            _ => false,
+        };
     }
 };
 
@@ -445,24 +472,41 @@ test "terminal size messages preserve legacy cells and extend pixels" {
 
 test "Tag wire values are frozen" {
     inline for (.{
-        .{ Tag.Input, 0 },     .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
-        .{ Tag.Detach, 3 },    .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
-        .{ Tag.Info, 6 },      .{ Tag.Init, 7 },          .{ Tag.History, 8 },
-        .{ Tag.Run, 9 },       .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
-        .{ Tag.Write, 12 },    .{ Tag.TaskComplete, 13 }, .{ Tag.SessionEnd, 14 },
-        .{ Tag.CwdQuery, 15 }, .{ Tag.CwdResponse, 16 },  .{ Tag.ResizePixels, 17 },
-        .{ Tag.ForegroundProcessQuery, 18 },
-        .{ Tag.ForegroundProcessResponse, 19 },
+        .{ Tag.Input, 0 },                   .{ Tag.Output, 1 },                     .{ Tag.Resize, 2 },
+        .{ Tag.Detach, 3 },                  .{ Tag.DetachAll, 4 },                  .{ Tag.Kill, 5 },
+        .{ Tag.Info, 6 },                    .{ Tag.Init, 7 },                       .{ Tag.History, 8 },
+        .{ Tag.Run, 9 },                     .{ Tag.Ack, 10 },                       .{ Tag.Switch, 11 },
+        .{ Tag.Write, 12 },                  .{ Tag.TaskComplete, 13 },              .{ Tag.SessionEnd, 14 },
+        .{ Tag.CwdQuery, 15 },               .{ Tag.CwdResponse, 16 },               .{ Tag.ResizePixels, 17 },
+        .{ Tag.ForegroundProcessQuery, 18 }, .{ Tag.ForegroundProcessResponse, 19 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 
 test "foreground process response round trips" {
+    try std.testing.expectEqual(@as(usize, 288), @sizeOf(ForegroundProcessResponse));
+
     var payload = ForegroundProcessResponse.foreground(9001, "ssh");
+    payload.transition_sequence = 2;
+    payload.sample_sequence = 7;
     try std.testing.expectEqual(ForegroundProcessState.foreground, payload.state);
     try std.testing.expectEqual(@as(i32, 9001), payload.process_group_id);
     try std.testing.expectEqualStrings("ssh", payload.executableSlice());
+    try std.testing.expect(payload.isValid());
     try std.testing.expectEqual(@as(u8, 18), @intFromEnum(Tag.ForegroundProcessQuery));
     try std.testing.expectEqual(@as(u8, 19), @intFromEnum(Tag.ForegroundProcessResponse));
+}
+
+test "foreground process response rejects malformed state combinations" {
+    var missing_identity = ForegroundProcessResponse.foreground(9001, "");
+    missing_identity.transition_sequence = 1;
+    missing_identity.sample_sequence = 1;
+    try std.testing.expect(!missing_identity.isValid());
+
+    var impossible_clear = ForegroundProcessResponse.noForeground();
+    impossible_clear.transition_sequence = 1;
+    impossible_clear.sample_sequence = 1;
+    impossible_clear.process_group_id = 9001;
+    try std.testing.expect(!impossible_clear.isValid());
 }
 
 test "SessionEnd IPC payload round trips" {

@@ -619,6 +619,28 @@ test "Cfg.init uses custom modes from env vars" {
 /// crashes for one session won't crash all the other sessions.
 ///
 /// Conceptually it's also much simpler to reason about.
+const ForegroundProcessTracker = struct {
+    last: ?ipc.ForegroundProcessResponse = null,
+    transition_sequence: u64 = 0,
+    sample_sequence: u64 = 0,
+
+    fn next(
+        self: *ForegroundProcessTracker,
+        observation: ipc.ForegroundProcessResponse,
+    ) ipc.ForegroundProcessResponse {
+        self.sample_sequence +|= 1;
+        if (self.last == null or !self.last.?.sameObservation(&observation)) {
+            self.transition_sequence +|= 1;
+        }
+
+        var response = observation;
+        response.transition_sequence = self.transition_sequence;
+        response.sample_sequence = self.sample_sequence;
+        self.last = response;
+        return response;
+    }
+};
+
 const Daemon = struct {
     cfg: *Cfg,
     alloc: std.mem.Allocator,
@@ -640,6 +662,7 @@ const Daemon = struct {
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
     task_ended_at: ?u64 = null, // timestamp when task exited
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
+    foreground_process_tracker: ForegroundProcessTracker = .{},
     pty_write_buf: std.ArrayList(u8) = .empty,
     // Set once the pty child is reaped on the EOF path in daemonLoop, so the
     // startOrAttach defer skips its own waitpid — a second reap hits
@@ -1330,7 +1353,9 @@ const Daemon = struct {
     }
 
     pub fn handleForegroundProcessQuery(self: *Daemon, client: *Client) !void {
-        const response = foregroundProcessResponse(self.alloc, self.pty_fd);
+        const response = self.foreground_process_tracker.next(
+            foregroundProcessResponse(self.alloc, self.pty_fd),
+        );
         try ipc.appendMessage(
             self.alloc,
             &client.write_buf,
@@ -2254,6 +2279,32 @@ fn foregroundProcessResponseFrom(
     return .foreground(process_group_id, name);
 }
 
+const ForegroundProcessPayload = union(enum) {
+    current: ipc.ForegroundProcessResponse,
+    malformed,
+    stale: ipc.ForegroundProcessResponse,
+};
+
+fn foregroundProcessPayload(
+    payload: []const u8,
+    last_transition_sequence: u64,
+    last_sample_sequence: u64,
+) ForegroundProcessPayload {
+    if (payload.len != @sizeOf(ipc.ForegroundProcessResponse)) return .malformed;
+
+    const response = std.mem.bytesToValue(
+        ipc.ForegroundProcessResponse,
+        payload[0..@sizeOf(ipc.ForegroundProcessResponse)],
+    );
+    if (!response.isValid()) return .malformed;
+    if (response.transition_sequence < last_transition_sequence or
+        response.sample_sequence <= last_sample_sequence)
+    {
+        return .{ .stale = response };
+    }
+    return .{ .current = response };
+}
+
 fn foregroundProcessResponse(
     alloc: std.mem.Allocator,
     pty_fd: i32,
@@ -2387,6 +2438,69 @@ test "foreground response fails closed without process identity" {
 
     const unavailable = foregroundProcessResponseFrom(-1, null);
     try std.testing.expectEqual(ipc.ForegroundProcessState.unavailable, unavailable.state);
+}
+
+test "foreground tracker records shell ssh shell transitions" {
+    var tracker = ForegroundProcessTracker{};
+
+    const shell = tracker.next(ipc.ForegroundProcessResponse.foreground(100, "zsh"));
+    const ssh = tracker.next(ipc.ForegroundProcessResponse.foreground(101, "ssh"));
+    const returned_shell = tracker.next(ipc.ForegroundProcessResponse.foreground(100, "zsh"));
+
+    try std.testing.expectEqual(@as(u64, 1), shell.transition_sequence);
+    try std.testing.expectEqual(@as(u64, 2), ssh.transition_sequence);
+    try std.testing.expectEqual(@as(u64, 3), returned_shell.transition_sequence);
+    try std.testing.expect(shell.sample_sequence < ssh.sample_sequence);
+    try std.testing.expect(ssh.sample_sequence < returned_shell.sample_sequence);
+}
+
+test "background ssh does not change the foreground shell observation" {
+    var tracker = ForegroundProcessTracker{};
+
+    const before = tracker.next(ipc.ForegroundProcessResponse.foreground(100, "zsh"));
+    const while_background_ssh_runs = tracker.next(ipc.ForegroundProcessResponse.foreground(100, "zsh"));
+
+    try std.testing.expectEqual(before.transition_sequence, while_background_ssh_runs.transition_sequence);
+    try std.testing.expect(before.sample_sequence < while_background_ssh_runs.sample_sequence);
+}
+
+test "detach reattach keeps daemon sequence and respawn starts a new incarnation sequence" {
+    var daemon = ForegroundProcessTracker{};
+    const attached = daemon.next(ipc.ForegroundProcessResponse.foreground(100, "zsh"));
+    const reattached = daemon.next(ipc.ForegroundProcessResponse.foreground(100, "zsh"));
+
+    var respawned_daemon = ForegroundProcessTracker{};
+    const respawned = respawned_daemon.next(ipc.ForegroundProcessResponse.foreground(200, "zsh"));
+
+    try std.testing.expectEqual(attached.transition_sequence, reattached.transition_sequence);
+    try std.testing.expect(attached.sample_sequence < reattached.sample_sequence);
+    try std.testing.expectEqual(@as(u64, 1), respawned.transition_sequence);
+    try std.testing.expectEqual(@as(u64, 1), respawned.sample_sequence);
+}
+
+test "foreground payload rejects malformed and replayed samples" {
+    var current = ipc.ForegroundProcessResponse.foreground(101, "ssh");
+    current.transition_sequence = 2;
+    current.sample_sequence = 7;
+
+    switch (foregroundProcessPayload(std.mem.asBytes(&current), 1, 6)) {
+        .current => {},
+        else => return error.ExpectedCurrentForegroundSample,
+    }
+    switch (foregroundProcessPayload(std.mem.asBytes(&current), 2, 7)) {
+        .stale => {},
+        else => return error.ExpectedStaleForegroundSample,
+    }
+    switch (foregroundProcessPayload(std.mem.asBytes(&current)[0..4], 0, 0)) {
+        .malformed => {},
+        else => return error.ExpectedMalformedForegroundSample,
+    }
+
+    current.state = @enumFromInt(99);
+    switch (foregroundProcessPayload(std.mem.asBytes(&current), 0, 0)) {
+        .malformed => {},
+        else => return error.ExpectedMalformedForegroundState,
+    }
 }
 
 fn switchSesh(daemon: *Daemon, current_sesh: []const u8) !void {
@@ -2832,10 +2946,14 @@ fn clientLoop(
 
     const stdin_fd = posix.STDIN_FILENO;
     var saw_session_end = false;
-    var foreground_sequence: u64 = 0;
-    var last_foreground: ?ipc.ForegroundProcessResponse = null;
-    var next_foreground_query_ms = std.time.milliTimestamp();
+    var last_foreground_transition_sequence: u64 = 0;
+    var last_foreground_sample_sequence: u64 = 0;
+    var foreground_fault: ?enum { malformed, stale } = null;
+    const foreground_started_ms = std.time.milliTimestamp();
+    var last_foreground_response_ms = foreground_started_ms;
+    var next_foreground_query_ms = foreground_started_ms;
     const foreground_query_interval_ms: i64 = 250;
+    const foreground_stale_after_ms: i64 = 1_000;
 
     const emitSessionEnd = struct {
         fn call(
@@ -2861,6 +2979,37 @@ fn clientLoop(
         }
     }.call;
 
+    const emitForeground = struct {
+        fn call(
+            alloc_inner: std.mem.Allocator,
+            cfg: status.StatusConfig,
+            daemon_pid_inner: i32,
+            daemon_created_at_inner: u64,
+            transition_sequence: u64,
+            sample_sequence: u64,
+            state: []const u8,
+            process_group_id: i32,
+            executable: []const u8,
+            session: []const u8,
+        ) void {
+            status.StatusFile.emitForeground(
+                alloc_inner,
+                cfg,
+                daemon_pid_inner,
+                daemon_created_at_inner,
+                transition_sequence,
+                sample_sequence,
+                state,
+                process_group_id,
+                executable,
+                session,
+                @intCast(std.time.timestamp()),
+            ) catch |err| {
+                std.log.warn("failed to emit foreground status: {s}", .{@errorName(err)});
+            };
+        }
+    }.call;
+
     // Make stdin non-blocking. O_NONBLOCK is set on the open file description,
     // which is shared with the parent shell; restore on exit to avoid
     // corrupting the parent's stdin.
@@ -2873,6 +3022,24 @@ fn clientLoop(
         if (status_cfg.isEnabled() and before_poll_ms >= next_foreground_query_ms) {
             try ipc.appendMessage(alloc, &sock_write_buf, .ForegroundProcessQuery, "");
             next_foreground_query_ms = before_poll_ms + foreground_query_interval_ms;
+        }
+        if (status_cfg.isEnabled() and
+            before_poll_ms - last_foreground_response_ms >= foreground_stale_after_ms and
+            foreground_fault != .stale)
+        {
+            emitForeground(
+                alloc,
+                status_cfg,
+                daemon_pid,
+                daemon_created_at,
+                last_foreground_transition_sequence,
+                last_foreground_sample_sequence,
+                "stale",
+                0,
+                "",
+                session_name,
+            );
+            foreground_fault = .stale;
         }
 
         poll_fds.clearRetainingCapacity();
@@ -2989,30 +3156,65 @@ fn clientLoop(
                         return ClientResult{ .kind = .detach, .session_name = null };
                     },
                     .ForegroundProcessResponse => {
-                        if (msg.payload.len != @sizeOf(ipc.ForegroundProcessResponse)) continue;
-                        const observation = std.mem.bytesToValue(
-                            ipc.ForegroundProcessResponse,
-                            msg.payload[0..@sizeOf(ipc.ForegroundProcessResponse)],
-                        );
-                        if (observation.executable_len > ipc.MAX_EXECUTABLE_LEN) continue;
-                        if (last_foreground != null and std.meta.eql(last_foreground.?, observation)) continue;
-
-                        foreground_sequence +%= 1;
-                        status.StatusFile.emitForeground(
-                            alloc,
-                            status_cfg,
-                            daemon_pid,
-                            daemon_created_at,
-                            foreground_sequence,
-                            observation.state.statusString(),
-                            observation.process_group_id,
-                            observation.executableSlice(),
-                            session_name,
-                            @intCast(std.time.timestamp()),
-                        ) catch |err| {
-                            std.log.warn("failed to emit foreground status: {s}", .{@errorName(err)});
-                        };
-                        last_foreground = observation;
+                        last_foreground_response_ms = std.time.milliTimestamp();
+                        switch (foregroundProcessPayload(
+                            msg.payload,
+                            last_foreground_transition_sequence,
+                            last_foreground_sample_sequence,
+                        )) {
+                            .current => |observation| {
+                                const changed = foreground_fault != null or
+                                    observation.transition_sequence != last_foreground_transition_sequence;
+                                last_foreground_transition_sequence = observation.transition_sequence;
+                                last_foreground_sample_sequence = observation.sample_sequence;
+                                foreground_fault = null;
+                                if (!changed) continue;
+                                emitForeground(
+                                    alloc,
+                                    status_cfg,
+                                    daemon_pid,
+                                    daemon_created_at,
+                                    observation.transition_sequence,
+                                    observation.sample_sequence,
+                                    observation.state.statusString(),
+                                    observation.process_group_id,
+                                    observation.executableSlice(),
+                                    session_name,
+                                );
+                            },
+                            .malformed => {
+                                if (foreground_fault == .malformed) continue;
+                                emitForeground(
+                                    alloc,
+                                    status_cfg,
+                                    daemon_pid,
+                                    daemon_created_at,
+                                    last_foreground_transition_sequence,
+                                    last_foreground_sample_sequence,
+                                    "malformed",
+                                    0,
+                                    "",
+                                    session_name,
+                                );
+                                foreground_fault = .malformed;
+                            },
+                            .stale => |observation| {
+                                if (foreground_fault == .stale) continue;
+                                emitForeground(
+                                    alloc,
+                                    status_cfg,
+                                    daemon_pid,
+                                    daemon_created_at,
+                                    observation.transition_sequence,
+                                    observation.sample_sequence,
+                                    "stale",
+                                    0,
+                                    "",
+                                    session_name,
+                                );
+                                foreground_fault = .stale;
+                            },
+                        }
                     },
                     else => {},
                 }
