@@ -639,7 +639,11 @@ const Daemon = struct {
     is_task_mode: bool = false, // flag for when session is run as a task
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
     task_ended_at: ?u64 = null, // timestamp when task exited
-    pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
+    // Set by daemonLoop before any client message is dispatched; handleRun and
+    // handleCwd probe the foreground process through it. If dispatch ever moves
+    // ahead of daemonLoop's assignment, cwd queries silently degrade to the
+    // root shell (cwdForSession treats -1 as "no pty").
+    pty_fd: i32 = -1,
     pty_write_buf: std.ArrayList(u8) = .empty,
     // Set once the pty child is reaped on the EOF path in daemonLoop, so the
     // startOrAttach defer skips its own waitpid — a second reap hits
