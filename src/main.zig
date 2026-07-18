@@ -639,7 +639,11 @@ const Daemon = struct {
     is_task_mode: bool = false, // flag for when session is run as a task
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
     task_ended_at: ?u64 = null, // timestamp when task exited
-    pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
+    // Set by daemonLoop before any client message is dispatched; handleRun and
+    // handleCwd probe the foreground process through it. If dispatch ever moves
+    // ahead of daemonLoop's assignment, cwd queries silently degrade to the
+    // root shell (cwdForSession treats -1 as "no pty").
+    pty_fd: i32 = -1,
     pty_write_buf: std.ArrayList(u8) = .empty,
     // Set once the pty child is reaped on the EOF path in daemonLoop, so the
     // startOrAttach defer skips its own waitpid — a second reap hits
@@ -1320,7 +1324,7 @@ const Daemon = struct {
     }
 
     pub fn handleCwd(self: *Daemon, client: *Client) !void {
-        const resolved = cwd_mod.cwdForPid(self.alloc, self.pid) catch null;
+        const resolved = cwd_mod.cwdForSession(self.alloc, self.pty_fd, self.pid) catch null;
         defer if (resolved) |path| self.alloc.free(path);
 
         const response = if (resolved) |path|
@@ -1464,7 +1468,7 @@ fn help() !void {
         \\  [l]ist|ls [--short]                      List active sessions
         \\  [k]ill <name>... [--force]               Kill session and all attached clients
         \\  [hi]story <name> [--vt|--html]           Output session scrollback
-        \\  cwd <name>                               Print session root shell cwd
+        \\  cwd <name>                               Print active terminal job cwd
         \\  [w]ait <name>...                         Wait for session tasks to complete
         \\  [t]ail <name>...                         Follow session output
         \\  [c]ompletions <shell>                    Shell completions (bash, zsh, fish, nu)
