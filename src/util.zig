@@ -16,6 +16,7 @@ pub const SessionEntry = struct {
     created_at: u64,
     task_ended_at: ?u64,
     task_exit_code: ?u8,
+    daemon_pid: i32 = 0,
 
     pub fn deinit(self: SessionEntry, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -95,6 +96,7 @@ pub fn get_session_entries(
                 .created_at = result.info.created_at,
                 .task_ended_at = result.info.task_ended_at,
                 .task_exit_code = result.info.task_exit_code,
+                .daemon_pid = result.info.daemon_pid,
             });
         }
     }
@@ -809,6 +811,10 @@ pub fn writeSessionLine(
             }
         }
     }
+    // Always emitted, even 0 (0 means "unknown daemon pid", e.g. probing an
+    // old daemon that predates this field) — downstream parsers can rely on
+    // the key always being present rather than treating absence as unknown.
+    try writer.print("\tdaemon_pid={d}", .{session.daemon_pid});
     try writer.print("\n", .{});
 }
 
@@ -838,19 +844,19 @@ test "writeSessionLine formats output for current session and short output" {
             .session = session,
             .short = false,
             .current_session = "dev",
-            .expected = "→ name=dev\tpid=123\tclients=2\tcreated=0\n",
+            .expected = "→ name=dev\tpid=123\tclients=2\tcreated=0\tdaemon_pid=0\n",
         },
         .{
             .session = session,
             .short = false,
             .current_session = "other",
-            .expected = "  name=dev\tpid=123\tclients=2\tcreated=0\n",
+            .expected = "  name=dev\tpid=123\tclients=2\tcreated=0\tdaemon_pid=0\n",
         },
         .{
             .session = session,
             .short = false,
             .current_session = null,
-            .expected = "name=dev\tpid=123\tclients=2\tcreated=0\n",
+            .expected = "name=dev\tpid=123\tclients=2\tcreated=0\tdaemon_pid=0\n",
         },
         .{
             .session = session,

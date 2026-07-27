@@ -127,9 +127,11 @@ pub fn getTerminalSize(fd: i32) TerminalSize {
 pub const MAX_CMD_LEN = 256;
 pub const MAX_CWD_LEN = 256;
 
-/// Frozen wire shape. Do NOT add fields — new stats go in new `Tag` values
-/// so old daemons (whose `_` arm ignores unknown tags) stay reachable.
-/// Changing `@sizeOf(Info)` breaks `zmx list` against running daemons.
+/// Frozen wire shape: @sizeOf(Info) must stay 552 (see "Info wire size is
+/// frozen" below), or `zmx list` breaks against running daemons. Prefer new
+/// `Tag` values for new stats (old daemons' `_` arm ignores unknown tags).
+/// A field may only be appended here when it fits in existing tail padding
+/// without changing @sizeOf — verify with `zig run` before adding one.
 pub const Info = extern struct {
     clients_len: u64,
     pid: i32,
@@ -140,6 +142,12 @@ pub const Info = extern struct {
     created_at: u64,
     task_ended_at: u64,
     task_exit_code: u8,
+    // Appended after task_exit_code: consumes existing tail padding rather
+    // than growing @sizeOf(Info), so the freeze below still holds. Old
+    // daemons zero the whole struct before filling it (see main.zig
+    // handleInfo), so a new client reading an old daemon sees 0, i.e.
+    // "daemon pid unknown" — never confuse with a real pid.
+    daemon_pid: i32,
 };
 
 pub fn expectedLength(data: []const u8) ?usize {
@@ -340,12 +348,25 @@ pub fn probeSession(
 //  Changing these constants does not fix the test; it breaks every
 //  running daemon for every user until they `pkill -f zmx`.
 //
-//  Need a new field?   → add a new `Tag` value (next free integer).
+//  Need a new field?   → add a new `Tag` value (next free integer), unless
+//                         it provably fits in existing tail padding (see
+//                         `daemon_pid` on `Info` for the one exception made
+//                         so far — measured with `zig run`, not assumed).
 //  Need to remove one? → don't. Reserve the integer, stop sending it.
 test "Info wire size is frozen" {
     try std.testing.expectEqual(@as(usize, 552), @sizeOf(Info));
     // packed struct{u8,u32} backs to u40 → @sizeOf rounds to 8, not 5.
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(Header));
+}
+
+test "daemon_pid lands in task_exit_code's old tail padding" {
+    try std.testing.expectEqual(@as(usize, 548), @offsetOf(Info, "daemon_pid"));
+}
+
+test "an old zeroed 552-byte payload decodes daemon_pid as absent" {
+    const old_payload = [_]u8{0} ** 552;
+    const decoded = std.mem.bytesToValue(Info, old_payload[0..@sizeOf(Info)]);
+    try std.testing.expectEqual(@as(i32, 0), decoded.daemon_pid);
 }
 
 test "Init and Resize wire size is frozen" {
@@ -443,7 +464,11 @@ test "zeroed Info has no stack garbage in wire bytes" {
     info.pid = 999;
     info.task_exit_code = 7;
     const bytes = std.mem.asBytes(&info);
-    // Tail padding after task_exit_code must be zero (asBytes ships it).
-    const last_field_end = @offsetOf(Info, "task_exit_code") + @sizeOf(u8);
-    for (bytes[last_field_end..]) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    // Padding between task_exit_code and daemon_pid (now the real last
+    // field) must be zero (asBytes ships it).
+    const task_exit_code_end = @offsetOf(Info, "task_exit_code") + @sizeOf(u8);
+    const daemon_pid_start = @offsetOf(Info, "daemon_pid");
+    for (bytes[task_exit_code_end..daemon_pid_start]) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    // daemon_pid itself is untouched here, so it stays zero too.
+    for (bytes[daemon_pid_start..]) |b| try std.testing.expectEqual(@as(u8, 0), b);
 }
