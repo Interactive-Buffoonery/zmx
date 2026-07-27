@@ -1264,6 +1264,10 @@ const Daemon = struct {
         info.created_at = self.created_at;
         info.task_ended_at = self.task_ended_at orelse 0;
         info.task_exit_code = self.task_exit_code orelse 0;
+        // self.pid (above) is the forkpty shell child, not this process.
+        // daemon_pid is the daemon's own pid, for callers that need to tell
+        // "is the daemon itself still alive" apart from "is the shell alive".
+        info.daemon_pid = @intCast(std.c.getpid());
 
         // Build command string from args, re-quoting args that contain
         // shell-special characters so the displayed command is copy-pasteable.
