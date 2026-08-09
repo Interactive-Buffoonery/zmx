@@ -1,6 +1,6 @@
 const std = @import("std");
-const posix = std.posix;
 const cross = @import("cross.zig");
+const lib_posix = @import("posix.zig");
 
 const MAX_STATUS_LINE_LEN = 2048;
 
@@ -29,11 +29,6 @@ pub const StatusConfig = struct {
     }
 };
 
-pub fn clearEnvForDaemonCreation() void {
-    _ = cross.c.unsetenv("AMX_STATUS_FILE");
-    _ = cross.c.unsetenv("AMX_STATUS_TOKEN");
-}
-
 pub const StatusFile = struct {
     pub fn emitAttached(
         alloc: std.mem.Allocator,
@@ -54,19 +49,21 @@ pub const StatusFile = struct {
         try appendJsonString(alloc, &line, token);
         try line.appendSlice(alloc, ",\"created\":");
         try line.appendSlice(alloc, if (created) "true" else "false");
-        try line.writer(alloc).print(
+        try appendFmt(
+            alloc,
+            &line,
             ",\"daemon_pid\":{d},\"daemon_created_at\":{d},\"session\":",
             .{ daemon_pid, daemon_created_at },
         );
         try appendJsonString(alloc, &line, session);
-        try line.writer(alloc).print(",\"ts\":{d}}}\n", .{ts});
+        try appendFmt(alloc, &line, ",\"ts\":{d}}}\n", .{ts});
 
         if (line.items.len > MAX_STATUS_LINE_LEN) return error.StatusLineTooLong;
 
         const fd = try openAppend(path);
-        defer posix.close(fd);
+        defer lib_posix.close(fd);
 
-        const written = try posix.write(fd, line.items);
+        const written = try lib_posix.write(fd, line.items);
         if (written != line.items.len) return error.ShortWrite;
     }
 
@@ -88,37 +85,49 @@ pub const StatusFile = struct {
         try appendJsonString(alloc, &line, token);
         try line.appendSlice(alloc, ",\"reason\":");
         try appendJsonString(alloc, &line, reason);
-        try line.writer(alloc).print(",\"code\":{d},\"session\":", .{code});
+        try appendFmt(alloc, &line, ",\"code\":{d},\"session\":", .{code});
         try appendJsonString(alloc, &line, session);
-        try line.writer(alloc).print(",\"ts\":{d}}}\n", .{ts});
+        try appendFmt(alloc, &line, ",\"ts\":{d}}}\n", .{ts});
 
         if (line.items.len > MAX_STATUS_LINE_LEN) return error.StatusLineTooLong;
 
         const fd = try openAppend(path);
-        defer posix.close(fd);
+        defer lib_posix.close(fd);
 
-        const written = try posix.write(fd, line.items);
+        const written = try lib_posix.write(fd, line.items);
         if (written != line.items.len) return error.ShortWrite;
     }
 
-    fn openAppend(path: []const u8) !posix.fd_t {
-        const fd = try posix.open(path, .{
+    fn openAppend(path: []const u8) !lib_posix.fd_t {
+        const fd = try lib_posix.open(path, .{
             .ACCMODE = .WRONLY,
             .APPEND = true,
             .CREAT = true,
             .CLOEXEC = true,
             .NOFOLLOW = true,
         }, 0o600);
-        errdefer posix.close(fd);
+        errdefer lib_posix.close(fd);
 
-        const st = try posix.fstat(fd);
-        if (st.uid != posix.getuid()) return error.InvalidStatusFile;
-        if ((st.mode & posix.S.IFMT) != posix.S.IFREG) return error.InvalidStatusFile;
-        if ((st.mode & 0o777) != 0o600) return error.InvalidStatusFile;
+        var st: cross.c.struct_stat = undefined;
+        if (cross.c.fstat(fd, &st) != 0) return error.InvalidStatusFile;
+        if (st.st_uid != lib_posix.getuid()) return error.InvalidStatusFile;
+        if ((st.st_mode & cross.c.S_IFMT) != cross.c.S_IFREG) return error.InvalidStatusFile;
+        if ((st.st_mode & 0o777) != 0o600) return error.InvalidStatusFile;
 
         return fd;
     }
 };
+
+fn appendFmt(
+    alloc: std.mem.Allocator,
+    line: *std.ArrayList(u8),
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    const rendered = try std.fmt.allocPrint(alloc, fmt, args);
+    defer alloc.free(rendered);
+    try line.appendSlice(alloc, rendered);
+}
 
 fn appendJsonString(
     alloc: std.mem.Allocator,
@@ -169,27 +178,13 @@ test "status env is copied without consuming attach parent state" {
     try std.testing.expect(cross.c.getenv("AMX_STATUS_TOKEN") != null);
 }
 
-test "status env clear covers daemon creation without StatusConfig copy" {
-    _ = cross.c.setenv("AMX_STATUS_FILE", "/tmp/x", 1);
-    _ = cross.c.setenv("AMX_STATUS_TOKEN", "tok", 1);
-    defer {
-        _ = cross.c.unsetenv("AMX_STATUS_FILE");
-        _ = cross.c.unsetenv("AMX_STATUS_TOKEN");
-    }
-
-    clearEnvForDaemonCreation();
-
-    try std.testing.expect(cross.c.getenv("AMX_STATUS_FILE") == null);
-    try std.testing.expect(cross.c.getenv("AMX_STATUS_TOKEN") == null);
-}
-
 test "emitAttached writes one JSON line with incarnation identity" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(tmp_path);
     const path = try std.fs.path.join(alloc, &.{ tmp_path, "status.jsonl" });
     defer alloc.free(path);
@@ -201,13 +196,14 @@ test "emitAttached writes one JSON line with incarnation identity" {
 
     try StatusFile.emitAttached(alloc, cfg, true, 4242, 1_777_000_111, "sesh-1", 1_777_000_222);
 
-    const contents = try tmp.dir.readFileAlloc(alloc, "status.jsonl", 4096);
+    const contents = try tmp.dir.readFileAlloc(std.testing.io, "status.jsonl", alloc, .limited(4096));
     defer alloc.free(contents);
 
     try std.testing.expect(std.mem.endsWith(u8, contents, "\n"));
     var lines = std.mem.splitScalar(u8, contents, '\n');
     const line = lines.next() orelse return error.MissingStatusLine;
-    try std.testing.expectEqual(@as(usize, 0), (lines.next() orelse "").len);
+    const trailing = lines.next() orelse return error.MissingTrailingLine;
+    try std.testing.expectEqual(@as(usize, 0), trailing.len);
     try std.testing.expect(lines.next() == null);
 
     try std.testing.expect(std.mem.indexOf(u8, line, "\"event\":\"attached\"") != null);

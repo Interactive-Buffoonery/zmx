@@ -52,15 +52,39 @@
 
 ### binaries
 
-- https://zmx.sh/a/zmx-0.6.0-linux-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.6.0-linux-x86_64.tar.gz
-- https://zmx.sh/a/zmx-0.6.0-macos-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.6.0-macos-x86_64.tar.gz
+- https://zmx.sh/a/zmx-0.7.0-linux-aarch64.tar.gz
+- https://zmx.sh/a/zmx-0.7.0-linux-x86_64.tar.gz
+- https://zmx.sh/a/zmx-0.7.0-macos-aarch64.tar.gz
+- https://zmx.sh/a/zmx-0.7.0-macos-x86_64.tar.gz
 
 ### homebrew
 
 ```bash
 brew install neurosnap/tap/zmx
+```
+
+### mise-en-place
+
+```bash
+mise use zmx
+```
+
+### NixOS / nixpkgs
+
+Run immediately without installation:
+
+```sh
+nix run github:NixOS/nixpkgs/nixpkgs-unstable#zmx
+# or build main yourself
+nix run github:neurosnap/zmx
+```
+
+Start a shell with zmx available while it runs:
+
+```sh
+nix shell github:NixOS/nixpkgs/nixpkgs-unstable#zmx
+# or built main yourself
+nix run github:neurosnap/zmx
 ```
 
 ### packages (unofficial)
@@ -74,7 +98,7 @@ brew install neurosnap/tap/zmx
 
 ### src
 
-- Requires zig `v0.15`
+- Requires zig `v0.16`
 - Clone the repo
 - Run build cmd
 
@@ -87,7 +111,7 @@ zig build -Doptimize=ReleaseSafe --prefix ~/.local
 ## usage
 
 > [!IMPORTANT]
-> We recommend closing the terminal window to detach from the session but you can also press `ctrl+\` or run `zmx detach`.
+> We recommend closing the terminal window to detach from the session but you can also press `ctrl+\` or run `zmx detach`. If you need `ctrl+\` for something else (e.g. vim's `ctrl+\ ctrl+n` to escape its own `:terminal`), set `ZMX_NO_DETACH_KEY` to disable the shortcut and rely on `zmx detach` or closing the window instead.
 
 Run `zmx help` for more information on usage, with examples.
 
@@ -101,7 +125,11 @@ Commands:
   [p]rint <name> <text...>                 Inject text into session display
   [wr]ite <name> <file_path>               Write stdin to file_path through the session
   [d]etach                                 Detach all clients (ctrl+\\ for current client)
-  [l]ist|ls [--short]                      List active sessions
+  [l]ist|ls [--short|--where k=v]          List active sessions
+  [g]et <name>                             Get session labels
+  set <name> k=v ...                       Set session labels
+  [un]set <name> key ...                   Remove session labels
+  [cl]ear <name>                           Clear all session labels
   [k]ill <name>... [--force]               Kill session and all attached clients
   [hi]story <name> [--vt|--html]           Output session scrollback
   [w]ait <name>...                         Wait for session tasks to complete
@@ -289,6 +317,22 @@ if command -v zmx &> /dev/null && command -v fzf &> /dev/null && [[ -z "$ZMX_SES
   zmx-select && exit
 fi
 ```
+
+#### Alternative: gentle hint (server use)
+
+If you use zmx on a shared server and SSH in frequently for quick operations, auto-launching the picker on every connection may be too aggressive. Instead, show a one-line reminder when active sessions exist:
+
+```bash
+if command -v zmx &> /dev/null && [[ -z "$ZMX_SESSION" ]]; then
+  local count
+  count=$(zmx ls --short 2>/dev/null | wc -l)
+  if [[ "$count" -gt 0 ]]; then
+    echo "zmx: $count session(s) active — \`zmx-select\` to attach" >&2
+  fi
+fi
+```
+
+Choose the auto-launch pattern for dedicated dev machines, and the hint pattern for shared servers where you frequently run quick commands.
 
 </details>
 
@@ -483,3 +527,4 @@ abduco provides session management (i.e. it allows programs to be run independen
 - [pi-zmx](https://github.com/deevus/pi-zmx) -- [pi](https://pi.dev) extension for zmx.
 - [zsm](https://github.com/mdsakalu/zmx-session-manager) -- TUI session manager for zmx. List, preview, filter, and kill sessions from an interactive terminal UI.
 - [zmosh](https://github.com/mmonad/zmosh) -- A fork of zmx that adds encrypted UDP auto-reconnect for remote sessions (like mosh).
+- [zmx-picker](https://github.com/EarthmanMuons/zmx-picker) -- fzf-based session picker and project launcher. Jump to a running zmx session or start one inside any of your git/jj repos.

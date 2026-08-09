@@ -1,6 +1,5 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const posix = std.posix;
 
 pub const c = switch (builtin.os.tag) {
     .macos => @cImport({
@@ -8,18 +7,21 @@ pub const c = switch (builtin.os.tag) {
         @cInclude("termios.h");
         @cInclude("stdlib.h");
         @cInclude("unistd.h");
+        @cInclude("sys/stat.h");
     }),
     .freebsd => @cImport({
         @cInclude("termios.h"); // ioctl and constants
         @cInclude("libutil.h"); // openpty()
         @cInclude("stdlib.h");
         @cInclude("unistd.h");
+        @cInclude("sys/stat.h");
     }),
     else => @cImport({
         @cInclude("sys/ioctl.h"); // ioctl and constants
         @cInclude("pty.h");
         @cInclude("stdlib.h");
         @cInclude("unistd.h");
+        @cInclude("sys/stat.h");
     }),
 };
 

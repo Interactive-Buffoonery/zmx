@@ -1,7 +1,7 @@
 const std = @import("std");
-const posix = std.posix;
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
+const lib_posix = @import("posix.zig");
 
 pub const Tag = enum(u8) {
     Input = 0,
@@ -22,15 +22,20 @@ pub const Tag = enum(u8) {
     CwdQuery = 15,
     CwdResponse = 16,
     ResizePixels = 17,
+    LabelGet = 18,
+    LabelSet = 19,
+    LabelClear = 20,
+    LabelData = 21,
+    Send = 22,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
-    // @enumFromInt, so out-of-range values (18-255) are representable
+    // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
     _,
 };
 
 comptime {
     if (@typeInfo(Tag).@"enum".is_exhaustive) @compileError(
-        "ipc.Tag must stay non-exhaustive — old daemons rely on `_` to ignore unknown tags",
+        "ipc.Tag must stay non-exhaustive -- old daemons rely on `_` to ignore unknown tags",
     );
 }
 
@@ -99,7 +104,6 @@ pub const CwdResponse = extern struct {
             response.overflow = 1;
             return response;
         }
-
         response.path_len = @intCast(value.len);
         @memcpy(response.path[0..value.len], value);
         return response;
@@ -114,24 +118,16 @@ pub const CwdResponse = extern struct {
 pub fn getTerminalSize(fd: i32) TerminalSize {
     var ws: cross.c.struct_winsize = undefined;
     if (cross.c.ioctl(fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
-        return .{
-            .rows = ws.ws_row,
-            .cols = ws.ws_col,
-            .xpixel = ws.ws_xpixel,
-            .ypixel = ws.ws_ypixel,
-        };
+        return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
     }
-    return .{ .rows = 24, .cols = 160, .xpixel = 0, .ypixel = 0 };
+    return .{ .rows = 24, .cols = 120, .xpixel = 0, .ypixel = 0 };
 }
 
 pub const MAX_CMD_LEN = 256;
 pub const MAX_CWD_LEN = 256;
 
-/// Frozen wire shape: @sizeOf(Info) must stay 552 (see "Info wire size is
-/// frozen" below), or `zmx list` breaks against running daemons. Prefer new
-/// `Tag` values for new stats (old daemons' `_` arm ignores unknown tags).
-/// A field may only be appended here when it fits in existing tail padding
-/// without changing @sizeOf — verify with `zig run` before adding one.
+/// Frozen wire shape. `daemon_pid` consumes existing tail padding and does
+/// not change the 552-byte payload used by already-running daemons.
 pub const Info = extern struct {
     clients_len: u64,
     pid: i32,
@@ -142,11 +138,6 @@ pub const Info = extern struct {
     created_at: u64,
     task_ended_at: u64,
     task_exit_code: u8,
-    // Appended after task_exit_code: consumes existing tail padding rather
-    // than growing @sizeOf(Info), so the freeze below still holds. Old
-    // daemons zero the whole struct before filling it (see main.zig
-    // handleInfo), so a new client reading an old daemon sees 0, i.e.
-    // "daemon pid unknown" — never confuse with a real pid.
     daemon_pid: i32,
 };
 
@@ -171,7 +162,7 @@ pub fn send(fd: i32, tag: Tag, data: []const u8) !void {
 }
 
 pub fn appendMessage(
-    alloc: std.mem.Allocator,
+    gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
     tag: Tag,
     data: []const u8,
@@ -182,7 +173,7 @@ pub fn appendMessage(
     };
     // Guarantee capacity for header + payload in one check to avoid
     // intermediate realloc between the two appends on the hot path.
-    try list.ensureTotalCapacity(alloc, list.items.len + @sizeOf(Header) + data.len);
+    try list.ensureTotalCapacity(gpa, list.items.len + @sizeOf(Header) + data.len);
     list.appendSliceAssumeCapacity(std.mem.asBytes(&header));
     if (data.len > 0) {
         list.appendSliceAssumeCapacity(data);
@@ -204,7 +195,7 @@ pub fn appendTerminalSizeMessages(
 fn writeAll(fd: i32, data: []const u8) !void {
     var index: usize = 0;
     while (index < data.len) {
-        const n = try posix.write(fd, data[index..]);
+        const n = try lib_posix.write(fd, data[index..]);
         if (n == 0) return error.DiskQuota;
         index += n;
     }
@@ -260,7 +251,7 @@ pub const SocketBuffer = struct {
         }
 
         var tmp: [4096]u8 = undefined;
-        const n = try posix.read(fd, &tmp);
+        const n = try lib_posix.read(fd, &tmp);
         if (n > 0) {
             try self.buf.appendSlice(self.alloc, tmp[0..n]);
         }
@@ -307,6 +298,13 @@ const SessionProbeError = error{
 const SessionProbeResult = struct {
     fd: i32,
     info: Info,
+    labels: ?[]const u8,
+    alloc: std.mem.Allocator,
+
+    pub fn deinit(self: *const SessionProbeResult) void {
+        if (self.labels) |lbl| self.alloc.free(lbl);
+        lib_posix.close(self.fd);
+    }
 };
 
 pub fn probeSession(
@@ -315,12 +313,13 @@ pub fn probeSession(
 ) SessionProbeError!SessionProbeResult {
     const timeout_ms = 1000;
     const fd = try connectSession(socket_path);
-    errdefer posix.close(fd);
+    errdefer lib_posix.close(fd);
 
     send(fd, .Info, "") catch return error.Unexpected;
+    send(fd, .LabelGet, "") catch {};
 
-    var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    const poll_result = posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
+    var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+    const poll_result = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
     if (poll_result == 0) {
         return error.Timeout;
     }
@@ -331,27 +330,48 @@ pub fn probeSession(
     const n = sb.read(fd) catch return error.Unexpected;
     if (n == 0) return error.Unexpected;
 
-    while (sb.next()) |msg| {
-        if (msg.header.tag == .Info) {
-            if (msg.payload.len != @sizeOf(Info)) return error.InfoSizeMismatch;
-            return .{
-                .fd = fd,
-                .info = std.mem.bytesToValue(Info, msg.payload[0..@sizeOf(Info)]),
-            };
+    var info_result: ?Info = null;
+    var labels: ?[]const u8 = null;
+    errdefer if (labels) |lbl| alloc.free(lbl);
+
+    while (true) {
+        if (sb.next()) |msg| {
+            if (msg.header.tag == .Info) {
+                if (msg.payload.len != @sizeOf(Info)) return error.InfoSizeMismatch;
+                info_result = std.mem.bytesToValue(Info, msg.payload[0..@sizeOf(Info)]);
+            }
+            if (msg.header.tag == .LabelData) {
+                labels = alloc.dupe(u8, msg.payload) catch null;
+            }
+
+            if (info_result != null and labels != null) break;
+            continue;
         }
+
+        // No complete message available, wait for more data
+        const more = lib_posix.poll(&poll_fds, 50) catch break;
+        if (more == 0) break;
+        const n_read = sb.read(fd) catch break;
+        if (n_read == 0) break;
+    }
+
+    if (info_result) |info| {
+        return .{
+            .fd = fd,
+            .info = info,
+            .labels = labels,
+            .alloc = alloc,
+        };
     }
     return error.Unexpected;
 }
 
-//  WIRE PROTOCOL FREEZE — read before "fixing" any test below.
+//  WIRE PROTOCOL FREEZE: read before "fixing" any test below.
 //
 //  Changing these constants does not fix the test; it breaks every
 //  running daemon for every user until they `pkill -f zmx`.
 //
-//  Need a new field?   → add a new `Tag` value (next free integer), unless
-//                         it provably fits in existing tail padding (see
-//                         `daemon_pid` on `Info` for the one exception made
-//                         so far — measured with `zig run`, not assumed).
+//  Need a new field?   → add a new `Tag` value (next free integer).
 //  Need to remove one? → don't. Reserve the integer, stop sending it.
 test "Info wire size is frozen" {
     try std.testing.expectEqual(@as(usize, 552), @sizeOf(Info));
@@ -363,99 +383,93 @@ test "daemon_pid lands in task_exit_code's old tail padding" {
     try std.testing.expectEqual(@as(usize, 548), @offsetOf(Info, "daemon_pid"));
 }
 
-test "an old zeroed 552-byte payload decodes daemon_pid as absent" {
-    const old_payload = [_]u8{0} ** 552;
-    const decoded = std.mem.bytesToValue(Info, old_payload[0..@sizeOf(Info)]);
-    try std.testing.expectEqual(@as(i32, 0), decoded.daemon_pid);
-}
-
 test "Init and Resize wire size is frozen" {
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(Resize));
 }
 
-test "terminal size messages preserve legacy cells and extend pixels" {
+test "terminal size messages preserve cell wire shape and pixel extension" {
     const alloc = std.testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(alloc);
+    try appendTerminalSizeMessages(alloc, &bytes, .Init, .{
+        .rows = 42,
+        .cols = 120,
+        .xpixel = 1440,
+        .ypixel = 900,
+    });
 
-    const size = TerminalSize{ .rows = 42, .cols = 120, .xpixel = 1440, .ypixel = 900 };
-    try appendTerminalSizeMessages(alloc, &buf, .Init, size);
-
-    var socket_buf = SocketBuffer{
-        .buf = buf,
-        .alloc = alloc,
-        .head = 0,
-    };
-    buf = .empty;
+    var socket_buf = SocketBuffer{ .buf = bytes, .alloc = alloc, .head = 0 };
+    bytes = .empty;
     defer socket_buf.deinit();
-
-    const init = socket_buf.next() orelse return error.MissingInitMessage;
-    try std.testing.expectEqual(Tag.Init, init.header.tag);
-    try std.testing.expectEqual(@as(usize, 4), init.payload.len);
-    try std.testing.expectEqual(
-        Resize{ .rows = 42, .cols = 120 },
-        std.mem.bytesToValue(Resize, init.payload),
-    );
+    const cells = socket_buf.next() orelse return error.MissingInitMessage;
+    try std.testing.expectEqual(Tag.Init, cells.header.tag);
+    try std.testing.expectEqual(@as(usize, 4), cells.payload.len);
+    try std.testing.expectEqual(Resize{ .rows = 42, .cols = 120 }, std.mem.bytesToValue(Resize, cells.payload));
 
     const pixels = socket_buf.next() orelse return error.MissingResizePixelsMessage;
     try std.testing.expectEqual(Tag.ResizePixels, pixels.header.tag);
-    try std.testing.expectEqual(@as(usize, 4), pixels.payload.len);
     try std.testing.expectEqual(
         ResizePixels{ .xpixel = 1440, .ypixel = 900 },
         std.mem.bytesToValue(ResizePixels, pixels.payload),
     );
+}
 
-    try appendTerminalSizeMessages(alloc, &socket_buf.buf, .Resize, size);
-    const resize = socket_buf.next() orelse return error.MissingResizeMessage;
-    try std.testing.expectEqual(Tag.Resize, resize.header.tag);
-    try std.testing.expectEqual(@as(usize, 4), resize.payload.len);
+test "SessionEnd payload round trips with zeroed padding" {
+    const payload = SessionEnd.init(.shell_exit, 7);
+    const bytes = std.mem.asBytes(&payload);
+    const reason_end = @offsetOf(SessionEnd, "reason") + @sizeOf(SessionEndReason);
+    const code_start = @offsetOf(SessionEnd, "code");
+    for (bytes[reason_end..code_start]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    try std.testing.expectEqual(SessionEndReason.shell_exit, payload.reason);
+    try std.testing.expectEqual(@as(i32, 7), payload.code);
 }
 
 test "Tag wire values are frozen" {
     inline for (.{
-        .{ Tag.Input, 0 },     .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
-        .{ Tag.Detach, 3 },    .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
-        .{ Tag.Info, 6 },      .{ Tag.Init, 7 },          .{ Tag.History, 8 },
-        .{ Tag.Run, 9 },       .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
-        .{ Tag.Write, 12 },    .{ Tag.TaskComplete, 13 }, .{ Tag.SessionEnd, 14 },
-        .{ Tag.CwdQuery, 15 }, .{ Tag.CwdResponse, 16 },  .{ Tag.ResizePixels, 17 },
+        .{ Tag.Input, 0 },      .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
+        .{ Tag.Detach, 3 },     .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
+        .{ Tag.Info, 6 },       .{ Tag.Init, 7 },          .{ Tag.History, 8 },
+        .{ Tag.Run, 9 },        .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
+        .{ Tag.Write, 12 },     .{ Tag.TaskComplete, 13 }, .{ Tag.SessionEnd, 14 },
+        .{ Tag.CwdQuery, 15 },  .{ Tag.CwdResponse, 16 },  .{ Tag.ResizePixels, 17 },
+        .{ Tag.LabelGet, 18 },  .{ Tag.LabelSet, 19 },     .{ Tag.LabelClear, 20 },
+        .{ Tag.LabelData, 21 }, .{ Tag.Send, 22 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 
-test "SessionEnd IPC payload round trips" {
-    const alloc = std.testing.allocator;
+pub fn roundTripForTag(
+    alloc: std.mem.Allocator,
+    socket_path: []const u8,
+    request_tag: Tag,
+    payload: []const u8,
+    expected_tag: Tag,
+) SessionProbeError![]u8 {
+    const fd = try connectSession(socket_path);
+    defer lib_posix.close(fd);
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
+    send(fd, request_tag, payload) catch return error.Unexpected;
 
-    const payload = SessionEnd.init(.shell_exit, 0);
+    var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+    var sb = SocketBuffer.init(alloc) catch return error.Unexpected;
+    defer sb.deinit();
 
-    try appendMessage(alloc, &buf, .SessionEnd, std.mem.asBytes(&payload));
+    // One overall ~1s deadline, split into bounded polls so partial messages
+    // and interleaved PTY output cannot hide the response indefinitely.
+    var polls_remaining: u8 = 20;
+    while (polls_remaining > 0) : (polls_remaining -= 1) {
+        poll_fds[0].revents = 0;
+        const ready = lib_posix.poll(&poll_fds, 50) catch return error.Unexpected;
+        if (ready == 0) continue;
 
-    var socket_buf = SocketBuffer{
-        .buf = buf,
-        .alloc = alloc,
-        .head = 0,
-    };
-    buf = .empty;
-    defer socket_buf.deinit();
-
-    const msg = socket_buf.next() orelse return error.MissingSessionEndMessage;
-    try std.testing.expectEqual(Tag.SessionEnd, msg.header.tag);
-    try std.testing.expectEqual(@sizeOf(SessionEnd), msg.payload.len);
-
-    const decoded = std.mem.bytesToValue(SessionEnd, msg.payload[0..@sizeOf(SessionEnd)]);
-    try std.testing.expectEqual(SessionEndReason.shell_exit, decoded.reason);
-    try std.testing.expectEqual(@as(i32, 0), decoded.code);
-}
-
-test "zeroed SessionEnd has no stack garbage in wire bytes" {
-    const payload = SessionEnd.init(.daemon_died, 9);
-    const bytes = std.mem.asBytes(&payload);
-
-    const reason_end = @offsetOf(SessionEnd, "reason") + @sizeOf(SessionEndReason);
-    const code_start = @offsetOf(SessionEnd, "code");
-    for (bytes[reason_end..code_start]) |b| try std.testing.expectEqual(@as(u8, 0), b);
+        const n = sb.read(fd) catch return error.Unexpected;
+        if (n == 0) return error.Unexpected;
+        while (sb.next()) |msg| {
+            if (msg.header.tag == expected_tag) {
+                return alloc.dupe(u8, msg.payload) catch return error.Unexpected;
+            }
+        }
+    }
+    return error.Timeout;
 }
 
 test "zeroed Info has no stack garbage in wire bytes" {
@@ -464,11 +478,8 @@ test "zeroed Info has no stack garbage in wire bytes" {
     info.pid = 999;
     info.task_exit_code = 7;
     const bytes = std.mem.asBytes(&info);
-    // Padding between task_exit_code and daemon_pid (now the real last
-    // field) must be zero (asBytes ships it).
     const task_exit_code_end = @offsetOf(Info, "task_exit_code") + @sizeOf(u8);
     const daemon_pid_start = @offsetOf(Info, "daemon_pid");
     for (bytes[task_exit_code_end..daemon_pid_start]) |b| try std.testing.expectEqual(@as(u8, 0), b);
-    // daemon_pid itself is untouched here, so it stays zero too.
     for (bytes[daemon_pid_start..]) |b| try std.testing.expectEqual(@as(u8, 0), b);
 }

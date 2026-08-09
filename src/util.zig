@@ -1,8 +1,10 @@
 const std = @import("std");
-const posix = std.posix;
 const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
 const socket = @import("socket.zig");
+const cross = @import("cross.zig");
+const label = @import("label.zig");
+const lib_posix = @import("posix.zig");
 const testing = std.testing;
 
 pub const SessionEntry = struct {
@@ -13,6 +15,7 @@ pub const SessionEntry = struct {
     error_name: ?[]const u8,
     cmd: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
+    labels: ?[]const u8 = null,
     created_at: u64,
     task_ended_at: ?u64,
     task_exit_code: ?u8,
@@ -22,6 +25,7 @@ pub const SessionEntry = struct {
         alloc.free(self.name);
         if (self.cmd) |cmd| alloc.free(cmd);
         if (self.cwd) |cwd| alloc.free(cwd);
+        if (self.labels) |l| alloc.free(l);
     }
 
     pub fn lessThan(_: void, a: SessionEntry, b: SessionEntry) bool {
@@ -31,16 +35,17 @@ pub const SessionEntry = struct {
 
 pub fn get_session_entries(
     alloc: std.mem.Allocator,
+    io: std.Io,
     socket_dir: []const u8,
 ) !std.ArrayList(SessionEntry) {
-    var dir = try std.fs.openDirAbsolute(socket_dir, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.openDirAbsolute(io, socket_dir, .{ .iterate = true });
+    defer dir.close(io);
     var iter = dir.iterate();
 
     var sessions = try std.ArrayList(SessionEntry).initCapacity(alloc, 30);
 
-    while (try iter.next()) |entry| {
-        const exists = socket.sessionExists(dir, entry.name) catch continue;
+    while (try iter.next(io)) |entry| {
+        const exists = socket.sessionExists(io, dir, entry.name) catch continue;
         if (exists) {
             const name = try alloc.dupe(u8, entry.name);
             errdefer alloc.free(name);
@@ -61,16 +66,17 @@ pub fn get_session_entries(
                     .created_at = 0,
                     .task_exit_code = 1,
                     .task_ended_at = 0,
+                    .labels = "",
                 });
                 // Only clean up when the daemon is definitively gone. A busy
                 // daemon can miss the probe timeout; deleting its socket
                 // orphans it permanently.
                 if (err == error.ConnectionRefused) {
-                    socket.cleanupStaleSocket(dir, entry.name);
+                    socket.cleanupStaleSocket(io, dir, entry.name);
                 }
                 continue;
             };
-            posix.close(result.fd);
+            defer result.deinit();
 
             // Extract cmd and cwd from the fixed-size arrays. Lengths come
             // off the wire (u16 range), so clamp to the actual array size.
@@ -80,8 +86,14 @@ pub fn get_session_entries(
                 alloc.dupe(u8, result.info.cmd[0..cmd_len]) catch null
             else
                 null;
+
             const cwd: ?[]const u8 = if (cwd_len > 0)
                 alloc.dupe(u8, result.info.cwd[0..cwd_len]) catch null
+            else
+                null;
+
+            const labels = if (result.labels) |lbl|
+                alloc.dupe(u8, lbl) catch null
             else
                 null;
 
@@ -93,6 +105,7 @@ pub fn get_session_entries(
                 .error_name = null,
                 .cmd = cmd,
                 .cwd = cwd,
+                .labels = labels,
                 .created_at = result.info.created_at,
                 .task_ended_at = result.info.task_ended_at,
                 .task_exit_code = result.info.task_exit_code,
@@ -102,6 +115,18 @@ pub fn get_session_entries(
     }
 
     return sessions;
+}
+
+/// getCwd get the current working directory in a std.Uri format.
+/// Caller is responsible for releasing memory.
+pub fn getCwd(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
+    const cur_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cur_path);
+
+    var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const hostname = try std.posix.gethostname(&buf);
+
+    return std.fmt.allocPrint(gpa, "file://{s}{s}", .{ hostname, cur_path });
 }
 
 pub fn shellNeedsQuoting(arg: []const u8) bool {
@@ -330,8 +355,14 @@ test "rewritePromptRedraw: embedded in larger output" {
 pub fn findTaskExitMarker(output: []const u8) ?u8 {
     const marker = "ZMX_TASK_COMPLETED:";
 
-    // Search for marker in output
-    if (std.mem.indexOf(u8, output, marker)) |idx| {
+    // The command line is echoed back by the PTY (canonical mode) before the
+    // shell evaluates it, so the *first* occurrence of the marker in the
+    // output is often the literal, unexpanded "ZMX_TASK_COMPLETED:$?" from
+    // the echo, not the real "ZMX_TASK_COMPLETED:<code>" written once the
+    // shell actually runs it. Keep scanning past unparseable occurrences
+    // instead of giving up on the first one.
+    var search_start: usize = 0;
+    while (std.mem.indexOfPos(u8, output, search_start, marker)) |idx| {
         const after_marker = output[idx + marker.len ..];
 
         // Find the exit code number and newline
@@ -346,8 +377,7 @@ pub fn findTaskExitMarker(output: []const u8) ?u8 {
         if (std.fmt.parseInt(u8, exit_code_str, 10)) |exit_code| {
             return exit_code;
         } else |_| {
-            std.log.warn("failed to parse task exit code from: {s}", .{exit_code_str});
-            return null;
+            search_start = idx + marker.len;
         }
     }
 
@@ -389,10 +419,63 @@ pub fn stripAnsi(alloc: std.mem.Allocator, data: []const u8) ![]const u8 {
     return result.toOwnedSlice(alloc);
 }
 
-/// Detects Kitty keyboard protocol escape sequence for Ctrl+\
+/// Dcts Ctrl+\ across raw, Kitty CSI u, and xterm modifyOtherKeys encodings.
 pub fn isCtrlBackslash(buf: []const u8) bool {
     if (buf.len == 0) return false;
-    return buf[0] == 0x1C or isKeyPressed(buf, 0x5c, 0b100);
+    return buf[0] == 0x1C or isKeyPressed(buf, 0x5c, 0b100) or isModifyOtherKey(buf, 0x5c, 0b100);
+}
+
+/// Scans the buffer for an xterm modifyOtherKeys-encoded keypress.
+/// Format: CSI 27 ; <modifier> ; <keycode> ~
+/// Reference: invisible-island.net/xterm/ctlseqs/ctlseqs.html (modifyOtherKeys).
+fn isModifyOtherKey(buf: []const u8, expected_key: u32, expected_mods: u32) bool {
+    var i: usize = 0;
+    while (i + 1 < buf.len) : (i += 1) {
+        if (buf[i] == 0x1b and buf[i + 1] == '[') {
+            if (modifyOtherMatches(buf[i + 2 ..], expected_key, expected_mods)) return true;
+        }
+    }
+    return false;
+}
+
+/// Parses the body of an xterm modifyOtherKeys CSI sequence (after the leading
+/// `\x1b[`). Mirrors keypressWithMod's tolerance for lock modifiers.
+fn modifyOtherMatches(buf: []const u8, expected_key: u32, expected_mods: u32) bool {
+    var pos: usize = 0;
+
+    // 1. Sentinel: literal "27" identifies xterm modifyOtherKeys.
+    const sentinel = parseDecimal(buf, &pos) orelse return false;
+    if (sentinel != 27) return false;
+
+    // 2. Expect ';' before modifier.
+    if (pos >= buf.len or buf[pos] != ';') return false;
+    pos += 1;
+
+    // 3. Parse modifier (xterm encodes as 1 + bitfield, same as kitty).
+    const mod_encoded = parseDecimal(buf, &pos) orelse return false;
+    if (mod_encoded < 1) return false;
+    const mod_raw = mod_encoded - 1;
+    // Tolerate ambient lock modifiers (caps_lock=64, num_lock=128).
+    const intentional_mods = mod_raw & 0b00111111;
+    if (expected_mods > 0 and expected_mods != intentional_mods) return false;
+
+    // 4. Expect ';' before keycode.
+    if (pos >= buf.len or buf[pos] != ';') return false;
+    pos += 1;
+
+    // 5. Parse keycode.
+    const key_code = parseDecimal(buf, &pos) orelse return false;
+    if (key_code != expected_key) return false;
+
+    // 6. Expect '~' terminator.
+    return pos < buf.len and buf[pos] == '~';
+}
+
+/// Returns true when the user has opted out of the ctrl+\ detach shortcut
+/// via ZMX_NO_DETACH_KEY, e.g. to free up ctrl+\ for an inner program
+/// like vim, which uses ctrl+\ ctrl+n to escape its own terminal mode.
+pub fn isDetachKeyDisabled() bool {
+    return lib_posix.getenv("ZMX_NO_DETACH_KEY") != null;
 }
 
 /// Detects vt100 or kitty keyboard protocol escape sequence for up arrow.
@@ -419,11 +502,31 @@ fn isKeyPressed(buf: []const u8, expected_key: u32, expected_mods: u32) bool {
 /// and alternate key sub-fields from the kitty protocol's progressive
 /// enhancement flags.
 fn keypressWithMod(buf: []const u8, expected_key: u32, expected_mods: u32) bool {
+    const parsed = parseKittyCsiU(buf) orelse return false;
+    if (parsed.key_code != expected_key) return false;
+
+    // Only accept intentional modifiers. Lock modifiers
+    // (caps_lock=0b1000000, num_lock=0b10000000) are tolerated because
+    // they are ambient state, not deliberate key combinations.
+    const intentional_mods = parsed.modifiers & 0b00111111;
+    if (expected_mods > 0 and expected_mods != intentional_mods) return false;
+
+    // 3 = release -- reject. Accept press (1) and repeat (2).
+    return parsed.event_type != 3;
+}
+
+const KittyCsiU = struct {
+    key_code: u32,
+    modifiers: u32,
+    event_type: u32,
+    consumed: usize,
+};
+
+fn parseKittyCsiU(buf: []const u8) ?KittyCsiU {
     var pos: usize = 0;
 
     // 1. Parse key code.
-    const key_code = parseDecimal(buf, &pos) orelse return false;
-    if (key_code != expected_key) return false;
+    const key_code = parseDecimal(buf, &pos) orelse return null;
 
     // 2. Skip any ':alternate-key' sub-fields (shifted key, base layout key).
     while (pos < buf.len and buf[pos] == ':') {
@@ -432,29 +535,22 @@ fn keypressWithMod(buf: []const u8, expected_key: u32, expected_mods: u32) bool 
     }
 
     // 3. Expect ';' separator before modifiers.
-    if (pos >= buf.len or buf[pos] != ';') return false;
+    if (pos >= buf.len or buf[pos] != ';') return null;
     pos += 1;
 
     // 4. Parse modifier value. Kitty encodes as 1 + bitfield.
-    const mod_encoded = parseDecimal(buf, &pos) orelse return false;
-    if (mod_encoded < 1) return false;
+    const mod_encoded = parseDecimal(buf, &pos) orelse return null;
+    if (mod_encoded < 1) return null;
     const mod_raw = mod_encoded - 1;
 
-    // 5. Only accept intentional modifiers. Lock modifiers
-    //    (caps_lock=0b1000000, num_lock=0b10000000) are tolerated because
-    //    they are ambient state, not deliberate key combinations.
-    const intentional_mods = mod_raw & 0b00111111;
-    if (expected_mods > 0 and expected_mods != intentional_mods) return false;
-
-    // 6. Parse optional event type after ':'.
+    var event_type: u32 = 1;
+    // 5. Parse optional event type after ':'.
     if (pos < buf.len and buf[pos] == ':') {
         pos += 1;
-        const event_type = parseDecimal(buf, &pos) orelse return false;
-        // 3 = release -- reject. Accept press (1) and repeat (2).
-        if (event_type == 3) return false;
+        event_type = parseDecimal(buf, &pos) orelse return null;
     }
 
-    // 7. Skip optional ';text-codepoints' section.
+    // 6. Skip optional ';text-codepoints' section.
     if (pos < buf.len and buf[pos] == ';') {
         pos += 1;
         // Consume remaining digits and colons until 'u'.
@@ -463,8 +559,16 @@ fn keypressWithMod(buf: []const u8, expected_key: u32, expected_mods: u32) bool 
         }
     }
 
-    // 8. Expect terminal 'u'.
-    return pos < buf.len and buf[pos] == 'u';
+    // 7. Expect terminal 'u'.
+    if (pos >= buf.len or buf[pos] != 'u') return null;
+    pos += 1;
+
+    return .{
+        .key_code = key_code,
+        .modifiers = mod_raw,
+        .event_type = event_type,
+        .consumed = pos,
+    };
 }
 
 /// Parse a decimal integer from buf starting at pos, advancing pos past the
@@ -480,24 +584,11 @@ fn parseDecimal(buf: []const u8, pos: *usize) ?u32 {
     return value;
 }
 
-/// True when `payload` consists ENTIRELY of one or more complete mouse reports
-/// (SGR `CSI < ... M/m` or legacy `CSI M Cb Cx Cy`). Used to drop stale host
-/// mouse reports when the inner app's vt mouse mode is off. Intentionally
-/// conservative: a split (partial) report or any payload mixing a report with
-/// real keys/text returns false, so user input is never dropped.
-///
-/// Ceiling: this is a byte-shape heuristic, not protocol-aware — it can't
-/// distinguish "the host terminal generated this as a wheel event" from
-/// "the user pasted or typed this exact escape sequence as literal text."
-/// A paste containing a complete, isolated mouse-report-shaped sequence
-/// while mouse mode happens to be off would be silently dropped. Accepted
-/// tradeoff given how rare that input shape is in practice; revisit if it
-/// ever surfaces. Only recognizes SGR and legacy X10 formats — a stale
-/// report in another Ghostty-supported mouse encoding (e.g. URXVT, mode
-/// 1015) would not be caught by this gate.
+/// True when the whole payload is one or more complete SGR or legacy X10
+/// mouse reports. Partial or mixed payloads return false so real input is
+/// forwarded conservatively.
 pub fn isMouseReport(payload: []const u8) bool {
     if (payload.len == 0) return false;
-
     var pos: usize = 0;
     while (pos < payload.len) {
         if (consumeSgrMouseReport(payload[pos..])) |n| {
@@ -511,21 +602,11 @@ pub fn isMouseReport(payload: []const u8) bool {
     return true;
 }
 
-/// Parses `<button>;<x>;<y>M/m` — three non-empty numeric fields separated
-/// by exactly two semicolons, terminated by M or m. Requiring exact field
-/// structure (not just "some digit and >=2 semicolons somewhere") matters:
-/// a looser check accepts malformed lookalikes like `\x1b[<1;;M` (empty
-/// field) or `\x1b[<64;1-2;3M` (garbage mid-field) as complete reports,
-/// which would wrongly drop real, non-mouse input that merely resembles
-/// one.
 fn consumeSgrMouseReport(payload: []const u8) ?usize {
     if (!std.mem.startsWith(u8, payload, "\x1b[<")) return null;
-
     var pos: usize = 3;
     var field: usize = 0;
     while (field < 3) : (field += 1) {
-        // SGR-pixels (mode 1016) emits signed pixel coordinates that can be
-        // negative; accept a leading '-' so those reports are still detected.
         if (pos < payload.len and payload[pos] == '-') pos += 1;
         const digits_start = pos;
         while (pos < payload.len and payload[pos] >= '0' and payload[pos] <= '9') : (pos += 1) {}
@@ -543,15 +624,8 @@ fn consumeSgrMouseReport(payload: []const u8) ?usize {
 }
 
 fn consumeLegacyMouseReport(payload: []const u8) ?usize {
-    if (!std.mem.startsWith(u8, payload, "\x1b[M")) return null;
-    if (payload.len < 6) return null;
-    // Legacy X10 Cb/Cx/Cy are always emitted as a value + 32, so each byte
-    // is guaranteed >= 0x20; reject anything that couldn't plausibly be an
-    // encoded coordinate rather than treating arbitrary bytes (e.g. pasted
-    // binary content) as a mouse report.
-    for (payload[3..6]) |b| {
-        if (b < 0x20) return null;
-    }
+    if (!std.mem.startsWith(u8, payload, "\x1b[M") or payload.len < 6) return null;
+    for (payload[3..6]) |b| if (b < 0x20) return null;
     return 6;
 }
 
@@ -559,8 +633,17 @@ fn consumeLegacyMouseReport(payload: []const u8) ?usize {
 /// is a key combination like up-arrow, backspace, enter, ctrl+f, etc.
 pub fn isUserInput(payload: []const u8) bool {
     var parser = ghostty_vt.Parser.init();
-    for (payload) |c| {
-        const actions = parser.next(c);
+    var i: usize = 0;
+    while (i < payload.len) {
+        if (payload[i] == 0x1b and i + 2 < payload.len and payload[i + 1] == '[') {
+            if (parseKittyCsiU(payload[i + 2 ..])) |kitty| {
+                if (kitty.event_type != 3) return true;
+                i += 2 + kitty.consumed;
+                continue;
+            }
+        }
+
+        const actions = parser.next(payload[i]);
         for (actions) |action_opt| {
             const action = action_opt orelse continue;
             switch (action) {
@@ -586,6 +669,7 @@ pub fn isUserInput(payload: []const u8) bool {
                 else => {},
             }
         }
+        i += 1;
     }
     return false;
 }
@@ -685,6 +769,16 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         return null;
     };
 
+    // The formatter has no title extra and never emits OSC 0/1/2, so the title
+    // has to be replayed separately or an attaching client shows whatever its
+    // terminal defaults to, usually the client process name. OSC 2 does not
+    // move the cursor, so this is safe to append after the content.
+    if (term.getTitle()) |title| {
+        builder.writer.print("\x1b]2;{s}\x07", .{title}) catch |err| {
+            std.log.warn("failed to format title err={s}", .{@errorName(err)});
+        };
+    }
+
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
 
@@ -748,10 +842,6 @@ pub fn serializeTerminal(
     };
 }
 
-pub fn detectShell() [:0]const u8 {
-    return std.posix.getenv("SHELL") orelse "/bin/sh";
-}
-
 /// Formats a session entry for list output (only the name when `short` is
 /// true), adding a prefix to indicate the current session, if there is one.
 pub fn writeSessionLine(
@@ -797,7 +887,7 @@ pub fn writeSessionLine(
         session.created_at,
     });
     if (session.cwd) |cwd| {
-        try writer.print("\tstart_dir={s}", .{cwd});
+        try writer.print("\tcwd={s}", .{cwd});
     }
     if (session.cmd) |cmd| {
         try writer.print("\tcmd={s}", .{cmd});
@@ -811,9 +901,13 @@ pub fn writeSessionLine(
             }
         }
     }
-    // Always emitted, even 0 (0 means "unknown daemon pid", e.g. probing an
-    // old daemon that predates this field) — downstream parsers can rely on
-    // the key always being present rather than treating absence as unknown.
+    if (session.labels) |labels| {
+        var kvs = label.LabelIterator.init(labels);
+        while (kvs.next()) |kv| {
+            try writer.print("\t{s}={s}", .{ kv.key, kv.value });
+        }
+    }
+    // Always emit the key. Zero means the peer predates daemon_pid support.
     try writer.print("\tdaemon_pid={d}", .{session.daemon_pid});
     try writer.print("\n", .{});
 }
@@ -1086,10 +1180,81 @@ test "isCtrlBackslash" {
     try expect(!isCtrlBackslash("\x1b[65;92u"));
 }
 
+test "isCtrlBackslash xterm modifyOtherKeys" {
+    const expect = std.testing.expect;
+
+    // Basic: ctrl only (modifier 5 = 1 + 4), key 92 = '\'
+    // Format: CSI 27 ; <mod> ; <key> ~
+    try expect(isCtrlBackslash("\x1b[27;5;92~"));
+
+    // Lock modifiers tolerated
+    // ctrl + caps_lock = 1 + (4 + 64) = 69
+    try expect(isCtrlBackslash("\x1b[27;69;92~"));
+    // ctrl + num_lock = 1 + (4 + 128) = 133
+    try expect(isCtrlBackslash("\x1b[27;133;92~"));
+    // ctrl + caps_lock + num_lock = 1 + (4 + 64 + 128) = 197
+    try expect(isCtrlBackslash("\x1b[27;197;92~"));
+
+    // Combined intentional modifiers must NOT match
+    // ctrl + shift = 1 + (4 + 1) = 6
+    try expect(!isCtrlBackslash("\x1b[27;6;92~"));
+    // ctrl + alt = 1 + (4 + 2) = 7
+    try expect(!isCtrlBackslash("\x1b[27;7;92~"));
+    // ctrl + super = 1 + (4 + 8) = 13
+    try expect(!isCtrlBackslash("\x1b[27;13;92~"));
+    // ctrl + shift + caps_lock = 1 + (1 + 4 + 64) = 70 -- shift is intentional
+    try expect(!isCtrlBackslash("\x1b[27;70;92~"));
+    // ctrl + shift + num_lock = 1 + (1 + 4 + 128) = 134 -- shift is intentional
+    try expect(!isCtrlBackslash("\x1b[27;134;92~"));
+
+    // Modifier without ctrl bit -- must NOT match
+    try expect(!isCtrlBackslash("\x1b[27;1;92~"));
+    try expect(!isCtrlBackslash("\x1b[27;2;92~"));
+
+    // Wrong key code -- must NOT match
+    try expect(!isCtrlBackslash("\x1b[27;5;91~"));
+    try expect(!isCtrlBackslash("\x1b[27;5;93~"));
+    try expect(!isCtrlBackslash("\x1b[27;5;65~"));
+
+    // Wrong sentinel -- must NOT match
+    try expect(!isCtrlBackslash("\x1b[28;5;92~"));
+    try expect(!isCtrlBackslash("\x1b[26;5;92~"));
+
+    // Wrong terminator -- must NOT match
+    try expect(!isCtrlBackslash("\x1b[27;5;92u"));
+    try expect(!isCtrlBackslash("\x1b[27;5;92m"));
+
+    // CSI sequences that look similar but are not modifyOtherKeys
+    try expect(!isCtrlBackslash("\x1b[27m")); // SGR reset reverse
+    try expect(!isCtrlBackslash("\x1b[27~")); // xterm F4
+    try expect(!isCtrlBackslash("\x1b[27;5R")); // truncated cursor report
+
+    // Sequence embedded in larger buffer
+    try expect(isCtrlBackslash("abc\x1b[27;5;92~"));
+    try expect(isCtrlBackslash("\x1b[A\x1b[27;5;92~"));
+
+    // Garbage / malformed
+    try expect(!isCtrlBackslash("\x1b[27"));
+    try expect(!isCtrlBackslash("\x1b[27;"));
+    try expect(!isCtrlBackslash("\x1b[27;5"));
+    try expect(!isCtrlBackslash("\x1b[27;5;"));
+    try expect(!isCtrlBackslash("\x1b[27;5;92"));
+}
+
+test "isDetachKeyDisabled" {
+    _ = cross.c.unsetenv("ZMX_NO_DETACH_KEY");
+    try testing.expect(!isDetachKeyDisabled());
+
+    _ = cross.c.setenv("ZMX_NO_DETACH_KEY", "1", 1);
+    defer _ = cross.c.unsetenv("ZMX_NO_DETACH_KEY");
+    try testing.expect(isDetachKeyDisabled());
+}
+
 test "serializeTerminalState excludes synchronized output replay" {
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var term = try ghostty_vt.Terminal.init(alloc, .{
+    var term = try ghostty_vt.Terminal.init(io, alloc, .{
         .cols = 80,
         .rows = 24,
     });
@@ -1114,11 +1279,54 @@ test "serializeTerminalState excludes synchronized output replay" {
     try testing.expect(std.mem.indexOf(u8, output, "\x1b[?2026h") == null);
 }
 
-fn testCreateTerminal(alloc: std.mem.Allocator, cols: u16, rows: u16, vt_data: []const u8) !ghostty_vt.Terminal {
-    var term = try ghostty_vt.Terminal.init(alloc, .{
+test "serializeTerminalState replays the title" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var term = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("\x1b]2;my title\x07");
+    stream.nextSlice("hello");
+
+    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    defer alloc.free(output);
+
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b]2;my title\x07") != null);
+}
+
+test "serializeTerminalState omits the title when none is set" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var term = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("hello");
+
+    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    defer alloc.free(output);
+
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b]2;") == null);
+}
+
+fn testCreateTerminal(alloc: std.mem.Allocator, io: std.Io, cols: u16, rows: u16, vt_data: []const u8) !ghostty_vt.Terminal {
+    var term = try ghostty_vt.Terminal.init(io, alloc, .{
         .cols = cols,
         .rows = rows,
-        .max_scrollback = 10_000_000,
+        .max_scrollback_lines = 2_000,
     });
     if (vt_data.len > 0) {
         var stream = term.vtStream();
@@ -1142,15 +1350,15 @@ fn expectCursorAt(term: *ghostty_vt.Terminal, row: usize, col: usize) !void {
     try testing.expectEqual(row, cursor.y);
 }
 
-fn serializeRoundtrip(alloc: std.mem.Allocator, source: *ghostty_vt.Terminal) !ghostty_vt.Terminal {
+fn serializeRoundtrip(alloc: std.mem.Allocator, io: std.Io, source: *ghostty_vt.Terminal) !ghostty_vt.Terminal {
     const serialized = serializeTerminalState(alloc, source) orelse
         return error.SerializationFailed;
     defer alloc.free(serialized);
 
-    var dest = try ghostty_vt.Terminal.init(alloc, .{
+    var dest = try ghostty_vt.Terminal.init(io, alloc, .{
         .cols = source.screens.active.pages.cols,
         .rows = source.screens.active.pages.rows,
-        .max_scrollback = 10_000_000,
+        .max_scrollback_lines = 2_000,
     });
     var stream = dest.vtStream();
     defer stream.deinit();
@@ -1176,15 +1384,16 @@ fn expectMarkerAtRow(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal, marke
 
 test "serializeTerminalState roundtrip preserves cursor position" {
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var term = try testCreateTerminal(alloc, 80, 24, "\x1b[2J" ++ // clear
+    var term = try testCreateTerminal(alloc, io, 80, 24, "\x1b[2J" ++ // clear
         "\x1b[10;20H" // cursor at row 10, col 20 (1-indexed)
     );
     defer term.deinit(alloc);
 
     try expectCursorAt(&term, 9, 19); // 0-indexed
 
-    var client = try serializeRoundtrip(alloc, &term);
+    var client = try serializeRoundtrip(alloc, io, &term);
     defer client.deinit(alloc);
 
     try expectCursorAt(&client, 9, 19);
@@ -1192,8 +1401,9 @@ test "serializeTerminalState roundtrip preserves cursor position" {
 
 test "serializeTerminalState roundtrip preserves CUP-positioned markers" {
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var term = try testCreateTerminal(alloc, 80, 24, "\x1b[2J" ++
+    var term = try testCreateTerminal(alloc, io, 80, 24, "\x1b[2J" ++
         "\x1b[2;5HMARK_A" ++
         "\x1b[6;15HMARK_B" ++
         "\x1b[10;30HMARK_C" ++
@@ -1201,7 +1411,7 @@ test "serializeTerminalState roundtrip preserves CUP-positioned markers" {
         "\x1b[16;20H");
     defer term.deinit(alloc);
 
-    var client = try serializeRoundtrip(alloc, &term);
+    var client = try serializeRoundtrip(alloc, io, &term);
     defer client.deinit(alloc);
 
     try expectScreensMatch(alloc, &term, &client);
@@ -1214,8 +1424,9 @@ test "serializeTerminalState roundtrip preserves CUP-positioned markers" {
 
 test "serializeTerminalState with scrollback preserves visible content" {
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var term = try testCreateTerminal(alloc, 80, 24, "");
+    var term = try testCreateTerminal(alloc, io, 80, 24, "");
     defer term.deinit(alloc);
 
     var stream = term.vtStream();
@@ -1241,7 +1452,7 @@ test "serializeTerminalState with scrollback preserves visible content" {
     try testing.expect(has_scrollback);
 
     // Roundtrip: serialize → feed into fresh terminal
-    var client = try serializeRoundtrip(alloc, &term);
+    var client = try serializeRoundtrip(alloc, io, &term);
     defer client.deinit(alloc);
 
     // Visible content must match (this is the core cursor corruption test)
@@ -1256,9 +1467,10 @@ test "serializeTerminalState nested roundtrip preserves content" {
     // Simulates: inner zmx → serialized state → outer ghostty-vt → serialized again → client
     // This is the exact nested session scenario (zmx → SSH → zmx).
     const alloc = testing.allocator;
+    const io = testing.io;
 
     // "Inner" terminal with scrollback + markers
-    var inner = try testCreateTerminal(alloc, 80, 24, "");
+    var inner = try testCreateTerminal(alloc, io, 80, 24, "");
     defer inner.deinit(alloc);
 
     {
@@ -1285,7 +1497,7 @@ test "serializeTerminalState nested roundtrip preserves content" {
     defer alloc.free(inner_serialized);
 
     // "Outer" terminal processes inner's serialized output
-    var outer = try testCreateTerminal(alloc, 80, 24, "");
+    var outer = try testCreateTerminal(alloc, io, 80, 24, "");
     defer outer.deinit(alloc);
 
     {
@@ -1295,7 +1507,7 @@ test "serializeTerminalState nested roundtrip preserves content" {
     }
 
     // Serialize outer (simulates outer daemon re-attach after detach)
-    var client = try serializeRoundtrip(alloc, &outer);
+    var client = try serializeRoundtrip(alloc, io, &outer);
     defer client.deinit(alloc);
 
     // Client must see the same content as inner's visible screen
@@ -1307,15 +1519,16 @@ test "serializeTerminalState nested roundtrip preserves content" {
 
 test "serializeTerminalState alternate screen not leaked" {
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var term = try testCreateTerminal(alloc, 80, 24, "\x1b[?1049h" ++ // enter alt screen
+    var term = try testCreateTerminal(alloc, io, 80, 24, "\x1b[?1049h" ++ // enter alt screen
         "\x1b[2J\x1b[3;10HALT_MARK" ++ // write on alt screen
         "\x1b[?1049l" ++ // exit alt screen
         "\x1b[2J\x1b[2;5HMAIN_MARK\x1b[8;20H" // write on main screen
     );
     defer term.deinit(alloc);
 
-    var client = try serializeRoundtrip(alloc, &term);
+    var client = try serializeRoundtrip(alloc, io, &term);
     defer client.deinit(alloc);
 
     try expectScreensMatch(alloc, &term, &client);
@@ -1328,8 +1541,9 @@ test "serializeTerminalState alternate screen not leaked" {
 
 test "serializeTerminalState size mismatch roundtrip" {
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var term = try testCreateTerminal(alloc, 80, 30, "\x1b[2J" ++
+    var term = try testCreateTerminal(alloc, io, 80, 30, "\x1b[2J" ++
         "\x1b[3;10HSIZE_A" ++
         "\x1b[12;20HSIZE_B" ++
         "\x1b[20;40HSIZE_C" ++
@@ -1337,9 +1551,9 @@ test "serializeTerminalState size mismatch roundtrip" {
     defer term.deinit(alloc);
 
     // Resize to 24 rows (simulates outer terminal being smaller)
-    try term.resize(alloc, 80, 24);
+    try term.resize(alloc, ghostty_vt.Terminal.Resize{ .cols = 80, .rows = 24 });
 
-    var client = try serializeRoundtrip(alloc, &term);
+    var client = try serializeRoundtrip(alloc, io, &term);
     defer client.deinit(alloc);
 
     try expectScreensMatch(alloc, &term, &client);
@@ -1348,8 +1562,9 @@ test "serializeTerminalState size mismatch roundtrip" {
 
 test "serializeTerminalState scrollback + size mismatch nested roundtrip" {
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var inner = try testCreateTerminal(alloc, 80, 30, "");
+    var inner = try testCreateTerminal(alloc, io, 80, 30, "");
     defer inner.deinit(alloc);
 
     {
@@ -1367,7 +1582,7 @@ test "serializeTerminalState scrollback + size mismatch nested roundtrip" {
     }
 
     // Resize inner to 24 rows (outer terminal is smaller)
-    try inner.resize(alloc, 80, 24);
+    try inner.resize(alloc, ghostty_vt.Terminal.Resize{ .cols = 80, .rows = 24 });
 
     const inner_cursor_x = inner.screens.active.cursor.x;
     const inner_cursor_y = inner.screens.active.cursor.y;
@@ -1377,7 +1592,7 @@ test "serializeTerminalState scrollback + size mismatch nested roundtrip" {
         return error.SerializationFailed;
     defer alloc.free(inner_ser);
 
-    var outer = try testCreateTerminal(alloc, 80, 24, "");
+    var outer = try testCreateTerminal(alloc, io, 80, 24, "");
     defer outer.deinit(alloc);
     {
         var outer_stream = outer.vtStream();
@@ -1385,7 +1600,7 @@ test "serializeTerminalState scrollback + size mismatch nested roundtrip" {
         outer_stream.nextSlice(inner_ser);
     }
 
-    var client = try serializeRoundtrip(alloc, &outer);
+    var client = try serializeRoundtrip(alloc, io, &outer);
     defer client.deinit(alloc);
 
     try expectScreensMatch(alloc, &inner, &client);
@@ -1506,6 +1721,10 @@ test "isUserInput: kitty keyboard sequences" {
     // Kitty keyboard protocol uses CSI u
     try testing.expect(isUserInput("\x1b[11;2u")); // F1 with modifier
     try testing.expect(isUserInput("\x1b[12;2u")); // F2 with modifier
+    try testing.expect(isUserInput("\x1b[102;1:1u")); // literal "f" press
+    try testing.expect(isUserInput("\x1b[57444;1:1u")); // Kitty functional key press
+    try testing.expect(!isUserInput("\x1b[102;1:3u")); // literal "f" release only
+    try testing.expect(isUserInput("\x1b[102;1:1u\x1b[67;65;31M")); // key press with mouse noise
 }
 
 test "isUserInput: mouse events (CSI M) excluded" {
@@ -1522,41 +1741,13 @@ test "isUserInput: mouse events SGR mode CSI < excluded" {
     try testing.expect(!isUserInput("\x1b[<64;1;1M")); // button press
 }
 
-test "isMouseReport: complete SGR and legacy reports" {
+test "isMouseReport accepts complete reports and rejects partial or mixed input" {
     try testing.expect(isMouseReport("\x1b[<35;116;62M"));
-    try testing.expect(isMouseReport("\x1b[<0;1;1m"));
     try testing.expect(isMouseReport("\x1b[M !!"));
     try testing.expect(isMouseReport("\x1b[<64;1;1M\x1b[<65;1;1M"));
-}
-
-test "isMouseReport: partial or mixed payloads forward conservatively" {
     try testing.expect(!isMouseReport(""));
     try testing.expect(!isMouseReport("\x1b[<35;116;62"));
-    try testing.expect(!isMouseReport("\x1b[M "));
-    try testing.expect(!isMouseReport("x\x1b[<35;116;62M"));
-    try testing.expect(!isMouseReport("\x1b[<35;116;62Mx"));
-}
-
-test "isMouseReport: SGR-pixels negative coordinates still match" {
-    try testing.expect(isMouseReport("\x1b[<0;-5;10M"));
-    try testing.expect(isMouseReport("\x1b[<0;5;-10m"));
-}
-
-test "isMouseReport: malformed SGR-shaped payloads are rejected, not dropped" {
-    // Empty coordinate field between semicolons.
-    try testing.expect(!isMouseReport("\x1b[<1;;M"));
-    // Stray '-' mid-digit-run rather than as a field prefix.
-    try testing.expect(!isMouseReport("\x1b[<64;1-2;3M"));
-    // Only two fields instead of three.
-    try testing.expect(!isMouseReport("\x1b[<64;1M"));
-    // Trailing junk after the third field's digits, before the terminator.
-    try testing.expect(!isMouseReport("\x1b[<64;1;1xM"));
-}
-
-test "isMouseReport: legacy report rejects sub-0x20 coordinate bytes" {
-    // Byte 0x00 in the coordinate range can't be a real X10-encoded value
-    // (always emitted as value + 32) — should forward, not drop.
-    try testing.expect(!isMouseReport("\x1b[M\x00\x00\x00"));
+    try testing.expect(!isMouseReport("\x1b[<0;1;1Mtyped"));
 }
 
 test "isUserInput: focus events excluded" {
