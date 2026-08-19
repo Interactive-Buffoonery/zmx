@@ -62,6 +62,14 @@ fn exec(sesh_name: []const u8, cmd: Cmd) !noreturn {
         0,
     );
 
+    if (cross.c.getenv("TERM")) |term_env| {
+        if (std.mem.eql(u8, std.mem.span(term_env), "dumb")) {
+            _ = cross.c.putenv(@constCast("TERM=xterm-256color"));
+        }
+    } else {
+        _ = cross.c.putenv(@constCast("TERM=xterm-256color"));
+    }
+
     // Build the exec environment explicitly so the awesoMux status channel
     // remains owned by the attach client and never leaks into the persistent
     // shell or trailing command. Avoid mutating the parent process's libc
@@ -102,8 +110,7 @@ pub const PtyInfo = struct {
 ///
 /// This is the second fork in the double-fork technique explained in the
 /// daemonize() comment.
-pub fn spawnPty(sesh_name: []const u8, cmd: Cmd) !PtyInfo {
-    const size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
+pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.TerminalSize) !PtyInfo {
     var ws: cross.c.struct_winsize = .{
         .ws_row = size.rows,
         .ws_col = size.cols,
@@ -203,6 +210,9 @@ pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo
     // becomes the session leader and detaches process from its controlling terminal
     _ = try lib_posix.setsid();
 
+    // Fetch terminal size before redirecting stdio FDs to /dev/null.
+    const term_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
+
     // Redirect stdin/stdout/stderr to /dev/null. The daemon
     // communicates via its unix socket, not stdio. Without
     // this, any pipe on FDs 0-2 (e.g. from bats' `run`
@@ -249,5 +259,5 @@ pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo
         }
     }
 
-    return spawnPty(sesh_name, cmd);
+    return spawnPty(sesh_name, cmd, term_size);
 }

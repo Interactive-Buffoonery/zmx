@@ -422,7 +422,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         @memcpy(scan_buf[marker_carry_len..][0..n], buf[0..n]);
                         const scan_len = marker_carry_len + n;
 
-                        if (util.findTaskExitMarker(scan_buf[0..scan_len])) |exit_code| {
+                        if (try util.findTaskExitMarker(scan_buf[0..scan_len], daemon.task_id)) |exit_code| {
                             daemon.task_exit_code = exit_code;
                             daemon.task_ended_at = @intCast(std.Io.Timestamp.now(io, .real).toSeconds());
 
@@ -531,13 +531,13 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                             daemon.broadcastSessionEnd(.daemon_died, 0);
                             break :daemon_loop;
                         },
-                        .Info => try daemon.handleInfo(gpa, client),
+                        .Info => try daemon.handleInfo(gpa, client, &term),
                         .LabelGet => try daemon.handleLabelGet(gpa, client),
                         .LabelSet => try daemon.handleLabelSet(gpa, client, msg.payload),
                         .LabelClear => try daemon.handleLabelClear(gpa, client),
                         .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
                         .CwdQuery => try daemon.handleCwd(gpa, client),
-                        .Run => try daemon.handleRun(gpa, client, msg.payload),
+                        .Run => try daemon.handleRun(gpa, io, client, msg.payload),
                         .Ack, .TaskComplete, .LabelData, .SessionEnd, .CwdResponse => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
                         _ => std.log.warn(
@@ -623,12 +623,24 @@ pub const Daemon = struct {
     running: bool = true,
     pid: i32 = undefined,
     command: ?[]const []const u8 = null,
+    /// The session's working directory in OSC 7 form, `file://<host><path>`.
+    /// Kept as a URI rather than a path so `zmx list` shows the host, which is
+    /// what tells you a session is inside SSH. Points into `cwd_buf` once set,
+    /// so a Daemon must not be copied by value after that.
     cwd: []const u8 = "",
+    /// The same directory as a path that can be opened: percent-decoding
+    /// applied, scheme and host stripped. Empty when the cwd is on another
+    /// host, since then it names no directory here and nothing should chdir
+    /// into it. Points into `cwd_path_buf`.
+    cwd_path: []const u8 = "",
+    cwd_buf: [std.fs.max_path_bytes]u8 = undefined,
+    cwd_path_buf: [std.fs.max_path_bytes]u8 = undefined,
     has_pty_output: bool = false,
     has_had_client: bool = false,
     has_terminal_client: bool = false, // true only after a real attach (.Init received)
     created_at: u64, // unix timestamp (ns)
     is_task_mode: bool = false, // flag for when session is run as a task
+    task_id: [4]u8 = undefined,
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
     task_ended_at: ?u64 = null, // timestamp when task exited
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
@@ -756,31 +768,19 @@ pub const Daemon = struct {
         var keep_fds_open = [_]i32{ server_sock_fd, dir.handle, log_fd };
         const cmd = try daemonize.createCmdZ(self.shell, self.is_task_mode, self.command);
 
-        // format will look like file://{host}{path}
-        std.log.info("checking pwd={s}", .{self.cwd});
-        const uri_opt = std.Uri.parse(self.cwd) catch |err| blk: {
-            std.log.warn("uri parse failed err={s}", .{@errorName(err)});
-            break :blk null;
-        };
-        if (uri_opt) |uri| {
-            var host_buf: [255]u8 = undefined;
-            const pwd_host = if (uri.getHost(&host_buf) catch null) |host| host.bytes else "unknown";
-            var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-            const hostname = try std.posix.gethostname(&buf);
-            std.log.info("pwd_host={s} hostname={s}", .{ pwd_host, hostname });
-            if (std.mem.eql(u8, pwd_host, hostname)) {
-                const path_str = switch (uri.path) {
-                    .raw, .percent_encoded => |s| s,
-                };
-                const pwd_dir = std.Io.Dir.openDirAbsolute(io, path_str, .{}) catch |err| blk: {
-                    std.log.warn("failed to open dir={s} err={s}", .{ path_str, @errorName(err) });
-                    break :blk null;
-                };
-                if (pwd_dir) |pdir| {
-                    defer std.Io.Dir.close(pdir, io);
-                    std.log.info("set directory dir={s}", .{path_str});
-                    try std.process.setCurrentDir(io, pdir);
-                }
+        // `cwd_path` is the decoded path, and is empty when the cwd is on
+        // another host: OSC 7 crosses SSH boundaries, so a session that ssh'd
+        // elsewhere reports a directory that does not exist on this machine.
+        std.log.info("checking pwd={s} path={s}", .{ self.cwd, self.cwd_path });
+        if (self.cwd_path.len > 0) {
+            const pwd_dir = std.Io.Dir.openDirAbsolute(io, self.cwd_path, .{}) catch |err| blk: {
+                std.log.warn("failed to open dir={s} err={s}", .{ self.cwd_path, @errorName(err) });
+                break :blk null;
+            };
+            if (pwd_dir) |pdir| {
+                defer std.Io.Dir.close(pdir, io);
+                std.log.info("set directory dir={s}", .{self.cwd_path});
+                try std.process.setCurrentDir(io, pdir);
             }
         }
 
@@ -949,8 +949,11 @@ pub const Daemon = struct {
     pub fn handleSwitch(self: *Daemon, gpa: std.mem.Allocator, session_name: []const u8) !void {
         for (self.clients.items) |client| {
             if (self.leader_client_fd == client.socket_fd) {
-                // Include the daemon's current cwd so the new session can start in the right directory
-                if (self.cwd.len > 0) {
+                // Include the daemon's current cwd so the new session can start
+                // in the right directory. A remote cwd is left out: it names no
+                // directory here, so the new session is better off with the
+                // attaching client's own cwd than with a path it cannot enter.
+                if (self.cwd.len > 0 and self.cwd_path.len > 0) {
                     var payload = gpa.alloc(u8, session_name.len + 1 + self.cwd.len) catch return;
                     defer gpa.free(payload);
                     @memcpy(payload[0..session_name.len], session_name);
@@ -1132,7 +1135,9 @@ pub const Daemon = struct {
         };
     }
 
-    pub fn handleInfo(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+    pub fn handleInfo(self: *Daemon, gpa: std.mem.Allocator, client: *Client, term: *ghostty_vt.Terminal) !void {
+        self.setPwd(term);
+
         // zeroes() so asBytes() doesn't ship struct padding + unused cmd/cwd
         // tail bytes (daemon stack contents) to clients.
         var info = std.mem.zeroes(ipc.Info);
@@ -1182,12 +1187,13 @@ pub const Daemon = struct {
     }
 
     pub fn handleHistory(
-        _: *Daemon,
+        self: *Daemon,
         gpa: std.mem.Allocator,
         client: *Client,
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
+        self.setPwd(term);
         const format: util.HistoryFormat = if (payload.len > 0)
             @enumFromInt(payload[0])
         else
@@ -1210,13 +1216,14 @@ pub const Daemon = struct {
         client.has_pending_output = true;
     }
 
-    pub fn handleRun(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
+    pub fn handleRun(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, client: *Client, payload: []const u8) !void {
         // Reset task tracking so the new command's exit marker is detected.
         // Without this, a second `zmx run` on the same session is ignored
         // because task_exit_code is still set from the first run.
         self.task_exit_code = null;
         self.task_ended_at = null;
         self.is_task_mode = true;
+        self.task_id = util.generateTaskId(io);
 
         if (payload.len == 0) return;
 
@@ -1226,8 +1233,12 @@ pub const Daemon = struct {
         // exit code of the command (not the `;`). The sole exception is when
         // the command contains a heredoc (`<<`), the delimiter must be alone
         // on its line, so the marker goes on the next line instead.
-        const single_line_marker = "; echo ZMX_TASK_COMPLETED:$?\r";
-        const heredoc_marker = "\r\necho ZMX_TASK_COMPLETED:$?\r";
+        var buf: [1024]u8 = undefined;
+        const marker = try util.getTaskExitMarker(&buf, self.task_id);
+        var single_buf: [1024]u8 = undefined;
+        const single_line_marker = try std.fmt.bufPrint(&single_buf, "; echo {s}$?\r", .{marker});
+        var here_buf: [1024]u8 = undefined;
+        const heredoc_marker = try std.fmt.bufPrint(&here_buf, "\r\necho {s}$?\r", .{marker});
         const uses_heredoc = std.mem.indexOf(u8, cmd, "<<") != null;
 
         if (cmd.len > 0 and cmd[cmd.len - 1] == '\r') {
@@ -1243,12 +1254,48 @@ pub const Daemon = struct {
         std.log.debug("run command len={d}", .{payload.len});
     }
 
-    fn setPwd(self: *Daemon, term: *ghostty_vt.Terminal) void {
-        const pwd_opt = term.getPwd();
-        if (pwd_opt) |pwd| {
-            std.log.info("setting pwd to ghostty term pwd={s}", .{pwd});
-            self.cwd = pwd;
+    /// Store the session's working directory as a plain path.
+    ///
+    /// Accepts either an OSC 7 value (`file://<host><path>`, percent-encoded)
+    /// or a path. Decoding here rather than at each use keeps `zmx list`
+    /// printing a path and lets the chdir on session create find directories
+    /// whose names needed escaping.
+    ///
+    /// The value is copied, so callers may pass a temporary.
+    pub fn setCwd(self: *Daemon, value: []const u8) void {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+        const hostname = std.posix.gethostname(&host_buf) catch "";
+        const cwd = util.parseOsc7Cwd(&buf, value, hostname) orelse {
+            std.log.warn("ignoring unusable cwd={s}", .{value});
+            return;
+        };
+
+        // Store the URI form. A caller that handed us a plain path gets one
+        // built here, so `cwd` has the same shape no matter the source. A value
+        // that already was a URI is kept verbatim, so `list` shows what the
+        // shell actually reported.
+        self.cwd = if (std.fs.path.isAbsolute(value))
+            util.toOsc7Cwd(&self.cwd_buf, value, hostname) orelse return
+        else blk: {
+            if (value.len > self.cwd_buf.len) return;
+            @memcpy(self.cwd_buf[0..value.len], value);
+            break :blk self.cwd_buf[0..value.len];
+        };
+
+        // Only keep an openable path when it names a directory on this host.
+        if (cwd.is_local and cwd.path.len <= self.cwd_path_buf.len) {
+            @memcpy(self.cwd_path_buf[0..cwd.path.len], cwd.path);
+            self.cwd_path = self.cwd_path_buf[0..cwd.path.len];
+        } else {
+            self.cwd_path = "";
         }
+        std.log.info("set cwd={s} path={s}", .{ self.cwd, self.cwd_path });
+    }
+
+    fn setPwd(self: *Daemon, term: *ghostty_vt.Terminal) void {
+        const pwd = term.getPwd() orelse return;
+        self.setCwd(pwd);
     }
 
     pub fn handleOutput(self: *Daemon, gpa: std.mem.Allocator, payload: []const u8, term: *ghostty_vt.Terminal, vt_stream: anytype) !void {

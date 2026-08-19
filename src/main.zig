@@ -157,7 +157,7 @@ pub fn main(init: std.process.Init) !void {
         };
         var daemon = Daemon.init(io, &cfg, sesh, socket_path);
         daemon.command = command;
-        daemon.cwd = cwd;
+        daemon.setCwd(cwd);
         daemon.shell = shell_env;
         std.log.info("socket path={s}", .{daemon.socket_path});
         return attach(gpa, io, &daemon, status_cfg);
@@ -190,7 +190,7 @@ pub fn main(init: std.process.Init) !void {
         };
         defer gpa.free(socket_path);
         var daemon = Daemon.init(io, &cfg, sesh, socket_path);
-        daemon.cwd = cwd;
+        daemon.setCwd(cwd);
         daemon.is_task_mode = true;
         daemon.shell = shell_env;
         std.log.info("socket path={s}", .{daemon.socket_path});
@@ -405,7 +405,7 @@ pub fn main(init: std.process.Init) !void {
         };
         var daemon = Daemon.init(io, &cfg, sesh, socket_path);
         daemon.is_task_mode = true;
-        daemon.cwd = cwd;
+        daemon.setCwd(cwd);
         daemon.shell = shell_env;
         std.log.info("socket path={s}", .{daemon.socket_path});
         try writeFile(gpa, io, &daemon, file_path);
@@ -655,15 +655,16 @@ fn tail(alloc: std.mem.Allocator, client_socket_fds: std.ArrayList(i32), detache
                         },
                         .Output => {
                             if (msg.payload.len > 0) {
+                                //  TODO: figure out how to bring this back
                                 // Fallback: scan output for task exit marker in case
                                 // .TaskComplete was lost (e.g. daemon exited before
                                 // flushing). This ensures we detect completion even
                                 // when the IPC message doesn't arrive.
-                                if (task_complete_code == null and is_run_cmd) {
-                                    if (util.findTaskExitMarker(msg.payload)) |ec| {
-                                        task_complete_code = ec;
-                                    }
-                                }
+                                // if (task_complete_code == null and is_run_cmd) {
+                                //     if (util.findTaskExitMarker(msg.payload)) |ec| {
+                                //         task_complete_code = ec;
+                                //     }
+                                // }
 
                                 // Strip the first line (command echo) for run mode.
                                 var payload = msg.payload;
@@ -1355,12 +1356,14 @@ fn attach(
     var orig_termios: cross.c.termios = undefined;
     const stdin_is_tty = cross.c.tcgetattr(lib_posix.STDIN_FILENO, &orig_termios) == 0;
 
+    // RIS, OSC 10/11/12
+    const restore_seq = "\x1bc\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\";
+
     defer {
         if (stdin_is_tty) {
             _ = cross.c.tcsetattr(lib_posix.STDIN_FILENO, cross.c.TCSAFLUSH, &orig_termios);
         }
         // Reset terminal modes on detach
-        const restore_seq = "\x1bc";
         _ = lib_posix.write(lib_posix.STDOUT_FILENO, restore_seq) catch {};
     }
 
@@ -1393,7 +1396,6 @@ fn attach(
         .switch_session => {
             if (looper.session_name) |session_name| {
                 // Reset terminal modes when switching sessions
-                const restore_seq = "\x1bc";
                 _ = lib_posix.write(lib_posix.STDOUT_FILENO, restore_seq) catch {};
 
                 const target_path = socket.getSocketPath(
@@ -1414,7 +1416,7 @@ fn attach(
                 // otherwise fall back to the client's original cwd
                 const switch_cwd = looper.cwd orelse daemon.cwd;
                 std.log.info("switching to new session cwd={s}", .{switch_cwd});
-                target_daemon.cwd = switch_cwd;
+                target_daemon.setCwd(switch_cwd);
                 target_daemon.shell = daemon.shell;
                 return attach(gpa, io, &target_daemon, status_cfg);
             }
@@ -1641,6 +1643,9 @@ fn run(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, detached: bool, comm
         return error.SessionNotReady;
     };
     defer lib_posix.close(client_sock);
+
+    const term_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
+    ipc.send(client_sock, .Resize, std.mem.asBytes(&term_size)) catch {};
 
     var fds = try std.ArrayList(i32).initCapacity(gpa, 1);
     defer fds.deinit(gpa);
