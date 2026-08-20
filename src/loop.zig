@@ -656,6 +656,7 @@ pub const Daemon = struct {
             .session_name = sesh_name,
             .socket_path = socket_path,
             .created_at = @intCast(std.Io.Timestamp.now(io, .real).toSeconds()),
+            .task_id = util.generateTaskId(io),
         };
     }
 

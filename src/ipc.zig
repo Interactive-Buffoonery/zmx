@@ -205,6 +205,13 @@ pub fn appendTerminalSizeMessages(
     try appendMessage(alloc, list, .ResizePixels, std.mem.asBytes(&pixels));
 }
 
+pub fn sendTerminalSizeMessages(fd: i32, tag: Tag, size: TerminalSize) !void {
+    const cells = Resize{ .rows = size.rows, .cols = size.cols };
+    const pixels = ResizePixels{ .xpixel = size.xpixel, .ypixel = size.ypixel };
+    try send(fd, tag, std.mem.asBytes(&cells));
+    try send(fd, .ResizePixels, std.mem.asBytes(&pixels));
+}
+
 fn writeAll(fd: i32, data: []const u8) !void {
     var index: usize = 0;
     while (index < data.len) {
