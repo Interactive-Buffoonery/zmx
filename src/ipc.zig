@@ -120,6 +120,19 @@ pub fn getTerminalSize(fd: i32) TerminalSize {
     if (cross.c.ioctl(fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
         return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
     }
+    inline for (.{ lib_posix.STDOUT_FILENO, lib_posix.STDIN_FILENO, lib_posix.STDERR_FILENO }) |fallback_fd| {
+        if (fallback_fd != fd) {
+            if (cross.c.ioctl(fallback_fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
+                return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
+            }
+        }
+    }
+    if (lib_posix.open("/dev/tty", .{ .ACCMODE = .RDWR }, 0)) |tty_fd| {
+        defer lib_posix.close(tty_fd);
+        if (cross.c.ioctl(tty_fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
+            return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
+        }
+    } else |_| {}
     return .{ .rows = 24, .cols = 120, .xpixel = 0, .ypixel = 0 };
 }
 
@@ -190,6 +203,13 @@ pub fn appendTerminalSizeMessages(
     const pixels = ResizePixels{ .xpixel = size.xpixel, .ypixel = size.ypixel };
     try appendMessage(alloc, list, tag, std.mem.asBytes(&cells));
     try appendMessage(alloc, list, .ResizePixels, std.mem.asBytes(&pixels));
+}
+
+pub fn sendTerminalSizeMessages(fd: i32, tag: Tag, size: TerminalSize) !void {
+    const cells = Resize{ .rows = size.rows, .cols = size.cols };
+    const pixels = ResizePixels{ .xpixel = size.xpixel, .ypixel = size.ypixel };
+    try send(fd, tag, std.mem.asBytes(&cells));
+    try send(fd, .ResizePixels, std.mem.asBytes(&pixels));
 }
 
 fn writeAll(fd: i32, data: []const u8) !void {
