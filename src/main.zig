@@ -18,6 +18,18 @@ const Daemon = loop.Daemon;
 const version = build_options.version;
 const ghostty_version = build_options.ghostty_version;
 
+/// User-facing command name shown in help, examples, version output, and
+/// generated completion scripts. Derived from argv[0] so a binary staged
+/// under another name (e.g. awesoMux's `amx`) describes itself correctly;
+/// falls back to "zmx" when argv[0] is missing or empty.
+var prog_name: []const u8 = "zmx";
+
+/// Rewrites the built-in command name in user-facing static text so vendored
+/// builds renamed at stage time render their own name throughout.
+fn branded(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.mem.replaceOwned(u8, alloc, text, "zmx", prog_name);
+}
+
 pub const std_options: std.Options = .{
     .logFn = log.zmxLogFn,
     .log_level = .debug,
@@ -39,7 +51,10 @@ pub fn main(init: std.process.Init) !void {
 
     var args = init.minimal.args.iterate();
     defer args.deinit();
-    _ = args.next(); // skip program name
+    if (args.next()) |argv0| {
+        const base = std.fs.path.basename(argv0);
+        if (base.len > 0) prog_name = base;
+    }
 
     var cfg = try Cfg.init(gpa, io);
     defer cfg.deinit(gpa);
@@ -571,9 +586,11 @@ fn help(io: std.Io) !void {
         \\  AMX_STATUS_TOKEN     Correlation token included in awesoMux events
         \\
     ;
+    const text = try branded(std.heap.page_allocator, help_text);
+    defer std.heap.page_allocator.free(text);
     var buf: [8192]u8 = undefined;
     var w = std.Io.File.stdout().writer(io, &buf);
-    try w.interface.print(help_text, .{});
+    try w.interface.print("{s}", .{text});
     try w.interface.flush();
 }
 
@@ -581,17 +598,18 @@ fn printVersion(io: std.Io, cfg: *Cfg) !void {
     var buf: [256]u8 = undefined;
     var w = std.Io.File.stdout().writer(io, &buf);
     try w.interface.print(
-        "zmx\t\t{s}\nghostty_vt\t{s}\nsocket_dir\t{s}\nlog_dir\t\t{s}\n",
-        .{ version, ghostty_version, cfg.socket_dir, cfg.log_dir },
+        "{s}\t\t{s}\nghostty_vt\t{s}\nsocket_dir\t{s}\nlog_dir\t\t{s}\n",
+        .{ prog_name, version, ghostty_version, cfg.socket_dir, cfg.log_dir },
     );
     try w.interface.flush();
 }
 
 fn printCompletions(io: std.Io, shell: completions.Shell) !void {
-    const script = shell.getCompletionScript();
+    const text = try branded(std.heap.page_allocator, shell.getCompletionScript());
+    defer std.heap.page_allocator.free(text);
     var buf: [8192]u8 = undefined;
     var w = std.Io.File.stdout().writer(io, &buf);
-    try w.interface.print("{s}\n", .{script});
+    try w.interface.print("{s}\n", .{text});
     try w.interface.flush();
 }
 
@@ -927,7 +945,7 @@ fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList
                 }
             }
 
-            try stdout.print("\nSee the logs:\nzmx history {s}\nzmx attach {s}\n", .{ session.name, session.name });
+            try stdout.print("\nSee the logs:\n{s} history {s}\n{s} attach {s}\n", .{ prog_name, session.name, prog_name, session.name });
             try stdout.flush();
         }
     }
@@ -973,7 +991,7 @@ fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
 fn detachAll(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg) !void {
     const session_name = socket.getSeshNameFromEnv();
     if (session_name.len == 0) {
-        std.log.err("ZMX_SESSION env var not found: are you inside a zmx session?", .{});
+        std.log.err("ZMX_SESSION env var not found: are you inside a session?", .{});
         return;
     }
     std.log.info("detach all session={s}", .{session_name});
