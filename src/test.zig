@@ -10,4 +10,5 @@ comptime {
     _ = @import("daemonize.zig");
     _ = @import("status.zig");
     _ = @import("cwd.zig");
+    _ = @import("log.zig");
 }

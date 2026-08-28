@@ -1,5 +1,5 @@
 const std = @import("std");
-const cross = @import("cross.zig");
+const lib_posix = @import("posix.zig");
 
 pub var log_system = LogSystem{};
 
@@ -17,35 +17,24 @@ pub const LogSystem = struct {
     mutex: std.Io.Mutex = .init,
     current_size: u64 = 0,
     max_size: u64 = 2 * 1024 * 1024, // 2MB
-    path: []const u8 = "",
     io: std.Io = undefined,
-    mode: std.Io.File.Permissions = std.Io.File.Permissions.fromMode(0o640),
 
     pub fn init(self: *LogSystem, io: std.Io, path: []const u8, mode: std.Io.File.Permissions) !void {
         self.io = io;
-        self.path = path;
-        self.mode = mode;
 
-        const file = std.Io.Dir.openFileAbsolute(self.io, path, .{ .mode = .read_write }) catch |err| switch (err) {
-            error.FileNotFound => try std.Io.Dir.createFileAbsolute(
-                self.io,
-                path,
-                .{ .read = true, .permissions = self.mode },
-            ),
-            else => return err,
-        };
+        // The mutex is process-local after daemonization. O_APPEND makes the
+        // kernel choose the end offset for every record from every process.
+        const fd = try lib_posix.open(path, .{
+            .ACCMODE = .WRONLY,
+            .APPEND = true,
+            .CREAT = true,
+            .CLOEXEC = true,
+            .NOFOLLOW = true,
+        }, mode.toMode());
+        const file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+        errdefer std.Io.File.close(file, self.io);
 
-        // Use lseek(SEEK_END) instead of length() + seekTo() to avoid a
-        // TOCTOU race: after fork() the parent may still write to the log
-        // between our length() check and seekTo(), causing us to overwrite
-        // recent parent entries. lseek(fd, 0, SEEK_END) is atomic — it
-        // always positions at the true end of file at seek time.
-        const new_pos = cross.c.lseek(file.handle, 0, cross.c.SEEK_END);
-        if (new_pos == -1) {
-            std.Io.File.close(file, self.io);
-            return error.SeekFailed;
-        }
-        self.current_size = @as(u64, @intCast(new_pos));
+        self.current_size = (try std.Io.File.stat(file, self.io)).size;
         self.file = file;
     }
 
@@ -86,34 +75,78 @@ pub const LogSystem = struct {
         };
 
         if (self.file) |f| {
-            const prefix_len = std.fmt.count(prefix, prefix_args);
-            const msg_len = std.fmt.count(format, args);
-            const newline_len = 1;
-            const total_len = prefix_len + msg_len + newline_len;
-            self.current_size += total_len;
+            const record = try std.fmt.allocPrint(
+                std.heap.page_allocator,
+                prefix ++ format ++ "\n",
+                prefix_args ++ args,
+            );
+            defer std.heap.page_allocator.free(record);
 
-            var buf: [4096]u8 = undefined;
-            var w = f.writerStreaming(self.io, &buf);
-            std.Io.Writer.print(&w.interface, prefix ++ format ++ "\n", prefix_args ++ args) catch {};
-            w.interface.flush() catch {};
+            // One syscall is the cross-process record boundary. Streaming the
+            // prefix and message separately lets another process splice its
+            // own record between them even when every descriptor appends.
+            const written = try lib_posix.write(f.handle, record);
+            if (written != record.len) return error.ShortWrite;
+            self.current_size += written;
         }
     }
 
     fn wipe(self: *LogSystem) !void {
         if (self.file) |f| {
-            std.Io.File.close(f, self.io);
-            self.file = null;
+            try std.Io.File.setLength(f, self.io, 0);
         }
-
-        self.file = try std.Io.Dir.createFileAbsolute(
-            self.io,
-            self.path,
-            .{
-                .truncate = true,
-                .read = true,
-                .permissions = self.mode,
-            },
-        );
         self.current_size = 0;
     }
 };
+
+test "independent log systems append complete records" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(directory);
+    const path = try std.fs.path.join(alloc, &.{ directory, "zmx.log" });
+    defer alloc.free(path);
+
+    var first = LogSystem{};
+    try first.init(io, path, std.Io.File.Permissions.fromMode(0o600));
+    defer first.deinit();
+    var second = LogSystem{};
+    try second.init(io, path, std.Io.File.Permissions.fromMode(0o600));
+    defer second.deinit();
+
+    try first.log(.info, .default, "socket path={s}", .{"session-a"});
+    try second.log(.info, .default, "socket path={s}", .{"session-b"});
+
+    const contents = try tmp.dir.readFileAlloc(io, "zmx.log", alloc, .limited(4096));
+    defer alloc.free(contents);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, contents, "\n"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "session-a"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "session-b"));
+}
+
+test "rotation truncates the shared inode before appending the next record" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(directory);
+    const path = try std.fs.path.join(alloc, &.{ directory, "zmx.log" });
+    defer alloc.free(path);
+
+    var logs = LogSystem{ .max_size = 1 };
+    try logs.init(io, path, std.Io.File.Permissions.fromMode(0o600));
+    defer logs.deinit();
+    try logs.log(.info, .default, "first", .{});
+    try logs.log(.info, .default, "second", .{});
+
+    const contents = try tmp.dir.readFileAlloc(io, "zmx.log", alloc, .limited(4096));
+    defer alloc.free(contents);
+    try std.testing.expect(!std.mem.containsAtLeast(u8, contents, 1, "first"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "second"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, contents, "\n"));
+}
