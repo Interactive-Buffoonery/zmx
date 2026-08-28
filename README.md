@@ -52,10 +52,10 @@
 
 ### binaries
 
-- https://zmx.sh/a/zmx-0.7.0-linux-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.7.0-linux-x86_64.tar.gz
-- https://zmx.sh/a/zmx-0.7.0-macos-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.7.0-macos-x86_64.tar.gz
+- https://zmx.sh/a/zmx-0.7.1-linux-aarch64.tar.gz
+- https://zmx.sh/a/zmx-0.7.1-linux-x86_64.tar.gz
+- https://zmx.sh/a/zmx-0.7.1-macos-aarch64.tar.gz
+- https://zmx.sh/a/zmx-0.7.1-macos-x86_64.tar.gz
 
 ### homebrew
 
@@ -125,7 +125,7 @@ Commands:
   [p]rint <name> <text...>                 Inject text into session display
   [wr]ite <name> <file_path>               Write stdin to file_path through the session
   [d]etach                                 Detach all clients (ctrl+\\ for current client)
-  [l]ist|ls [--short|--where k=v]          List active sessions
+  [l]ist|ls [--short]                      List active sessions
   [g]et <name>                             Get session labels
   set <name> k=v ...                       Set session labels
   [un]set <name> key ...                   Remove session labels
