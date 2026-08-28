@@ -127,7 +127,7 @@ test "independent log systems append complete records" {
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "session-b"));
 }
 
-test "rotation truncates the shared inode before appending the next record" {
+test "rotation preserves append behavior across independent handles" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -141,12 +141,21 @@ test "rotation truncates the shared inode before appending the next record" {
     var logs = LogSystem{ .max_size = 1 };
     try logs.init(io, path, std.Io.File.Permissions.fromMode(0o600));
     defer logs.deinit();
+    var peer = LogSystem{};
+    try peer.init(io, path, std.Io.File.Permissions.fromMode(0o600));
+    defer peer.deinit();
+
     try logs.log(.info, .default, "first", .{});
     try logs.log(.info, .default, "second", .{});
+    logs.max_size = std.math.maxInt(u64);
+    try peer.log(.info, .default, "peer", .{});
+    try logs.log(.info, .default, "third", .{});
 
     const contents = try tmp.dir.readFileAlloc(io, "zmx.log", alloc, .limited(4096));
     defer alloc.free(contents);
     try std.testing.expect(!std.mem.containsAtLeast(u8, contents, 1, "first"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "second"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, contents, "\n"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "peer"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "third"));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, contents, "\n"));
 }
