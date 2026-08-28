@@ -82,9 +82,8 @@ pub const LogSystem = struct {
             );
             defer std.heap.page_allocator.free(record);
 
-            // One syscall is the cross-process record boundary. Streaming the
-            // prefix and message separately lets another process splice its
-            // own record between them even when every descriptor appends.
+            // Write the complete record in one syscall so another process
+            // cannot splice its own record between the prefix and message.
             const written = try lib_posix.write(f.handle, record);
             if (written != record.len) return error.ShortWrite;
             self.current_size += written;
