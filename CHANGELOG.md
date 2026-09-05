@@ -4,6 +4,8 @@ Use spec: https://common-changelog.org/
 
 ## Staged
 
+## v0.8.0 - 2026-09-03
+
 ### Added
 
 - We now track cwd changes via OSC7
@@ -12,12 +14,15 @@ Use spec: https://common-changelog.org/
 - Added `--labels` flag to attach command
   - e.g. `zmx attach --labels "project=pico env=prod" pico`
   - e.g. `zmx attach --labels "$(zmx get pico)" pico.sub`
+- New command `zmx print-env` which prints the leader's tracked env vars
 
 ### Fixed
 
 - Clear screen when switching sessions to prevent term state corruption
 - Stray NUL byte in the OSC 7 sequence replayed on attach
 - The OSC 7 cwd is now decoded before the chdir, so a new session can start in a directory whose name needed percent-encoding
+- CLI commands now respond with correct error exist codes
+- Various re-attach handling bugs
 
 ### Changed
 

@@ -27,6 +27,9 @@ pub const Tag = enum(u8) {
     LabelClear = 20,
     LabelData = 21,
     Send = 22,
+    EnvGet = 23,
+    EnvSet = 24,
+    EnvData = 25,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -193,23 +196,38 @@ pub fn appendMessage(
     }
 }
 
+/// Emit upstream's 8-byte size, the frozen AMX/legacy 4-byte size, then
+/// AMX pixels. Daemons reject unsupported size lengths, handling cells once.
 pub fn appendTerminalSizeMessages(
     alloc: std.mem.Allocator,
     list: *std.ArrayList(u8),
     tag: Tag,
     size: TerminalSize,
 ) !void {
-    const cells = Resize{ .rows = size.rows, .cols = size.cols };
     const pixels = ResizePixels{ .xpixel = size.xpixel, .ypixel = size.ypixel };
-    try appendMessage(alloc, list, tag, std.mem.asBytes(&cells));
+    try appendSizeMessage(alloc, list, tag, size);
     try appendMessage(alloc, list, .ResizePixels, std.mem.asBytes(&pixels));
 }
 
 pub fn sendTerminalSizeMessages(fd: i32, tag: Tag, size: TerminalSize) !void {
     const cells = Resize{ .rows = size.rows, .cols = size.cols };
     const pixels = ResizePixels{ .xpixel = size.xpixel, .ypixel = size.ypixel };
+    try send(fd, tag, std.mem.asBytes(&size));
     try send(fd, tag, std.mem.asBytes(&cells));
     try send(fd, .ResizePixels, std.mem.asBytes(&pixels));
+}
+
+pub const LEGACY_RESIZE_LEN = 4;
+
+pub fn appendSizeMessage(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    tag: Tag,
+    size: TerminalSize,
+) !void {
+    const bytes = std.mem.asBytes(&size);
+    try appendMessage(alloc, list, tag, bytes);
+    try appendMessage(alloc, list, tag, bytes[0..LEGACY_RESIZE_LEN]);
 }
 
 fn writeAll(fd: i32, data: []const u8) !void {
@@ -421,6 +439,9 @@ test "terminal size messages preserve cell wire shape and pixel extension" {
     var socket_buf = SocketBuffer{ .buf = bytes, .alloc = alloc, .head = 0 };
     bytes = .empty;
     defer socket_buf.deinit();
+    const current = socket_buf.next() orelse return error.MissingCurrentMessage;
+    try std.testing.expectEqual(Tag.Init, current.header.tag);
+    try std.testing.expectEqual(@as(usize, 8), current.payload.len);
     const cells = socket_buf.next() orelse return error.MissingInitMessage;
     try std.testing.expectEqual(Tag.Init, cells.header.tag);
     try std.testing.expectEqual(@as(usize, 4), cells.payload.len);
@@ -453,7 +474,8 @@ test "Tag wire values are frozen" {
         .{ Tag.Write, 12 },     .{ Tag.TaskComplete, 13 }, .{ Tag.SessionEnd, 14 },
         .{ Tag.CwdQuery, 15 },  .{ Tag.CwdResponse, 16 },  .{ Tag.ResizePixels, 17 },
         .{ Tag.LabelGet, 18 },  .{ Tag.LabelSet, 19 },     .{ Tag.LabelClear, 20 },
-        .{ Tag.LabelData, 21 }, .{ Tag.Send, 22 },
+        .{ Tag.LabelData, 21 }, .{ Tag.Send, 22 },         .{ Tag.EnvGet, 23 },
+        .{ Tag.EnvSet, 24 },    .{ Tag.EnvData, 25 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 
@@ -490,6 +512,30 @@ pub fn roundTripForTag(
         }
     }
     return error.Timeout;
+}
+
+test "appendSizeMessage emits current and legacy encodings" {
+    const alloc = std.testing.allocator;
+    var list = try std.ArrayList(u8).initCapacity(alloc, 64);
+    defer list.deinit(alloc);
+
+    const size = TerminalSize{ .rows = 45, .cols = 170, .xpixel = 900, .ypixel = 1800 };
+    try appendSizeMessage(alloc, &list, .Init, size);
+
+    const h1 = std.mem.bytesToValue(Header, list.items[0..@sizeOf(Header)]);
+    try std.testing.expectEqual(Tag.Init, h1.tag);
+    try std.testing.expectEqual(@as(u32, @sizeOf(TerminalSize)), h1.len);
+    const p1 = list.items[@sizeOf(Header)..][0..@sizeOf(TerminalSize)];
+    try std.testing.expectEqual(size, std.mem.bytesToValue(TerminalSize, p1));
+
+    const off2 = @sizeOf(Header) + @sizeOf(TerminalSize);
+    const h2 = std.mem.bytesToValue(Header, list.items[off2..][0..@sizeOf(Header)]);
+    try std.testing.expectEqual(Tag.Init, h2.tag);
+    try std.testing.expectEqual(@as(u32, LEGACY_RESIZE_LEN), h2.len);
+    // Legacy payload is the rows+cols prefix of the current encoding.
+    const p2 = list.items[off2 + @sizeOf(Header) ..][0..LEGACY_RESIZE_LEN];
+    try std.testing.expectEqualSlices(u8, p1[0..LEGACY_RESIZE_LEN], p2);
+    try std.testing.expectEqual(off2 + @sizeOf(Header) + LEGACY_RESIZE_LEN, list.items.len);
 }
 
 test "zeroed Info has no stack garbage in wire bytes" {
