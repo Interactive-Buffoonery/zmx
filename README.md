@@ -52,10 +52,10 @@
 
 ### binaries
 
-- https://zmx.sh/a/zmx-0.7.1-linux-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.7.1-linux-x86_64.tar.gz
-- https://zmx.sh/a/zmx-0.7.1-macos-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.7.1-macos-x86_64.tar.gz
+- https://zmx.sh/a/zmx-0.8.0-linux-aarch64.tar.gz
+- https://zmx.sh/a/zmx-0.8.0-linux-x86_64.tar.gz
+- https://zmx.sh/a/zmx-0.8.0-macos-aarch64.tar.gz
+- https://zmx.sh/a/zmx-0.8.0-macos-x86_64.tar.gz
 
 ### homebrew
 
@@ -630,3 +630,4 @@ abduco provides session management (i.e. it allows programs to be run independen
 - [zsm](https://github.com/mdsakalu/zmx-session-manager) -- TUI session manager for zmx. List, preview, filter, and kill sessions from an interactive terminal UI.
 - [zmosh](https://github.com/mmonad/zmosh) -- A fork of zmx that adds encrypted UDP auto-reconnect for remote sessions (like mosh).
 - [zmx-picker](https://github.com/EarthmanMuons/zmx-picker) -- fzf-based session picker and project launcher. Jump to a running zmx session or start one inside any of your git/jj repos.
+- [rootshell](https://github.com/kitknox/rootshell) -- Metal-accelerated terminal for iPhone, iPad, Vision Pro, and Mac. Lists active zmx sessions with live previews and can auto-attach on connect.
