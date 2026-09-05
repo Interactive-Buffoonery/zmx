@@ -621,8 +621,9 @@ pub const Client = struct {
     }
 
     fn setEnv(self: *Client, gpa: std.mem.Allocator, env_str: []const u8) !void {
+        const replacement = if (env_str.len > 0) try gpa.dupe(u8, env_str) else null;
         if (self.env_str) |s| gpa.free(s);
-        self.env_str = if (env_str.len > 0) try gpa.dupe(u8, env_str) else null;
+        self.env_str = replacement;
     }
 };
 
@@ -1624,4 +1625,28 @@ test "handleEnvGet returns leader client's environment variables including unset
     try daemon.handleEnvGet(alloc, &client_req);
     const pay3 = client_req.write_buf.items[@sizeOf(ipc.Header)..];
     try std.testing.expectEqualStrings("DISPLAY=:99\n", pay3);
+}
+
+test "client environment survives replacement allocation failure" {
+    const alloc = std.testing.allocator;
+    const fds = try lib_posix.pipe2(.{});
+    defer lib_posix.close(fds[1]);
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = fds[0],
+        .read_buf = try ipc.SocketBuffer.init(alloc),
+        .write_buf = .empty,
+    };
+    defer client.deinit(alloc);
+    try client.setEnv(alloc, "DISPLAY=:1\n");
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, client.setEnv(failing.allocator(), "DISPLAY=:2\n"));
+    try std.testing.expectEqual(@as(usize, 0), failing.freed_bytes);
+    try std.testing.expectEqualStrings("DISPLAY=:1\n", client.env_str.?);
+
+    try client.setEnv(alloc, "DISPLAY=:3\n");
+    try std.testing.expectEqualStrings("DISPLAY=:3\n", client.env_str.?);
+    try client.setEnv(failing.allocator(), "");
+    try std.testing.expectEqual(@as(?[]u8, null), client.env_str);
 }
