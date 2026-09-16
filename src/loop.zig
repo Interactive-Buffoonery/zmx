@@ -1036,7 +1036,6 @@ pub const Daemon = struct {
                 return;
             }
         }
-        return error.NoLeaderFound;
     }
 
     pub fn handleInit(
