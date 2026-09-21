@@ -1033,10 +1033,18 @@ pub fn writeSessionLine(
         session.created_at,
     });
     if (session.cwd) |cwd| {
-        try writer.print("\tcwd={s}", .{cwd});
+        const encoded_len = std.base64.standard.Encoder.calcSize(cwd.len);
+        const encoded = try std.heap.page_allocator.alloc(u8, encoded_len);
+        defer std.heap.page_allocator.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, cwd);
+        try writer.print("\tcwd_b64={s}", .{encoded});
     }
     if (session.cmd) |cmd| {
-        try writer.print("\tcmd={s}", .{cmd});
+        const encoded_len = std.base64.standard.Encoder.calcSize(cmd.len);
+        const encoded = try std.heap.page_allocator.alloc(u8, encoded_len);
+        defer std.heap.page_allocator.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, cmd);
+        try writer.print("\tcmd_b64={s}", .{encoded});
     }
     if (session.task_ended_at) |ended_at| {
         if (ended_at > 0) {
@@ -1127,7 +1135,7 @@ test "writeSessionLine formats output for current session and short output" {
     }
 }
 
-test "writeSessionLine emits cwd and labels as tab-separated fields" {
+test "writeSessionLine base64-encodes cwd and emits labels as tab-separated fields" {
     const session = SessionEntry{
         .name = "dev",
         .pid = 123,
@@ -1147,9 +1155,29 @@ test "writeSessionLine emits cwd and labels as tab-separated fields" {
     try writeSessionLine(&builder.writer, session, false, null);
 
     try testing.expectEqualStrings(
-        "name=dev\tpid=123\tclients=0\tcreated=10\tcwd=/Users/eD/Development/awesomux\tawesomux.workspace-title=V29yaw\tawesomux.group-id=MTExMQ\tdaemon_pid=99\n",
+        "name=dev\tpid=123\tclients=0\tcreated=10\tcwd_b64=L1VzZXJzL2VEL0RldmVsb3BtZW50L2F3ZXNvbXV4\tawesomux.workspace-title=V29yaw\tawesomux.group-id=MTExMQ\tdaemon_pid=99\n",
         builder.writer.buffered(),
     );
+}
+
+test "writeSessionLine frames delimiter-bearing cwd" {
+    const session = SessionEntry{
+        .name = "dev",
+        .pid = 123,
+        .clients_len = 1,
+        .is_error = false,
+        .error_name = null,
+        .cwd = "/tmp/x\tclients=0\nname=fake",
+        .created_at = 10,
+        .task_ended_at = null,
+        .task_exit_code = null,
+    };
+    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer builder.deinit();
+
+    try writeSessionLine(&builder.writer, session, false, null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, builder.writer.buffered(), "\n"));
+    try testing.expect(std.mem.indexOf(u8, builder.writer.buffered(), "\tclients=0") == null);
 }
 
 test "shellNeedsQuoting" {
