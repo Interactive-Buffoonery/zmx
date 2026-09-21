@@ -185,6 +185,9 @@ pub fn main(init: std.process.Init) !void {
         if (parsed.missing_labels_value) {
             return printError(io, "--labels requires \"key=value ...\"", .{});
         }
+        if (parsed.invalid_flag_combination) {
+            return printError(io, "--existing cannot be combined with --labels", .{});
+        }
         // Before ensureSession, so a rejected label does not leave a session
         // behind that the caller never asked for.
         if (parsed.labels) |kvs| assertLabels(io, kvs);
@@ -213,7 +216,7 @@ pub fn main(init: std.process.Init) !void {
         const env_str = try getTrackedEnvStr(gpa, env_keys, init.environ_map);
         defer gpa.free(env_str);
 
-        return attach(gpa, io, &daemon, env_str, status_cfg, parsed.labels);
+        return attach(gpa, io, &daemon, env_str, status_cfg, parsed.labels, parsed.existing_only);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -533,7 +536,8 @@ fn help(io: std.Io) !void {
         \\Usage: zmx <command> [args...]
         \\
         \\Commands:
-        \\  [a]ttach [--labels kv] <name> [command...]  Attach to session, creating if needed
+        \\  [a]ttach [--existing] [--labels kv] <name> [command...]
+        \\                                                Attach, creating unless --existing
         \\  [r]un <name> [-d] [command...]              Send command without attaching
         \\  [s]end <name> <text...>                     Send raw input to session PTY
         \\  [p]rint <name> <text...>                    Inject text into session display
@@ -560,6 +564,8 @@ fn help(io: std.Io) !void {
         \\  --labels applies labels as the session is created, in the same form
         \\  `zmx set` takes. A caller that creates and then labels in two steps
         \\  leaves an unlabelled session behind if it dies between them.
+        \\  --existing requires a responsive session and cannot be combined
+        \\  with --labels.
         \\
         \\  Examples:
         \\    zmx attach dev
@@ -1574,6 +1580,10 @@ const AttachArgs = struct {
     /// `--labels "k=v ..."`: labels to apply once the session exists, in the
     /// same space-separated form `zmx set` takes.
     labels: ?[]const u8 = null,
+    /// Attach only when a responsive daemon already owns the session name.
+    existing_only: bool = false,
+    /// `--existing` and `--labels` are mutually exclusive.
+    invalid_flag_combination: bool = false,
     want_help: bool = false,
     /// `--labels` was given with nothing to apply.
     missing_labels_value: bool = false,
@@ -1584,6 +1594,7 @@ const AttachArgs = struct {
 /// handed to the session.
 fn parseAttachArgs(argv: []const []const u8) AttachArgs {
     const labels_flag = "--labels";
+    const existing_flag = "--existing";
     var parsed: AttachArgs = .{};
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -1592,8 +1603,14 @@ fn parseAttachArgs(argv: []const []const u8) AttachArgs {
             parsed.want_help = true;
             return parsed;
         }
+        if (std.mem.eql(u8, arg, existing_flag)) {
+            parsed.existing_only = true;
+            parsed.invalid_flag_combination = parsed.labels != null;
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, labels_flag ++ "=")) {
             parsed.labels = arg[labels_flag.len + 1 ..];
+            parsed.invalid_flag_combination = parsed.existing_only;
             continue;
         }
         if (std.mem.eql(u8, arg, labels_flag)) {
@@ -1604,6 +1621,7 @@ fn parseAttachArgs(argv: []const []const u8) AttachArgs {
             }
             i += 1;
             parsed.labels = argv[i];
+            parsed.invalid_flag_combination = parsed.existing_only;
             continue;
         }
         parsed.session_name = arg;
@@ -1621,14 +1639,39 @@ fn attach(
     env_str: []const u8,
     status_cfg: status.StatusConfig,
     labels: ?[]const u8,
+    existing_only: bool,
 ) !void {
+    if (existing_only) {
+        verifyExistingSession(
+            gpa,
+            io,
+            daemon.cfg.socket_dir,
+            daemon.session_name,
+            daemon.socket_path,
+        ) catch |err| switch (err) {
+            error.SessionNotFound => return printError(
+                io,
+                "session \"{s}\" does not exist",
+                .{daemon.session_name},
+            ),
+            error.SessionUnresponsive => return printError(
+                io,
+                "session \"{s}\" is unresponsive",
+                .{daemon.session_name},
+            ),
+            else => return err,
+        };
+    }
+
     const sesh = socket.getSeshNameFromEnv();
     if (sesh.len > 0) {
         return switchSesh(gpa, io, daemon, sesh);
     }
 
-    const is_daemon_proc = try daemon.ensureSession(io);
-    if (is_daemon_proc) return;
+    if (!existing_only) {
+        const is_daemon_proc = try daemon.ensureSession(io);
+        if (is_daemon_proc) return;
+    }
 
     // The session exists now, so labels land before the client takes over the
     // terminal. Doing it here rather than in a follow-up `zmx set` keeps a
@@ -1729,10 +1772,25 @@ fn attach(
                 std.log.info("switching to new session cwd={s}", .{switch_cwd});
                 target_daemon.setCwd(switch_cwd);
                 target_daemon.shell = daemon.shell;
-                return attach(gpa, io, &target_daemon, env_str, status_cfg, null);
+                return attach(gpa, io, &target_daemon, env_str, status_cfg, null, existing_only);
             }
         },
     }
+}
+
+fn verifyExistingSession(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    socket_dir: []const u8,
+    session_name: []const u8,
+    socket_path: []const u8,
+) !void {
+    var dir = try std.Io.Dir.openDirAbsolute(io, socket_dir, .{});
+    defer dir.close(io);
+    if (!try socket.sessionExists(io, dir, session_name)) return error.SessionNotFound;
+
+    const probe = ipc.probeSession(alloc, socket_path) catch return error.SessionUnresponsive;
+    probe.deinit();
 }
 
 fn writeFile(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, file_path: []const u8) !void {
@@ -2029,6 +2087,108 @@ test "parseAttachArgs leaves labels unset when the flag is absent" {
     const parsed = parseAttachArgs(&.{"dev"});
     try std.testing.expectEqual(@as(?[]const u8, null), parsed.labels);
     try std.testing.expect(!parsed.missing_labels_value);
+}
+
+test "parseAttachArgs reads --existing only before the session name" {
+    const argv: []const []const u8 = &.{ "--existing", "dev", "--existing" };
+    const parsed = parseAttachArgs(argv);
+    try std.testing.expect(parsed.existing_only);
+    try std.testing.expectEqualStrings("dev", parsed.session_name);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{"--existing"},
+        argv[parsed.command_start..],
+    );
+}
+
+test "parseAttachArgs rejects --existing with --labels" {
+    for ([_][]const []const u8{
+        &.{ "--existing", "--labels", "a=1", "dev" },
+        &.{ "--labels=a=1", "--existing", "dev" },
+    }) |argv| {
+        const parsed = parseAttachArgs(argv);
+        try std.testing.expect(parsed.existing_only);
+        try std.testing.expect(parsed.labels != null);
+        try std.testing.expect(parsed.invalid_flag_combination);
+    }
+}
+
+test "verifyExistingSession refuses an absent session without creating it" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(directory);
+    const path = try std.fs.path.join(alloc, &.{ directory, "absent" });
+    defer alloc.free(path);
+
+    try std.testing.expectError(
+        error.SessionNotFound,
+        verifyExistingSession(alloc, io, directory, "absent", path),
+    );
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "absent", .{}));
+}
+
+test "verifyExistingSession leaves a refused stale socket intact" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const directory = "/tmp";
+    const name = try std.fmt.allocPrint(alloc, "zmx-existing-{d}-stale", .{std.c.getpid()});
+    defer alloc.free(name);
+    const path = try std.fs.path.join(alloc, &.{ directory, name });
+    defer alloc.free(path);
+    var dir = try std.Io.Dir.openDirAbsolute(io, directory, .{});
+    defer dir.close(io);
+    dir.deleteFile(io, name) catch {};
+    defer dir.deleteFile(io, name) catch {};
+    const fd = try socket.createSocket(path);
+    lib_posix.close(fd);
+
+    try std.testing.expectError(
+        error.SessionUnresponsive,
+        verifyExistingSession(alloc, io, directory, name, path),
+    );
+    try std.testing.expect((try dir.statFile(io, name, .{})).kind == .unix_domain_socket);
+}
+
+test "verifyExistingSession accepts a responsive daemon" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const directory = "/tmp";
+    const name = try std.fmt.allocPrint(alloc, "zmx-existing-{d}-live", .{std.c.getpid()});
+    defer alloc.free(name);
+    const path = try std.fs.path.join(alloc, &.{ directory, name });
+    defer alloc.free(path);
+    var dir = try std.Io.Dir.openDirAbsolute(io, directory, .{});
+    defer dir.close(io);
+    dir.deleteFile(io, name) catch {};
+    defer dir.deleteFile(io, name) catch {};
+    const server_fd = try socket.createSocket(path);
+    defer lib_posix.close(server_fd);
+
+    const child = try lib_posix.fork();
+    if (child == 0) {
+        const client_fd = while (true) {
+            break lib_posix.accept(server_fd, null, null, lib_posix.SOCK.CLOEXEC) catch |err| {
+                if (err == error.WouldBlock) {
+                    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+                    continue;
+                }
+                lib_posix.exit(2);
+            };
+        };
+        defer lib_posix.close(client_fd);
+        var info = std.mem.zeroes(ipc.Info);
+        info.pid = 123;
+        ipc.send(client_fd, .Info, std.mem.asBytes(&info)) catch lib_posix.exit(3);
+        ipc.send(client_fd, .LabelData, "") catch lib_posix.exit(4);
+        lib_posix.exit(0);
+    }
+
+    try verifyExistingSession(alloc, io, directory, name, path);
+    const result = lib_posix.waitpid(child, 0);
+    try std.testing.expectEqual(@as(u32, 0), result.status);
 }
 
 test "getTrackedEnvStr includes set and unset entries" {
