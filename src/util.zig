@@ -1127,6 +1127,31 @@ test "writeSessionLine formats output for current session and short output" {
     }
 }
 
+test "writeSessionLine emits cwd and labels as tab-separated fields" {
+    const session = SessionEntry{
+        .name = "dev",
+        .pid = 123,
+        .clients_len = 0,
+        .is_error = false,
+        .error_name = null,
+        .cwd = "/Users/eD/Development/awesomux",
+        .labels = "awesomux.workspace-title=V29yaw awesomux.group-id=MTExMQ",
+        .created_at = 10,
+        .task_ended_at = null,
+        .task_exit_code = null,
+        .daemon_pid = 99,
+    };
+    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer builder.deinit();
+
+    try writeSessionLine(&builder.writer, session, false, null);
+
+    try testing.expectEqualStrings(
+        "name=dev\tpid=123\tclients=0\tcreated=10\tcwd=/Users/eD/Development/awesomux\tawesomux.workspace-title=V29yaw\tawesomux.group-id=MTExMQ\tdaemon_pid=99\n",
+        builder.writer.buffered(),
+    );
+}
+
 test "shellNeedsQuoting" {
     try testing.expect(shellNeedsQuoting(""));
     try testing.expect(shellNeedsQuoting("hello world"));
