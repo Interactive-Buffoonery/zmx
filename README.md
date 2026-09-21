@@ -119,7 +119,7 @@ Run `zmx help` for more information on usage, with examples.
 Usage: zmx <command> [args...]
 
 Commands:
-  [a]ttach <name> [command...]             Attach to session, creating if needed
+  [a]ttach [--existing] <name> [command...] Attach, creating unless --existing
   [r]un <name> [-d] [command...]           Send command without attaching
   [s]end <name> <text...>                  Send raw input to session PTY
   [p]rint <name> <text...>                 Inject text into session display
@@ -138,6 +138,10 @@ Commands:
   [v]ersion                                Show version and metadata (socket dir, log dir)
   [h]elp                                   Show this help
 ```
+
+`attach --existing <name>` fails unless the named daemon is already responsive.
+It never creates a replacement or removes an unresponsive session socket, and
+cannot be combined with `--labels`.
 
 ## nested sessions
 
