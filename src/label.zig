@@ -7,7 +7,10 @@ pub const LabelError = error{
     LabelKeyReservedName,
 };
 
-const reserved_keys = [_][]const u8{ "name", "start_dir", "cmd" };
+const reserved_keys = [_][]const u8{
+    "name",      "pid", "clients", "created", "cwd",       "cwd_b64",
+    "start_dir", "cmd", "cmd_b64", "ended",   "exit_code", "daemon_pid",
+};
 
 fn isAlnum(c: u8) bool {
     return (c >= 'a' and c <= 'z') or
@@ -142,4 +145,7 @@ test "assertLabel" {
     try std.testing.expectError(error.LabelKeyReservedName, assertLabel("name", "dev"));
     try std.testing.expectError(error.LabelKeyReservedName, assertLabel("start_dir", "dev"));
     try std.testing.expectError(error.LabelKeyReservedName, assertLabel("cmd", "dev"));
+    for (reserved_keys) |key| {
+        try std.testing.expectError(error.LabelKeyReservedName, assertLabel(key, "value"));
+    }
 }
