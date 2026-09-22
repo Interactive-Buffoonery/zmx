@@ -10,6 +10,7 @@ pub const LabelError = error{
 const reserved_keys = [_][]const u8{
     "name",      "pid", "clients", "created", "cwd",       "cwd_b64",
     "start_dir", "cmd", "cmd_b64", "ended",   "exit_code", "daemon_pid",
+    "err",       "status",
 };
 
 fn isAlnum(c: u8) bool {
