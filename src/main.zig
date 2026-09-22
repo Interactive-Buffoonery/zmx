@@ -1681,19 +1681,28 @@ fn attach(
         try labelSet(gpa, io, daemon.cfg, daemon.session_name, kvs);
     }
 
-    var identity = ipc.probeSession(gpa, daemon.socket_path) catch |err| {
-        return printError(io, "cannot verify session \"{s}\": {s}", .{ daemon.session_name, @errorName(err) });
-    };
-    defer identity.deinit();
-    // Continue on the descriptor whose identity we just verified. Reconnecting
-    // by pathname would allow a same-name replacement between probe and attach.
-    const client_sock = identity.takeFd();
+    var identity = if (existing_only)
+        ipc.probeSession(gpa, daemon.socket_path) catch |err| {
+            return printError(io, "cannot verify session \"{s}\": {s}", .{ daemon.session_name, @errorName(err) });
+        }
+    else
+        null;
+    const client_sock = if (existing_only)
+        identity.?.takeFd()
+    else
+        socket.sessionConnect(daemon.socket_path) catch |err| {
+            return printError(io, "cannot connect to session \"{s}\": {s}", .{ daemon.session_name, @errorName(err) });
+        };
+    if (!existing_only) {
+        identity = ipc.probeSession(gpa, daemon.socket_path) catch null;
+    }
+    defer if (identity) |probe| probe.deinit();
     status.StatusFile.emitAttached(
         gpa,
         status_cfg,
         daemon.created_session,
-        identity.info.daemon_pid,
-        identity.info.created_at,
+        if (identity) |probe| probe.info.daemon_pid else 0,
+        if (identity) |probe| probe.info.created_at else 0,
         daemon.session_name,
         @intCast(std.Io.Timestamp.now(io, .real).toSeconds()),
     ) catch |err| std.log.warn("failed to emit attached status: {s}", .{@errorName(err)});
