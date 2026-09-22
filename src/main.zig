@@ -1681,13 +1681,13 @@ fn attach(
         try labelSet(gpa, io, daemon.cfg, daemon.session_name, kvs);
     }
 
-    const identity = ipc.probeSession(gpa, daemon.socket_path) catch |err| {
+    var identity = ipc.probeSession(gpa, daemon.socket_path) catch |err| {
         return printError(io, "cannot verify session \"{s}\": {s}", .{ daemon.session_name, @errorName(err) });
     };
     defer identity.deinit();
-    const client_sock = socket.sessionConnect(daemon.socket_path) catch |err| {
-        return printError(io, "cannot connect to session \"{s}\": {s}", .{ daemon.session_name, @errorName(err) });
-    };
+    // Continue on the descriptor whose identity we just verified. Reconnecting
+    // by pathname would allow a same-name replacement between probe and attach.
+    const client_sock = identity.takeFd();
     status.StatusFile.emitAttached(
         gpa,
         status_cfg,
