@@ -341,7 +341,13 @@ const SessionProbeResult = struct {
 
     pub fn deinit(self: *const SessionProbeResult) void {
         if (self.labels) |lbl| self.alloc.free(lbl);
-        lib_posix.close(self.fd);
+        if (self.fd >= 0) lib_posix.close(self.fd);
+    }
+
+    pub fn takeFd(self: *SessionProbeResult) i32 {
+        const fd = self.fd;
+        self.fd = -1;
+        return fd;
     }
 };
 
