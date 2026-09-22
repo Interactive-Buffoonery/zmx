@@ -1641,8 +1641,10 @@ fn attach(
     labels: ?[]const u8,
     existing_only: bool,
 ) !void {
+    var identity: ?ipc.SessionProbeResult = null;
+    defer if (identity) |probe| probe.deinit();
     if (existing_only) {
-        verifyExistingSession(
+        identity = verifyExistingSession(
             gpa,
             io,
             daemon.cfg.socket_dir,
@@ -1659,7 +1661,7 @@ fn attach(
                 "session \"{s}\" is unresponsive",
                 .{daemon.session_name},
             ),
-            else => return err,
+            else => return printError(io, "cannot verify session \"{s}\": {s}", .{ daemon.session_name, @errorName(err) }),
         };
     }
 
@@ -1681,12 +1683,6 @@ fn attach(
         try labelSet(gpa, io, daemon.cfg, daemon.session_name, kvs);
     }
 
-    var identity = if (existing_only)
-        ipc.probeSession(gpa, daemon.socket_path) catch |err| {
-            return printError(io, "cannot verify session \"{s}\": {s}", .{ daemon.session_name, @errorName(err) });
-        }
-    else
-        null;
     const client_sock = if (existing_only)
         identity.?.takeFd()
     else
@@ -1696,7 +1692,6 @@ fn attach(
     if (!existing_only) {
         identity = ipc.probeSession(gpa, daemon.socket_path) catch null;
     }
-    defer if (identity) |probe| probe.deinit();
     status.StatusFile.emitAttached(
         gpa,
         status_cfg,
@@ -1795,7 +1790,7 @@ fn verifyExistingSession(
     socket_dir: []const u8,
     session_name: []const u8,
     socket_path: []const u8,
-) !void {
+) !ipc.SessionProbeResult {
     var dir = std.Io.Dir.openDirAbsolute(io, socket_dir, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return error.SessionNotFound,
         else => return err,
@@ -1807,8 +1802,7 @@ fn verifyExistingSession(
     };
     if (!exists) return error.SessionNotFound;
 
-    const probe = ipc.probeSession(alloc, socket_path) catch return error.SessionUnresponsive;
-    probe.deinit();
+    return ipc.probeSession(alloc, socket_path) catch return error.SessionUnresponsive;
 }
 
 fn writeFile(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, file_path: []const u8) !void {
@@ -2208,6 +2202,26 @@ test "verifyExistingSession leaves a refused stale socket intact" {
     try std.testing.expect((try dir.statFile(io, name, .{})).kind == .unix_domain_socket);
 }
 
+test "verifyExistingSession preserves filesystem errors for a looping session symlink" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(directory);
+    const path = try std.fs.path.join(alloc, &.{ directory, "loop" });
+    defer alloc.free(path);
+    try tmp.dir.symLink(io, "loop", "loop", .{});
+
+    try std.testing.expectError(
+        error.SymLinkLoop,
+        verifyExistingSession(alloc, io, directory, "loop", path),
+    );
+    var target: [16]u8 = undefined;
+    const length = try tmp.dir.readLink(io, "loop", &target);
+    try std.testing.expectEqualStrings("loop", target[0..length]);
+}
+
 test "verifyExistingSession accepts a responsive daemon" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
@@ -2225,24 +2239,31 @@ test "verifyExistingSession accepts a responsive daemon" {
 
     const child = try lib_posix.fork();
     if (child == 0) {
-        const client_fd = while (true) {
-            break lib_posix.accept(server_fd, null, null, lib_posix.SOCK.CLOEXEC) catch |err| {
-                if (err == error.WouldBlock) {
-                    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
-                    continue;
-                }
-                lib_posix.exit(2);
-            };
-        };
+        var ready = [_]lib_posix.pollfd{.{ .fd = server_fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+        if ((lib_posix.poll(&ready, 1000) catch lib_posix.exit(2)) == 0) lib_posix.exit(2);
+        const client_fd = lib_posix.accept(server_fd, null, null, lib_posix.SOCK.CLOEXEC) catch lib_posix.exit(2);
         defer lib_posix.close(client_fd);
         var info = std.mem.zeroes(ipc.Info);
         info.pid = 123;
+        info.daemon_pid = 456;
+        info.created_at = 789;
         ipc.send(client_fd, .Info, std.mem.asBytes(&info)) catch lib_posix.exit(3);
         ipc.send(client_fd, .LabelData, "") catch lib_posix.exit(4);
         lib_posix.exit(0);
     }
 
-    try verifyExistingSession(alloc, io, directory, name, path);
+    const client_fd = blk: {
+        var probe = try verifyExistingSession(alloc, io, directory, name, path);
+        defer probe.deinit();
+        try std.testing.expectEqual(@as(i32, 123), probe.info.pid);
+        try std.testing.expectEqual(@as(i32, 456), probe.info.daemon_pid);
+        try std.testing.expectEqual(@as(u64, 789), probe.info.created_at);
+        const fd = probe.takeFd();
+        try std.testing.expectEqual(@as(i32, -1), probe.fd);
+        break :blk fd;
+    };
+    defer lib_posix.close(client_fd);
+    _ = try lib_posix.fcntl(client_fd, lib_posix.F.GETFD, 0);
     const result = lib_posix.waitpid(child, 0);
     try std.testing.expectEqual(@as(u32, 0), result.status);
 }
