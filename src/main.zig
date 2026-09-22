@@ -1681,17 +1681,19 @@ fn attach(
         try labelSet(gpa, io, daemon.cfg, daemon.session_name, kvs);
     }
 
+    const identity = ipc.probeSession(gpa, daemon.socket_path) catch |err| {
+        return printError(io, "cannot verify session \"{s}\": {s}", .{ daemon.session_name, @errorName(err) });
+    };
+    defer identity.deinit();
     const client_sock = socket.sessionConnect(daemon.socket_path) catch |err| {
         return printError(io, "cannot connect to session \"{s}\": {s}", .{ daemon.session_name, @errorName(err) });
     };
-    const identity = ipc.probeSession(gpa, daemon.socket_path) catch null;
-    defer if (identity) |probe| probe.deinit();
     status.StatusFile.emitAttached(
         gpa,
         status_cfg,
         daemon.created_session,
-        if (identity) |probe| probe.info.daemon_pid else 0,
-        if (identity) |probe| probe.info.created_at else 0,
+        identity.info.daemon_pid,
+        identity.info.created_at,
         daemon.session_name,
         @intCast(std.Io.Timestamp.now(io, .real).toSeconds()),
     ) catch |err| std.log.warn("failed to emit attached status: {s}", .{@errorName(err)});
