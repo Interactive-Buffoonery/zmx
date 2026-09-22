@@ -143,6 +143,17 @@ Commands:
 It never creates a replacement or removes an unresponsive session socket, and
 cannot be combined with `--labels`.
 
+### list output
+
+`list` emits tab-separated `key=value` fields, one session per line. Parse by
+key, not column position; optional fields may be absent. In this fork,
+`cwd_b64` and `cmd_b64` replace the legacy `cwd` and `cmd` fields. Their values
+use standard Base64 so paths and commands containing tabs or newlines cannot
+inject additional fields or records. Decode them only after splitting records
+and fields. Consumers of the legacy keys must migrate; no raw compatibility
+aliases are emitted. `list --short` emits session names only and is preferable
+for pickers that do not need metadata.
+
 ## nested sessions
 
 Nested sessions are not supported. Inside a session `ZMX_SESSION` is set, and `attach` reads it: instead of creating another client it switches the calling terminal to the session you named.
@@ -373,16 +384,12 @@ Requires [fzf](https://github.com/junegunn/fzf).
 zmx-select() {
   local display
   local prefix="${ZMX_SESSION_PREFIX:-}"
-  display=$(zmx list 2>/dev/null | while IFS=$'\t' read -r name pid clients created dir; do
-    name=${name#*name=}
-    pid=${pid#*pid=}
-    clients=${clients#*clients=}
-    dir=${dir#*start_dir=}
+  display=$(zmx list --short 2>/dev/null | while IFS= read -r name; do
     if [[ -n "$prefix" ]]; then
       [[ "$name" == "$prefix"* ]] || continue
       name=${name#"$prefix"}
     fi
-    printf "%-20s  pid:%-8s  clients:%-2s  %s\n" "$name" "$pid" "$clients" "$dir"
+    printf '%s\n' "$name"
   done)
 
   local output query key selected session_name

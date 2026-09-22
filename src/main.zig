@@ -1796,9 +1796,16 @@ fn verifyExistingSession(
     session_name: []const u8,
     socket_path: []const u8,
 ) !void {
-    var dir = try std.Io.Dir.openDirAbsolute(io, socket_dir, .{});
+    var dir = std.Io.Dir.openDirAbsolute(io, socket_dir, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return error.SessionNotFound,
+        else => return err,
+    };
     defer dir.close(io);
-    if (!try socket.sessionExists(io, dir, session_name)) return error.SessionNotFound;
+    const exists = socket.sessionExists(io, dir, session_name) catch |err| switch (err) {
+        error.FileNotUnixSocket => return error.SessionNotFound,
+        else => return err,
+    };
+    if (!exists) return error.SessionNotFound;
 
     const probe = ipc.probeSession(alloc, socket_path) catch return error.SessionUnresponsive;
     probe.deinit();
@@ -2139,6 +2146,44 @@ test "verifyExistingSession refuses an absent session without creating it" {
         verifyExistingSession(alloc, io, directory, "absent", path),
     );
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "absent", .{}));
+}
+
+test "verifyExistingSession leaves a non-socket file intact" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(directory);
+    const path = try std.fs.path.join(alloc, &.{ directory, "not-a-socket" });
+    defer alloc.free(path);
+    const file = try tmp.dir.createFile(io, "not-a-socket", .{});
+    file.close(io);
+
+    try std.testing.expectError(
+        error.SessionNotFound,
+        verifyExistingSession(alloc, io, directory, "not-a-socket", path),
+    );
+    try std.testing.expect((try tmp.dir.statFile(io, "not-a-socket", .{})).kind == .file);
+}
+
+test "verifyExistingSession refuses a missing socket directory without creating it" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(parent);
+    const directory = try std.fs.path.join(alloc, &.{ parent, "missing" });
+    defer alloc.free(directory);
+    const path = try std.fs.path.join(alloc, &.{ directory, "absent" });
+    defer alloc.free(path);
+
+    try std.testing.expectError(
+        error.SessionNotFound,
+        verifyExistingSession(alloc, io, directory, "absent", path),
+    );
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "missing", .{}));
 }
 
 test "verifyExistingSession leaves a refused stale socket intact" {
