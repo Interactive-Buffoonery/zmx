@@ -1778,7 +1778,7 @@ fn attach(
                 std.log.info("switching to new session cwd={s}", .{switch_cwd});
                 target_daemon.setCwd(switch_cwd);
                 target_daemon.shell = daemon.shell;
-                return attach(gpa, io, &target_daemon, env_str, status_cfg, null, existing_only);
+                return attach(gpa, io, &target_daemon, env_str, status_cfg, null, false);
             }
         },
     }
