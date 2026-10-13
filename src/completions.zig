@@ -374,7 +374,6 @@ const yash_completions =
     \\function completion/zmx::run:arg {
     \\    OPTIONS=( #>#
     \\        "d; detach from calling terminal"
-    \\        "--fish; session runs fish shell"
     \\    ) #<#
     \\    command -f completion//parseoptions -en
     \\    case $ARGOPT in
