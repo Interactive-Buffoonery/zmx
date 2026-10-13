@@ -7,7 +7,11 @@ pub const LabelError = error{
     LabelKeyReservedName,
 };
 
-const reserved_keys = [_][]const u8{ "name", "start_dir", "cmd" };
+const reserved_keys = [_][]const u8{
+    "name",      "pid",    "clients", "created", "cwd",       "cwd_b64",
+    "start_dir", "cmd",    "cmd_b64", "ended",   "exit_code", "daemon_pid",
+    "err",       "status",
+};
 
 fn isAlnum(c: u8) bool {
     return (c >= 'a' and c <= 'z') or
@@ -142,4 +146,19 @@ test "assertLabel" {
     try std.testing.expectError(error.LabelKeyReservedName, assertLabel("name", "dev"));
     try std.testing.expectError(error.LabelKeyReservedName, assertLabel("start_dir", "dev"));
     try std.testing.expectError(error.LabelKeyReservedName, assertLabel("cmd", "dev"));
+    for (reserved_keys) |key| {
+        try std.testing.expectError(error.LabelKeyReservedName, assertLabel(key, "value"));
+    }
+}
+
+test "awesomux recovery label blob uses the accepted wire format" {
+    var iter = LabelIterator.init(
+        "awesomux.agent-kind=codex awesomux.group-id=abc123 awesomux.group-name=V29yaw",
+    );
+    var count: usize = 0;
+    while (iter.next()) |kv| {
+        try assertLabel(kv.key, kv.value);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
 }
