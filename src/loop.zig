@@ -1434,11 +1434,12 @@ pub const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        self.setPwd(term);
-        const format: util.HistoryFormat = if (payload.len > 0)
-            @enumFromInt(payload[0])
+        if (payload.len > 1) return;
+        const format: util.HistoryFormat = if (payload.len == 0)
+            .plain
         else
-            .plain;
+            std.enums.fromInt(util.HistoryFormat, payload[0]) orelse return;
+        self.setPwd(term);
         if (util.serializeTerminal(gpa, term, format)) |output| {
             defer gpa.free(output);
             try ipc.appendMessage(gpa, &client.write_buf, .History, output);
