@@ -10,6 +10,18 @@ def frame(tag, data=b''):
     return HEADER.pack(tag, len(data)) + data
 
 
+def next_frame(client):
+    while True:
+        if len(client.buf) >= 8:
+            tag, size = HEADER.unpack(client.buf[:8])
+            if len(client.buf) >= 8 + size:
+                data, client.buf = client.buf[8:8 + size], client.buf[8 + size:]
+                return tag, data
+        chunk = client.sock.recv(65536)
+        assert chunk, 'unexpected EOF'
+        client.buf += chunk
+
+
 def fixture(root):
     tty.setraw(0)
     def monitor():
@@ -75,8 +87,10 @@ def scenario(binary, kind):
             if kind == 'history':
                 for payload in (b'\xff', b'\x00\x00', b'\x03'):
                     w.send(8, payload)
-                    w.state()
-                w.send(8); w.receive(8)
+                    w.send(STATE)
+                    assert next_frame(w)[0] == STATE, 'malformed History produced a response'
+                for payload in (b'', b'\x00', b'\x01', b'\x02'):
+                    w.send(8, payload); w.receive(8)
             else:
                 typed = kind == 'typed-resize'
                 if typed:
@@ -103,6 +117,9 @@ def scenario(binary, kind):
                         assert len(records()) == 3
                         a.send(0, b'X' * 131072 + b'\n')
                         a.sock.sendall(b''.join(frame(2, struct.pack('<HH', 38, 98)) for _ in range(4100)))
+                        # A distinguishable overflow resize must be rejected, not
+                        # merely deferred or accepted by an unbounded queue.
+                        a.send(2, struct.pack('<HH', 39, 99))
                         a.state()  # same-stream barrier proves dispatch survived
                         assert geometry()[:2] == [24, 80], 'resize overtook blocked tail'
                         Path(root + '/blocked').unlink()
