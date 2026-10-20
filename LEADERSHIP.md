@@ -53,7 +53,7 @@ per-batch acknowledgment; callers must not retry ambiguous sends. A full queue
 rejects the new operation without claiming leadership.
 
 Replies are accepted only from the current interactive leader and only for the
-current epoch. Every claim, leader disconnect or leader downgrade changes the
+current epoch. Explicit takeover, leader/grid change, disconnect or leader downgrade changes the
 epoch; queued replies are checked again before forwarding. Already forwarded
 bytes cannot be withdrawn. Automation Send does not claim or resize. Watch
 attachments affect neither synthetic focus reports nor fallback DA responses.
@@ -83,7 +83,8 @@ typed and legacy coalesced input followed by resize, queued cell/pixel sizing,
 and pixel retention on subsequent input. History accepts only an empty payload
 (plain) or exactly one supported format byte; malformed requests are ignored.
 
-Reply epochs still change on every claim. Resize validity instead tracks
+Reply epochs change on explicit takeover or an actual leader/grid change.
+Resize validity separately tracks
 uninterrupted ownership: another batch by the same leader preserves its queued
 resize, while an intervening leader change, disconnect or downgrade invalidates
 it. Per-attachment pixel preferences are captured in ordered operations; missing
@@ -97,3 +98,12 @@ must remain blocked until its tail drains. The harness saturates the 4096-entry
 operation queue, checks same daemon/child liveness, verifies complete batch
 receipts after unblocking, and checks queued revocation and unsolicited Authority
 notifications. These socket checks do not replace native or device acceptance.
+
+Legacy keyboard classification accepts C0 controls except ESC, DEL and ordinary
+CSI arrows before leadership. Standalone ESC before leadership remains an
+explicit legacy limitation: it is ambiguous with a terminal reply prefix. No
+timeout or guessing heuristic elects a leader. No-leader DA fallback also runs
+with legacy followers attached. Unchanged-grid input from the same leader keeps
+the reply epoch; explicit takeover still invalidates outstanding replies.
+Watch requires acceptance within one elapsed monotonic second, independent of
+output traffic; SessionEnd before acceptance is an unsupported failure.

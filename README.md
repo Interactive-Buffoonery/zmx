@@ -119,6 +119,7 @@ Run `zmx help` for more information on usage, with examples.
 Usage: zmx <command> [args...]
 
 Commands:
+  watch <name>                            Watch an existing session (no input)
   [a]ttach [--existing] <name> [command...] Attach, creating unless --existing
   [r]un <name> [-d] [command...]           Send command without attaching
   [s]end <name> <text...>                  Send raw input to session PTY
@@ -642,3 +643,15 @@ abduco provides session management (i.e. it allows programs to be run independen
 - [zmosh](https://github.com/mmonad/zmosh) -- A fork of zmx that adds encrypted UDP auto-reconnect for remote sessions (like mosh).
 - [zmx-picker](https://github.com/EarthmanMuons/zmx-picker) -- fzf-based session picker and project launcher. Jump to a running zmx session or start one inside any of your git/jj repos.
 - [rootshell](https://github.com/kitknox/rootshell) -- Metal-accelerated terminal for iPhone, iPad, Vision Pro, and Mac. Lists active zmx sessions with live previews and can auto-attach on connect.
+
+### Diagnostic watch
+
+| Command | Behavior |
+| --- | --- |
+| `zmx watch NAME` | Watch an existing session without input or resize authority |
+
+Watch requires a daemon supporting typed attachments and fails closed after
+one second without positive acceptance. It never creates a session or falls
+back to legacy attach. Output goes to stdout and authority updates to stderr;
+Ctrl-C exits. This local diagnostic command is not a safe remote renderer.
+See [LEADERSHIP.md](LEADERSHIP.md) for the protocol and legacy limitations.

@@ -179,7 +179,7 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(session);
         const path = try socket.getSocketPath(gpa, cfg.socket_dir, session);
         defer gpa.free(path);
-        return loop.watchSession(gpa, path);
+        return loop.watchSession(gpa, io, path);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         var attach_args: std.ArrayList([]const u8) = .empty;
         defer attach_args.deinit(gpa);

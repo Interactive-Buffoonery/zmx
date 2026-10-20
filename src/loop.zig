@@ -261,7 +261,7 @@ pub fn clientLoop(
 
 /// A watch client never sends Init, stdin, focus, resize or terminal replies.
 /// No legacy fallback: an old daemon cannot acknowledge this capability.
-pub fn watchSession(gpa: std.mem.Allocator, path: []const u8) !void {
+pub fn watchSession(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !void {
     const fd = try ipc.connectSession(path);
     defer lib_posix.close(fd);
     const request = [_]u8{ 1, 1, 24, 0, 80, 0 };
@@ -270,13 +270,11 @@ pub fn watchSession(gpa: std.mem.Allocator, path: []const u8) !void {
     defer buffer.deinit();
     var polls = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
     var accepted = false;
-    var remaining: u8 = 20;
+    const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + 1000;
     while (true) {
-        const ready = try lib_posix.poll(&polls, if (accepted) -1 else 50);
-        if (!accepted) {
-            remaining -= 1;
-            if (remaining == 0) return error.WatchUnsupported;
-        }
+        const remaining = deadline - std.Io.Clock.awake.now(io).toMilliseconds();
+        if (!accepted and remaining <= 0) return error.WatchUnsupported;
+        const ready = try lib_posix.poll(&polls, if (accepted) -1 else @intCast(@min(remaining, 50)));
         if (ready == 0) continue;
         if (try buffer.read(fd) == 0) {
             if (!accepted) return error.WatchUnsupported;
@@ -308,7 +306,10 @@ pub fn watchSession(gpa: std.mem.Allocator, path: []const u8) !void {
                         std.mem.readInt(u64, msg.payload[8..16], .little),
                     });
                 },
-                .SessionEnd => return,
+                .SessionEnd => {
+                    if (!accepted) return error.WatchUnsupported;
+                    return;
+                },
                 else => {},
             }
         }
@@ -484,13 +485,10 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     daemon.setPwd(&term);
                     daemon.has_pty_output = true;
 
-                    // When no real terminal client has attached yet, respond to
-                    // terminal queries (e.g. DA1/DA2) on behalf of the terminal.
-                    // This prevents fish from waiting 10s for unanswered queries.
-                    // Legacy Init preserves its historical reply policy. Typed
-                    // followers and Watch leave fallback unchanged until a
-                    // typed interactive renderer actually claims authority.
-                    if (daemon.leader_client_fd == null and !daemon.hasTerminalClient() and
+                    // With no leader, answer DA queries even when legacy
+                    // followers are attached: their replies lack authority.
+                    // This prevents fish from waiting 10s for unanswered DA1.
+                    if (daemon.leader_client_fd == null and
                         daemon.queued_bytes < Daemon.PTY_WRITE_BUF_MAX)
                     {
                         var replies: std.ArrayList(u8) = .empty;
@@ -824,7 +822,8 @@ pub const Daemon = struct {
     pub fn closeClient(self: *Daemon, gpa: std.mem.Allocator, client: *Client, i: usize, shutdown_on_last: bool) bool {
         const fd = client.socket_fd;
         // leader is disconnected, remove ref and let another client claim leader on input
-        if (self.leader_client_fd == client.socket_fd) {
+        const was_leader = self.leader_client_fd == client.socket_fd;
+        if (was_leader) {
             std.log.info(
                 "unsetting leader session={s} fd={d}",
                 .{ self.session_name, client.socket_fd },
@@ -837,7 +836,7 @@ pub const Daemon = struct {
         client.deinit(gpa);
         gpa.destroy(client);
         _ = self.clients.orderedRemove(i);
-        self.broadcastAuthority(gpa) catch {};
+        if (was_leader) self.broadcastAuthority(gpa) catch {};
         std.log.info("client disconnected fd={d} remaining={d}", .{ fd, self.clients.items.len });
         if (shutdown_on_last and self.clients.items.len == 0) {
             self.shutdown(gpa);
@@ -1171,10 +1170,13 @@ pub const Daemon = struct {
                         continue;
                     }
                     try resizeTerm(gpa, term, op.size.cols, op.size.rows);
+                    const grid_changed = self.grid.rows != op.size.rows or self.grid.cols != op.size.cols;
                     self.grid = op.size;
                     if (op.kind != .resize) {
-                        try self.setLeader(gpa, source.?);
-                    } else {
+                        if (op.kind == .takeover or grid_changed or self.leader_client_fd != source.?.socket_fd)
+                            try self.setLeader(gpa, source.?);
+                    } else if (grid_changed) {
+                        self.authority_epoch += 1;
                         try self.broadcastAuthority(gpa);
                     }
                 }
