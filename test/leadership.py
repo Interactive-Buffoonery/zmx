@@ -127,6 +127,7 @@ def watch_queries(binary, root, env):
         sender.send(22, b'PROBE\n')
         wait(lambda: len(rows()) == 3)
         watcher.close(); clients.remove(watcher)
+        sender.send(7, struct.pack('<HH', 24, 80))
         sender.send(22, b'PROBE\n')
         wait(lambda: len(rows()) == 4)
         replies = [r['reply'] for r in rows() if 'reply' in r]
@@ -162,9 +163,46 @@ def old_daemon(binary, root):
     assert result.returncode != 0 and result.stdout == b'', result
     assert len(received) == 14 and HEADER.unpack(received[:8]) == (ATTACH, 6) and received[8:] == struct.pack('<BBHH', 1, 1, 24, 80), received
 
+def handshake_deadlines(binary, root):
+    for mode in ('busy-accept', 'early-end', 'busy-timeout'):
+        path = root + '/' + mode
+        server = socket.socket(socket.AF_UNIX); server.bind(path); server.listen()
+        errors = []
+        def serve():
+            try:
+                conn, _ = server.accept()
+                with conn:
+                    conn.recv(4096)
+                    if mode == 'early-end':
+                        conn.sendall(HEADER.pack(14, 8) + bytes(8)); return
+                    start = time.monotonic()
+                    while time.monotonic() - start < (.3 if mode == 'busy-accept' else 1.5):
+                        conn.sendall(HEADER.pack(1, 1) + b'x'); time.sleep(.003)
+                    if mode == 'busy-accept':
+                        conn.sendall(HEADER.pack(ACCEPT, 16) + struct.pack('<QQ', 1, 1))
+                        conn.sendall(HEADER.pack(1, 2) + b'OK')
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as error:
+                errors.append(repr(error))
+        thread = threading.Thread(target=serve); thread.start()
+        start = time.monotonic()
+        result = subprocess.run([binary, 'watch', mode], env=environment(root), capture_output=True, timeout=4)
+        elapsed = time.monotonic() - start
+        thread.join(2); server.close()
+        assert not thread.is_alive() and not errors, errors
+        if mode == 'busy-accept':
+            assert result.returncode == 0 and result.stdout == b'OK', result
+        else:
+            assert result.returncode != 0 and not result.stdout, result
+        if mode == 'busy-timeout':
+            assert .85 <= elapsed < 2, elapsed
+
+
 def main(binary):
     with tempfile.TemporaryDirectory(prefix='zmx-leadership-') as root:
         old_daemon(binary, root)
+        handshake_deadlines(binary, root)
         env = environment(root)
         query_receipts = watch_queries(binary, root, env)
         path, receipts = root + '/leadership', root + '/receipts'
@@ -189,8 +227,22 @@ def main(binary):
             w.op(REPLY, struct.pack('<Q', 1) + b'forbidden\n')
             w.op(TAKE, struct.pack('<HH', 50, 150))
             w.op(USER, struct.pack('<HH', 50, 150) + b'forbidden\n')
-            for tag in [0, 1, 2, 7, 9, 11, 12, 17, 19, 20, 22, 24, 4, 5]:
-                w.send(tag, b'forbidden\n')
+            b.send(19, b'guard=kept'); b.receive(10)
+            w.send(18); labels_before = w.receive(21)
+            w.send(8); history_before = w.receive(8)
+            for tag, payload in [(0, b'forbidden\n'), (1, b'INJECTED'),
+                    (2, struct.pack('<HH', 50, 150)), (7, struct.pack('<HH', 50, 150)),
+                    (9, b'forbidden\n'), (11, b'other'), (12, b'forbidden\n'),
+                    (17, struct.pack('<HH', 1234, 567)), (19, b'guard=changed'),
+                    (20, b''), (22, b'forbidden\n'), (24, b'GUARD=changed\n'), (4, b''), (5, b'')]:
+                w.send(tag, payload)
+            w.send(18); assert w.receive(21) == labels_before
+            w.send(8); assert w.receive(8) == history_before
+            b.send(STATE)
+            while True:
+                data = b.receive(STATE)
+                if data: break
+            assert not records()[1:], 'watch injected PTY input'
             w.send(SIZE, struct.pack('<QQHH', w.id, w.rev, 50, 150))
             assert w.state()[0] == 0 and w.state()[2:] == initial
             b.op(TAKE, struct.pack('<HH', 0, 80))

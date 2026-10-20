@@ -84,7 +84,25 @@ def scenario(binary, kind):
             identity = wait(records)[0]
             a = Client(root + '/regression'); clients.append(a)
             w = Client(root + '/regression'); clients.append(w); w.attach(1)
-            if kind == 'history':
+            if kind == 'controls':
+                a.send(7, struct.pack('<HH', 24, 80))
+                keys = [bytes([c]) for c in range(32) if c not in (10, 27)] + [b'\x7f'] + [b'\x1b[' + bytes([c]) for c in b'ABCD']
+                for key in keys:
+                    a.send(0, key + b'\n')
+                wait(lambda: len(records()) == len(keys) + 1)
+                assert [r['sha256'] for r in records()[1:]] == [hashlib.sha256(k).hexdigest() for k in keys]
+                assert w.state()[0] != 0
+            elif kind == 'same-leader-reply':
+                a.attach(2); a.op(TAKE, struct.pack('<HH', 24, 80))
+                epoch = wait(lambda: (v if (v := w.state())[0] == a.id else None))[1]
+                a.op(USER, struct.pack('<HH', 24, 80) + b'user\n')
+                a.op(REPLY, struct.pack('<Q', epoch) + b'reply\n')
+                wait(lambda: len(records()) == 3)
+                assert w.state()[1] == epoch
+                assert records()[-1]['sha256'] == hashlib.sha256(b'reply').hexdigest()
+                a.op(TAKE, struct.pack('<HH', 24, 80))
+                wait(lambda: w.state()[1] != epoch)
+            elif kind == 'history':
                 for payload in (b'\xff', b'\x00\x00', b'\x03'):
                     w.send(8, payload)
                     w.send(STATE)
@@ -205,7 +223,7 @@ if __name__ == '__main__':
         signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
         binary = os.path.abspath(sys.argv[1])
         report = {'binary_sha256': hashlib.sha256(Path(binary).read_bytes()).hexdigest(), 'sources': {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in [Path('src/loop.zig'), Path(__file__), Path('test/leadership.py')]}, 'scenarios': {}}
-        for kind in ['history', 'typed-resize', 'legacy-resize', 'pixels', 'saturation', 'pressure']:
+        for kind in ['controls', 'same-leader-reply', 'history', 'typed-resize', 'legacy-resize', 'pixels', 'saturation', 'pressure']:
             try:
                 report['scenarios'][kind] = pressure(binary) if kind == 'pressure' else scenario(binary, kind)
             except Exception as error:
