@@ -227,7 +227,8 @@ def main(binary):
             w.op(REPLY, struct.pack('<Q', 1) + b'forbidden\n')
             w.op(TAKE, struct.pack('<HH', 50, 150))
             w.op(USER, struct.pack('<HH', 50, 150) + b'forbidden\n')
-            b.send(19, b'guard=kept'); b.receive(10)
+            label_setup = Client(path); clients.append(label_setup)
+            label_setup.send(19, b'guard=kept'); label_setup.receive(10)
             w.send(18); labels_before = w.receive(21)
             w.send(8); history_before = w.receive(8)
             for tag, payload in [(0, b'forbidden\n'), (1, b'INJECTED'),
