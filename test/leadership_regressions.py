@@ -34,6 +34,20 @@ def fixture(root):
                 out.write(json.dumps({'bytes': len(line), 'sha256': hashlib.sha256(line).hexdigest()}) + '\n')
 
 
+def cleanup(binary, env, root):
+    subprocess.run([binary, 'kill', 'regression', '--force'], env=env, capture_output=True)
+    # A deliberately crashing pre-fix daemon cannot clean up its child.
+    records = read_receipts(root + '/receipts')
+    if records:
+        pid = records[0]['pid']
+        command = subprocess.run(['ps', '-p', str(pid), '-o', 'command='], capture_output=True, text=True).stdout
+        if root in command and '--fixture' in command:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+
 def scenario(binary, kind):
     with tempfile.TemporaryDirectory(prefix='zmx-827-regression-') as root:
         env = environment(root)
@@ -106,7 +120,7 @@ def scenario(binary, kind):
         finally:
             for client in clients:
                 client.close()
-            subprocess.run([binary, 'kill', 'regression', '--force'], env=env, capture_output=True)
+            cleanup(binary, env, root)
 
 
 def pressure(binary):
@@ -164,7 +178,7 @@ def pressure(binary):
         finally:
             for client in clients:
                 client.close()
-            subprocess.run([binary, 'kill', 'regression', '--force'], env=env, capture_output=True)
+            cleanup(binary, env, root)
 
 
 if __name__ == '__main__':
