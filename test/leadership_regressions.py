@@ -88,10 +88,33 @@ def scenario(binary, kind):
                 a.send(7, struct.pack('<HH', 24, 80))
                 keys = [bytes([c]) for c in range(32) if c not in (10, 27)] + [b'\x7f'] + [b'\x1b[' + bytes([c]) for c in b'ABCD']
                 for key in keys:
-                    a.send(0, key + b'\n')
+                    a.close(); clients.remove(a)
+                    wait(lambda: w.state()[0] == 0)
+                    a = Client(root + '/regression'); clients.append(a)
+                    a.send(7, struct.pack('<HH', 24, 80))
+                    a.send(0, key)
+                    wait(lambda: w.state()[0] != 0)
+                    a.send(22, b'\n')
                 wait(lambda: len(records()) == len(keys) + 1)
                 assert [r['sha256'] for r in records()[1:]] == [hashlib.sha256(k).hexdigest() for k in keys]
                 assert w.state()[0] != 0
+            elif kind == 'watch-effects':
+                a.send(7, struct.pack('<HH', 24, 80)); a.send(0, b'claim\n')
+                wait(lambda: len(records()) == 2)
+                a.state(); w.state()
+                a.send(19, b'guard=kept'); a.receive(10)
+                w.send(18); labels = w.receive(21)
+                w.send(8); history = w.receive(8)
+                before = geometry()
+                for tag, payload in [(1, b'INJECTED'), (11, b'other'), (19, b'guard=changed'),
+                        (20, b''), (24, b'GUARD=changed\n')]:
+                    w.send(tag, payload); w.send(STATE)
+                    assert next_frame(w)[0] == STATE, ('watch mutation response', tag)
+                    w.send(18); assert w.receive(21) == labels, tag
+                    w.send(8); assert w.receive(8) == history, tag
+                    a.send(STATE)
+                    assert next_frame(a)[0] == STATE, ('injected peer output/switch', tag)
+                assert geometry() == before and len(records()) == 2
             elif kind == 'same-leader-reply':
                 a.attach(2); a.op(TAKE, struct.pack('<HH', 24, 80))
                 epoch = wait(lambda: (v if (v := w.state())[0] == a.id else None))[1]
@@ -101,6 +124,8 @@ def scenario(binary, kind):
                 assert w.state()[1] == epoch
                 assert records()[-1]['sha256'] == hashlib.sha256(b'reply').hexdigest()
                 a.op(TAKE, struct.pack('<HH', 24, 80))
+                epoch = wait(lambda: (v[1] if (v := w.state())[1] != epoch else None))
+                a.op(SIZE, struct.pack('<HH', 25, 81))
                 wait(lambda: w.state()[1] != epoch)
             elif kind == 'history':
                 for payload in (b'\xff', b'\x00\x00', b'\x03'):
@@ -223,7 +248,7 @@ if __name__ == '__main__':
         signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
         binary = os.path.abspath(sys.argv[1])
         report = {'binary_sha256': hashlib.sha256(Path(binary).read_bytes()).hexdigest(), 'sources': {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in [Path('src/loop.zig'), Path(__file__), Path('test/leadership.py')]}, 'scenarios': {}}
-        for kind in ['controls', 'same-leader-reply', 'history', 'typed-resize', 'legacy-resize', 'pixels', 'saturation', 'pressure']:
+        for kind in ['controls', 'watch-effects', 'same-leader-reply', 'history', 'typed-resize', 'legacy-resize', 'pixels', 'saturation', 'pressure']:
             try:
                 report['scenarios'][kind] = pressure(binary) if kind == 'pressure' else scenario(binary, kind)
             except Exception as error:
