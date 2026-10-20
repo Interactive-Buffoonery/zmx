@@ -172,7 +172,8 @@ def scenario(binary, kind):
                 if kind in ('typed-resize', 'legacy-resize'):
                     wait(lambda: geometry()[:2] == [37, 97])
             # Same attached socket and original child/daemon identities survive.
-            a.send(22, b'alive\n')
+            automation = Client(root + '/regression'); clients.append(automation)
+            automation.send(22, b'alive\n')
             wait(lambda: any(r.get('sha256') == hashlib.sha256(b'alive').hexdigest() for r in records()))
             assert records()[0] == identity
             os.kill(identity['pid'], 0); os.kill(identity['daemon'], 0)
@@ -206,7 +207,8 @@ def pressure(binary):
             a.op(TAKE, struct.pack('<HH', 24, 80))
             wait(lambda: w.state()[0] == a.id)
             Path(root + '/blocked').touch()
-            a.send(22, b'block\n')
+            automation = Client(root + '/regression'); clients.append(automation)
+            automation.send(22, b'block\n')
             wait(lambda: Path(root + '/blocked-ready').exists())
             a.op(USER, struct.pack('<HH', 25, 81) + b'P' * 131072 + b'\n')
             # Observe unsolicited claim + size, with no Authority request.
