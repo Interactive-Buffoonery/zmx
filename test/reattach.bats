@@ -41,14 +41,12 @@ count() { "$ZMX" history "$1" | grep -o "$2" | wc -l | tr -d ' '; }
   [ "$(count test-da DA1_TIMEOUT)" -eq 0 ]
 }
 
-@test "daemon leaves DA1 to the client while one is attached" {
-  # The session's own command probes after a delay; a client is attached by
-  # then, so the daemon must stay quiet and (with no real terminal behind the
-  # fake client) the probe times out.
+@test "daemon answers DA1 with a leaderless legacy client attached" {
+  # Attach does not elect a leader, so the daemon supplies fallback DA1.
   "$ZMX" run test-da2 -d bash -c "sleep 1; $(da1_probe 1); sleep 30"
   wait_for_session test-da2
   fake_attach test-da2 24 80 5 &
-  wait_for_output test-da2 "DA1_TIMEOUT" 5
+  wait_for_output test-da2 "DA1_ANSWERED" 5
   kill %1 2>/dev/null || true
 }
 
