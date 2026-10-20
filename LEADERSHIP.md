@@ -75,3 +75,25 @@ contiguity, stale replies, queued reply invalidation, and queued-input downgrade
 The fixture records kernel PTY size and actual input receipts. This does not
 prove native Mac reattachment, follower layout/leader indicator, paired-device
 authorization, snapshot generations/gaps, or real TUI/VoiceOver behavior.
+
+## Queue regression checks
+
+`test/leadership_regressions.py` exercises malformed Watch History requests,
+typed and legacy coalesced input followed by resize, queued cell/pixel sizing,
+and pixel retention on subsequent input. History accepts only an empty payload
+(plain) or exactly one supported format byte; malformed requests are ignored.
+
+Reply epochs still change on every claim. Resize validity instead tracks
+uninterrupted ownership: another batch by the same leader preserves its queued
+resize, while an intervening leader change, disconnect or downgrade invalidates
+it. Per-attachment pixel preferences are captured in ordered operations; missing
+pixel preferences preserve the current kernel dimensions. Pixel updates never
+bypass queued input, and a full queue rejects the new resize without terminating
+the daemon or evicting accepted work.
+
+The regression fixture independently samples TIOCGWINSZ while its PTY reader is
+paused. A 128 KiB batch exceeds PTY capacity, so later resize/takeover barriers
+must remain blocked until its tail drains. The harness saturates the 4096-entry
+operation queue, checks same daemon/child liveness, verifies complete batch
+receipts after unblocking, and checks queued revocation and unsolicited Authority
+notifications. These socket checks do not replace native or device acceptance.
