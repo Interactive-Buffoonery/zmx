@@ -172,7 +172,8 @@ def scenario(binary, kind):
                     wait(lambda: w.state()[0] == b.id)
                 if blocked:
                     Path(root + '/blocked').touch()
-                    b.send(22, b'block\n')
+                    automation = Client(root + '/regression'); clients.append(automation)
+                    automation.send(22, b'block\n')
                     wait(lambda: Path(root + '/blocked-ready').exists())
                     b.op(USER, struct.pack('<HH', 25, 81) + b'P' * 131072 + b'\n')
                     wait(lambda: geometry()[:2] == [25, 81])
