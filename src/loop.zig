@@ -692,6 +692,8 @@ pub const Client = struct {
     role: AttachmentRole = .pending,
     attachment_id: u64 = 0,
     revision: u64 = 1,
+    applied_claim: u64 = 0,
+    claim_ownership_epoch: u64 = 0,
     requested: ipc.Resize = .{ .rows = 24, .cols = 80 },
     requested_pixels: ?ipc.ResizePixels = null,
     is_terminal: bool = false, // sent .Init (a `zmx attach`), not a run/send/tail client
@@ -729,6 +731,7 @@ pub const Daemon = struct {
     operations: std.ArrayList(Operation) = .empty,
     queued_bytes: usize = 0,
     next_attachment_id: u64 = 1,
+    next_operation_id: u64 = 1,
     authority_epoch: u64 = 1,
     ownership_epoch: u64 = 1,
     grid: ipc.Resize = .{ .rows = 24, .cols = 80 },
@@ -1013,6 +1016,8 @@ pub const Daemon = struct {
     }
 
     const Operation = struct {
+        id: u64 = 0,
+        after_claim: ?u64 = null,
         kind: enum { automation, user, reply, takeover, resize } = .automation,
         source: u64 = 0,
         revision: u64 = 0,
@@ -1114,7 +1119,10 @@ pub const Daemon = struct {
         if (tag != .UserBatch and payload.len != 20) return;
         if (tag == .UserBatch and payload.len == 20) return;
         client.requested = size;
-        if (tag == .RequestedSize and self.leader_client_fd != client.socket_fd) return;
+        if (tag == .RequestedSize) {
+            try self.queueResize(gpa, client);
+            return;
+        }
         try self.queueOperation(gpa, .{ .kind = if (tag == .UserBatch) .user else if (tag == .TakeOver) .takeover else .resize, .source = client.attachment_id, .revision = client.revision, .epoch = self.authority_epoch, .ownership_epoch = self.ownership_epoch, .pixels = client.requested_pixels, .size = size, .data = if (tag == .UserBatch) payload[20..] else "" });
     }
 
@@ -1123,8 +1131,27 @@ pub const Daemon = struct {
         try self.operations.ensureUnusedCapacity(gpa, 1);
         var op = value;
         op.data = try gpa.dupe(u8, value.data);
+        op.id = self.next_operation_id;
+        self.next_operation_id += 1;
         self.operations.appendAssumeCapacity(op);
         self.queued_bytes += op.data.len;
+    }
+
+    fn queueResize(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+        var after_claim: ?u64 = null;
+        var i = self.operations.items.len;
+        while (i > 0) {
+            i -= 1;
+            const op = self.operations.items[i];
+            if (op.source == client.attachment_id and op.revision == client.revision and
+                (op.kind == .user or op.kind == .takeover) and !op.started)
+            {
+                after_claim = op.id;
+                break;
+            }
+        }
+        if (after_claim == null and self.leader_client_fd != client.socket_fd) return;
+        try self.queueOperation(gpa, .{ .kind = .resize, .source = client.attachment_id, .revision = client.revision, .ownership_epoch = self.ownership_epoch, .after_claim = after_claim, .pixels = client.requested_pixels, .size = client.requested, .data = "" });
     }
 
     fn removeOperation(self: *Daemon, gpa: std.mem.Allocator, index: usize) void {
@@ -1148,7 +1175,9 @@ pub const Daemon = struct {
             for (self.clients.items) |c| {
                 if (c.attachment_id == op.source and c.revision == op.revision and c.role != .watch) source = c;
             }
-            if ((op.source != 0 and source == null) or (op.kind == .reply and op.epoch != self.authority_epoch) or (op.kind == .resize and (source == null or self.leader_client_fd != source.?.socket_fd or op.ownership_epoch != self.ownership_epoch))) {
+            const resize_valid = if (source) |c| self.leader_client_fd == c.socket_fd and
+                (if (op.after_claim) |claim| c.applied_claim == claim and c.claim_ownership_epoch == self.ownership_epoch else op.ownership_epoch == self.ownership_epoch) else false;
+            if ((op.source != 0 and source == null) or (op.kind == .reply and op.epoch != self.authority_epoch) or (op.kind == .resize and !resize_valid)) {
                 self.removeOperation(gpa, 0);
                 continue;
             }
@@ -1178,6 +1207,11 @@ pub const Daemon = struct {
                     } else if (grid_changed) {
                         self.authority_epoch += 1;
                         try self.broadcastAuthority(gpa);
+                    }
+                    if (op.kind == .user or op.kind == .takeover) {
+                        // A following resize belongs to this ordered claim, not its receipt-time leader.
+                        source.?.applied_claim = op.id;
+                        source.?.claim_ownership_epoch = self.ownership_epoch;
                     }
                 }
                 op.started = true;
@@ -1347,17 +1381,14 @@ pub const Daemon = struct {
         const size = std.mem.bytesToValue(ipc.Resize, payload);
         if (!validSize(size)) return;
         client.requested = size;
-        if (self.leader_client_fd == client.socket_fd) {
-            try self.queueOperation(gpa, .{ .kind = .resize, .source = client.attachment_id, .revision = client.revision, .epoch = self.authority_epoch, .ownership_epoch = self.ownership_epoch, .pixels = client.requested_pixels, .size = size, .data = "" });
-        }
+        try self.queueResize(gpa, client);
     }
 
     pub fn handleResizePixels(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
         if (payload.len != @sizeOf(ipc.ResizePixels)) return;
         const pixels = std.mem.bytesToValue(ipc.ResizePixels, payload);
         client.requested_pixels = pixels;
-        if (self.leader_client_fd != client.socket_fd) return;
-        try self.queueOperation(gpa, .{ .kind = .resize, .source = client.attachment_id, .revision = client.revision, .ownership_epoch = self.ownership_epoch, .size = client.requested, .pixels = pixels, .data = "" });
+        try self.queueResize(gpa, client);
     }
 
     pub fn handleDetach(self: *Daemon, gpa: std.mem.Allocator, client: *Client, i: usize) void {
