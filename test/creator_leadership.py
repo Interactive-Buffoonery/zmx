@@ -74,6 +74,20 @@ def scenario(binary, kind, typed=False):
                 assert watcher.state()[0] == 0 and geometry() == initial
                 # A malformed terminal handshake must not consume creation.
                 invalid = client(); invalid.send(7, struct.pack('<HH', 0, 80)); invalid.state()
+            if kind.startswith('automation-') or kind == 'run-before-creator':
+                automation = client()
+                before = watcher.state()
+                tag = {'automation-send': 22, 'automation-output': 1,
+                       'automation-write': 12, 'run-before-creator': 9}[kind]
+                automation.send(tag)
+                assert watcher.state() == before, ('automation claimed', kind)
+                assert geometry() == initial, ('automation resized', kind)
+                # Init remains compatible, but cannot restore creation eligibility.
+                for attempt in range(2):
+                    automation.send(7, struct.pack('<HH', 60, 160))
+                    automation.send(2, struct.pack('<HH', 60, 160))
+                    assert automation.state() == before, ('automation Init claimed', kind, attempt)
+                    assert geometry() == initial, ('automation Init resized', kind, attempt)
             creator = client()
             if typed:
                 creator.attach(2)
@@ -82,7 +96,7 @@ def scenario(binary, kind, typed=False):
             state = creator.state()
             if kind != 'watch-first':
                 watcher.attach(1)
-            if kind == 'task':
+            if kind in ('task', 'run-before-creator'):
                 assert state[0] == 0, ('task attach claimed', state)
                 (creator.op(SIZE, struct.pack('<HH', 37, 97)) if typed else creator.send(2, struct.pack('<HH', 37, 97))); creator.state()
                 assert geometry() == initial, 'task attach resized'
@@ -91,6 +105,9 @@ def scenario(binary, kind, typed=False):
                 if typed:
                     assert state[0] == creator.id, state
                 epoch = state[1]
+                if kind.startswith('automation-'):
+                    assert state[1:] == (before[1] + 1, *before[2:]), ('creator authority/grid', state, before)
+                    assert geometry() == initial, 'creator handshake changed spawn grid'
                 if kind in ('settle', 'replies', 'reattach', 'watch-first'):
                     # Coalesced cells + pixels must use the existing ordered path.
                     if typed:
@@ -130,6 +147,12 @@ def scenario(binary, kind, typed=False):
                             replacement.attach(2, 60, 160)
                         assert replacement.state()[0] == 0, 'reattach claimed'
                         assert geometry() == settled, 'reattach resized'
+            if kind.startswith('automation-'):
+                # The converted legacy terminal can still claim through real input.
+                automation.send(0, b'normal-user')
+                wait(lambda: received() == b'normal-user')
+                assert watcher.state()[0] != state[0], 'converted user input did not claim'
+                assert geometry()[:2] == [60, 160], 'converted user input lost requested grid'
             data = received()
             return {'scenario': kind, 'typed': typed, 'result': 'pass', 'initial': initial,
                     'final': geometry(), 'authority': watcher.state(), 'bytes_hex': data.hex(),
@@ -150,7 +173,8 @@ def scenario(binary, kind, typed=False):
 
 def scenarios(binary):
     results = []
-    for kind in ('settle', 'replies', 'yields', 'reattach', 'task', 'watch-first'):
+    for kind in ('settle', 'replies', 'yields', 'reattach', 'task', 'watch-first',
+                 'automation-send', 'automation-output', 'automation-write', 'run-before-creator'):
         for typed in (False, True):
             try:
                 results.append(scenario(binary, kind, typed))
