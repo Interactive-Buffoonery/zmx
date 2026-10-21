@@ -337,6 +337,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
 
     const init_size = ipc.getTerminalSize(pty_fd);
     daemon.grid = .{ .rows = init_size.rows, .cols = init_size.cols };
+    daemon.creator_pending = !daemon.is_task_mode;
     var term = try initTerminal(gpa, io, init_size, daemon.cfg);
     defer term.deinit(gpa);
     var vt_stream = term.vtStream();
@@ -740,6 +741,7 @@ pub const Daemon = struct {
     // This control which client is the leader.  The leader controls terminal state and
     // cols/rows of session.
     leader_client_fd: ?i32 = null,
+    creator_pending: bool = false,
     running: bool = true,
     pid: i32 = undefined,
     command: ?[]const []const u8 = null,
@@ -1081,6 +1083,7 @@ pub const Daemon = struct {
             std.mem.writeInt(u64, accepted[0..8], client.attachment_id, .little);
             std.mem.writeInt(u64, accepted[8..16], client.revision, .little);
             try ipc.appendMessage(gpa, &client.write_buf, .AttachAccepted, &accepted);
+            if (client.role == .interactive) try self.claimCreation(gpa, client);
             try self.authority(gpa, client);
             if (util.serializeTerminalState(gpa, term)) |snapshot| {
                 defer gpa.free(snapshot);
@@ -1228,6 +1231,14 @@ pub const Daemon = struct {
         }
     }
 
+    fn claimCreation(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+        if (!self.creator_pending) return;
+        self.creator_pending = false;
+        // ponytail: creation belongs to the first valid terminal handshake on
+        // this fresh daemon. Watch and automation never consume that right.
+        try self.setLeader(gpa, client);
+    }
+
     fn setLeader(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
         std.log.info("setting new leader client_fd={d}", .{client.socket_fd});
         if (self.leader_client_fd != client.socket_fd) self.ownership_epoch += 1;
@@ -1336,6 +1347,7 @@ pub const Daemon = struct {
         client.role = .legacy;
         client.is_terminal = true;
         client.requested = resize;
+        try self.claimCreation(gpa, client);
 
         // Only serialize on re-attach (has_had_client), not first attach, to avoid
         // interfering with shell initialization (DA1 queries, etc.)
@@ -1513,6 +1525,7 @@ pub const Daemon = struct {
         self.task_exit_code = null;
         self.task_ended_at = null;
         self.is_task_mode = true;
+        self.creator_pending = false;
         self.task_id = util.generateTaskId(io);
 
         if (payload.len == 0) return;
