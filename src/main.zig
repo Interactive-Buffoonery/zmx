@@ -171,6 +171,15 @@ pub fn main(init: std.process.Init) !void {
         const sesh = try socket.getSeshName(gpa, session_name);
         defer gpa.free(sesh);
         return cwdCommand(gpa, io, &cfg, sesh);
+    } else if (std.mem.eql(u8, cmd, "watch")) {
+        const name = args.next() orelse return error.SessionNameRequired;
+        if (detectHelp(name)) return help(io);
+        if (args.next() != null) return error.UnexpectedArgument;
+        const session = try socket.getSeshName(gpa, name);
+        defer gpa.free(session);
+        const path = try socket.getSocketPath(gpa, cfg.socket_dir, session);
+        defer gpa.free(path);
+        return loop.watchSession(gpa, io, path);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         var attach_args: std.ArrayList([]const u8) = .empty;
         defer attach_args.deinit(gpa);
@@ -538,6 +547,7 @@ fn help(io: std.Io) !void {
         \\Commands:
         \\  [a]ttach [--existing] [--labels kv] <name> [command...]
         \\                                                Attach, creating unless --existing
+        \\  watch <name>                              Watch an existing session (no input)
         \\  [r]un <name> [-d] [command...]              Send command without attaching
         \\  [s]end <name> <text...>                     Send raw input to session PTY
         \\  [p]rint <name> <text...>                    Inject text into session display

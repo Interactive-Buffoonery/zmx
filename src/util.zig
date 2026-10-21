@@ -744,6 +744,8 @@ pub fn isUserInput(payload: []const u8) bool {
             }
         }
 
+        // Replies start with ESC; bare C0 controls and DEL are keyboard input.
+        if (i == 0 and ((payload[i] < 0x20 and payload[i] != 0x1b) or payload[i] == 0x7f)) return true;
         const actions = parser.next(payload[i]);
         for (actions) |action_opt| {
             const action = action_opt orelse continue;
@@ -757,8 +759,17 @@ pub fn isUserInput(payload: []const u8) bool {
                     // query, not a key press; skip it and keep scanning the payload
                     const status_reply = csi.final == 'u' and csi.intermediates.len > 0 and csi.intermediates[0] == '?';
                     if (!status_reply and (csi.final == 'u' or csi.final == '~')) return true;
-                    // modified arrow keys (e.g., Ctrl+F sends CSI 1;5C in legacy mode)
-                    if (csi.final >= 'A' and csi.final <= 'D' and csi.params.len > 1) return true;
+                    // Ordinary and modified CSI arrows are keyboard input.
+                    if (csi.final >= 'A' and csi.final <= 'D' and csi.intermediates.len == 0) return true;
+                    if (csi.intermediates.len == 0) {
+                        if (csi.final == 'Z' and csi.params.len == 0) return true;
+                        if (csi.final == 'H' or csi.final == 'F') {
+                            // Home/End use no params or 1;<modifier>, unlike cursor positioning.
+                            if (csi.params.len == 0 or
+                                (csi.params.len == 2 and csi.params[0] == 1 and
+                                    csi.params[1] >= 1 and !csi.params_sep.isSet(0))) return true;
+                        }
+                    }
                     // mouse events: CSI M (basic) or CSI < (SGR extended) - EXCLUDE these
                     // only intentional keyboard input should trigger leader switch
                     if (csi.final == 'M' or csi.final == '<') return false;

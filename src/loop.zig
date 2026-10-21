@@ -259,6 +259,63 @@ pub fn clientLoop(
     }
 }
 
+/// A watch client never sends Init, stdin, focus, resize or terminal replies.
+/// No legacy fallback: an old daemon cannot acknowledge this capability.
+pub fn watchSession(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    const fd = try ipc.connectSession(path);
+    defer lib_posix.close(fd);
+    const request = [_]u8{ 1, 1, 24, 0, 80, 0 };
+    try ipc.send(fd, .AttachRole, &request);
+    var buffer = try ipc.SocketBuffer.init(gpa);
+    defer buffer.deinit();
+    var polls = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+    var accepted = false;
+    const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + 1000;
+    while (true) {
+        const remaining = deadline - std.Io.Clock.awake.now(io).toMilliseconds();
+        if (!accepted and remaining <= 0) return error.WatchUnsupported;
+        const ready = try lib_posix.poll(&polls, if (accepted) -1 else @intCast(@min(remaining, 50)));
+        if (ready == 0) continue;
+        if (try buffer.read(fd) == 0) {
+            if (!accepted) return error.WatchUnsupported;
+            return;
+        }
+        while (buffer.next()) |msg| {
+            switch (msg.header.tag) {
+                .AttachAccepted => {
+                    if (msg.payload.len != 16) return error.WatchUnsupported;
+                    accepted = true;
+                },
+                .Output => {
+                    // Busy legacy daemons can broadcast before the handshake.
+                    // Do not render anything until capability acceptance.
+                    if (!accepted) continue;
+                    var offset: usize = 0;
+                    while (offset < msg.payload.len) {
+                        const n = try lib_posix.write(lib_posix.STDOUT_FILENO, msg.payload[offset..]);
+                        if (n == 0) return error.BrokenPipe;
+                        offset += n;
+                    }
+                },
+                .Authority => {
+                    if (!accepted or msg.payload.len != 20) return error.WatchUnsupported;
+                    std.debug.print("watch: leader={d} grid={d}x{d} epoch={d}\n", .{
+                        std.mem.readInt(u64, msg.payload[0..8], .little),
+                        std.mem.readInt(u16, msg.payload[18..20], .little),
+                        std.mem.readInt(u16, msg.payload[16..18], .little),
+                        std.mem.readInt(u64, msg.payload[8..16], .little),
+                    });
+                },
+                .SessionEnd => {
+                    if (!accepted) return error.WatchUnsupported;
+                    return;
+                },
+                else => {},
+            }
+        }
+    }
+}
+
 fn initTerminal(gpa: std.mem.Allocator, io: std.Io, size: ipc.TerminalSize, cfg: *const Cfg) !ghostty_vt.Terminal {
     return ghostty_vt.Terminal.init(io, gpa, .{
         .cols = size.cols,
@@ -279,6 +336,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
     defer poll_fds.deinit(gpa);
 
     const init_size = ipc.getTerminalSize(pty_fd);
+    daemon.grid = .{ .rows = init_size.rows, .cols = init_size.cols };
     var term = try initTerminal(gpa, io, init_size, daemon.cfg);
     defer term.deinit(gpa);
     var vt_stream = term.vtStream();
@@ -293,6 +351,10 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
     var had_terminal_client = daemon.hasTerminalClient();
 
     daemon_loop: while (daemon.running) {
+        // The PTY is nonblocking. Empty takeover/resize barriers must run even
+        // when its input buffer is full; a partial batch still holds the head.
+        try daemon.flushOperations(gpa, pty_fd, &term);
+
         // If the program asked for focus reports (DECSET 1004), send focus-out
         // when the last attached client leaves and focus-in when one returns,
         // as a terminal would when its window loses/gains focus.
@@ -311,7 +373,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
         });
 
         var pty_events: i16 = lib_posix.POLL.IN;
-        if (daemon.pty_write_buf.items.len > 0) {
+        if (daemon.operations.items.len > 0) {
             pty_events |= lib_posix.POLL.OUT;
         }
         try poll_fds.append(gpa, .{
@@ -360,9 +422,11 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             client.* = Client{
                 .alloc = gpa,
                 .socket_fd = client_fd,
+                .attachment_id = daemon.next_attachment_id,
                 .read_buf = try ipc.SocketBuffer.init(gpa),
                 .write_buf = undefined,
             };
+            daemon.next_attachment_id += 1;
             // 64KB initial capacity lets ~15 broadcast cycles (N_TTY_BUF_SIZE reads
             // * header) accumulate before the first ArrayList growth. The write
             // buffer is userspace-only: it drains via POLLOUT to the client socket,
@@ -421,15 +485,18 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     daemon.setPwd(&term);
                     daemon.has_pty_output = true;
 
-                    // When no real terminal client has attached yet, respond to
-                    // terminal queries (e.g. DA1/DA2) on behalf of the terminal.
-                    // This prevents fish from waiting 10s for unanswered queries.
-                    // Only clients that sent .Init (a real zmx attach) count,
-                    // not a `zmx run` tail-only client.
-                    if (!daemon.hasTerminalClient() and
-                        daemon.pty_write_buf.items.len < Daemon.PTY_WRITE_BUF_MAX)
+                    // With no leader, answer DA queries even when legacy
+                    // followers are attached: their replies lack authority.
+                    // This prevents fish from waiting 10s for unanswered DA1.
+                    if (daemon.leader_client_fd == null and
+                        daemon.queued_bytes < Daemon.PTY_WRITE_BUF_MAX)
                     {
-                        util.respondToDeviceAttributes(gpa, &daemon.pty_write_buf, buf[0..n]);
+                        var replies: std.ArrayList(u8) = .empty;
+                        defer replies.deinit(gpa);
+                        util.respondToDeviceAttributes(gpa, &replies, buf[0..n]);
+                        if (replies.items.len > 0) {
+                            daemon.queueOperation(gpa, .{ .kind = .reply, .epoch = daemon.authority_epoch, .data = replies.items }) catch {};
+                        }
                     }
 
                     // In run mode, scan output for exit code marker. The marker
@@ -482,17 +549,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
         }
 
         if (poll_fds.items[1].revents & lib_posix.POLL.OUT != 0) {
-            while (daemon.pty_write_buf.items.len > 0) {
-                const n = lib_posix.write(pty_fd, daemon.pty_write_buf.items) catch |err| {
-                    if (err != error.WouldBlock) {
-                        std.log.warn("pty write failed: {s}", .{@errorName(err)});
-                        daemon.pty_write_buf.clearRetainingCapacity();
-                    }
-                    break;
-                };
-                if (n == 0) break;
-                daemon.pty_write_buf.replaceRange(gpa, 0, n, &[_]u8{}) catch unreachable;
-            }
+            try daemon.flushOperations(gpa, pty_fd, &term);
         }
 
         var i: usize = daemon.clients.items.len;
@@ -531,14 +588,31 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 }
 
                 while (client.read_buf.next()) |msg| {
+                    if (!daemon.allowed(client, msg.header.tag)) continue;
+                    if (client.role == .pending) {
+                        switch (msg.header.tag) {
+                            .Send, .Run, .Write, .Output => client.role = .automation,
+                            else => {},
+                        }
+                    }
                     switch (msg.header.tag) {
-                        .Input => try daemon.handleInput(gpa, client, &term, msg.payload),
+                        .AttachRole, .Authority, .UserBatch, .TerminalReply, .TakeOver, .RequestedSize, .Downgrade => daemon.handleTyped(gpa, client, &term, msg.header.tag, msg.payload) catch |err| {
+                            if (err != error.InputQueueFull) return err;
+                            std.log.warn("typed operation rejected: queue full", .{});
+                        },
+                        .Input => daemon.handleInput(gpa, client, &term, msg.payload) catch |err| {
+                            if (err != error.InputQueueFull) return err;
+                        },
                         .Send => daemon.handleSend(gpa, msg.payload),
                         .Output => try daemon.handleOutput(gpa, msg.payload, &term, &vt_stream),
                         .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
                         .Switch => try daemon.handleSwitch(gpa, msg.payload),
-                        .Resize => try daemon.handleResize(gpa, client, pty_fd, &term, msg.payload),
-                        .ResizePixels => daemon.handleResizePixels(client, pty_fd, msg.payload),
+                        .Resize => daemon.handleResize(gpa, client, pty_fd, &term, msg.payload) catch |err| {
+                            if (err != error.InputQueueFull) return err;
+                        },
+                        .ResizePixels => daemon.handleResizePixels(gpa, client, msg.payload) catch |err| {
+                            if (err != error.InputQueueFull) return err;
+                        },
                         .Detach => {
                             daemon.handleDetach(gpa, client, i);
                             break :clients_loop;
@@ -560,7 +634,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
                         .CwdQuery => try daemon.handleCwd(gpa, client),
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
-                        .Ack, .TaskComplete, .LabelData, .EnvData, .SessionEnd, .CwdResponse => {},
+                        .Ack, .AttachAccepted, .TaskComplete, .LabelData, .EnvData, .SessionEnd, .CwdResponse => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
@@ -606,6 +680,8 @@ const ClientResult = struct {
     cwd: ?[]const u8 = null,
 };
 
+const AttachmentRole = enum { pending, legacy, watch, interactive, automation };
+
 /// Client represents each terminal that has connected to a session.
 ///
 /// Multiple Clients can connect to a single session.
@@ -613,6 +689,13 @@ pub const Client = struct {
     alloc: std.mem.Allocator,
     socket_fd: i32,
     has_pending_output: bool = false,
+    role: AttachmentRole = .pending,
+    attachment_id: u64 = 0,
+    revision: u64 = 1,
+    applied_claim: u64 = 0,
+    claim_ownership_epoch: u64 = 0,
+    requested: ipc.Resize = .{ .rows = 24, .cols = 80 },
+    requested_pixels: ?ipc.ResizePixels = null,
     is_terminal: bool = false, // sent .Init (a `zmx attach`), not a run/send/tail client
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
@@ -645,7 +728,13 @@ pub const Daemon = struct {
     session_name: []const u8,
     socket_path: []const u8,
     // === opt ===
-    pty_write_buf: std.ArrayList(u8) = .empty,
+    operations: std.ArrayList(Operation) = .empty,
+    queued_bytes: usize = 0,
+    next_attachment_id: u64 = 1,
+    next_operation_id: u64 = 1,
+    authority_epoch: u64 = 1,
+    ownership_epoch: u64 = 1,
+    grid: ipc.Resize = .{ .rows = 24, .cols = 80 },
     clients: std.ArrayList(*Client) = .empty,
     labels: std.StringHashMapUnmanaged([]u8) = .empty,
     // This control which client is the leader.  The leader controls terminal state and
@@ -698,7 +787,8 @@ pub const Daemon = struct {
             gpa.free(entry.value_ptr.*);
         }
         self.labels.deinit(gpa);
-        self.pty_write_buf.deinit(gpa);
+        for (self.operations.items) |op| gpa.free(op.data);
+        self.operations.deinit(gpa);
         gpa.free(self.socket_path);
     }
 
@@ -727,7 +817,7 @@ pub const Daemon = struct {
     /// True while a client that sent .Init (a real `zmx attach`) is connected.
     fn hasTerminalClient(self: *const Daemon) bool {
         for (self.clients.items) |c| {
-            if (c.is_terminal) return true;
+            if (c.is_terminal and c.role != .watch) return true;
         }
         return false;
     }
@@ -735,16 +825,21 @@ pub const Daemon = struct {
     pub fn closeClient(self: *Daemon, gpa: std.mem.Allocator, client: *Client, i: usize, shutdown_on_last: bool) bool {
         const fd = client.socket_fd;
         // leader is disconnected, remove ref and let another client claim leader on input
-        if (self.leader_client_fd == client.socket_fd) {
+        const was_leader = self.leader_client_fd == client.socket_fd;
+        if (was_leader) {
             std.log.info(
                 "unsetting leader session={s} fd={d}",
                 .{ self.session_name, client.socket_fd },
             );
             self.leader_client_fd = null;
+            self.ownership_epoch += 1;
+            self.authority_epoch += 1;
         }
+        self.dropSource(gpa, client.attachment_id);
         client.deinit(gpa);
         gpa.destroy(client);
         _ = self.clients.orderedRemove(i);
+        if (was_leader) self.broadcastAuthority(gpa) catch {};
         std.log.info("client disconnected fd={d} remaining={d}", .{ fd, self.clients.items.len });
         if (shutdown_on_last and self.clients.items.len == 0) {
             self.shutdown(gpa);
@@ -920,13 +1015,225 @@ pub const Daemon = struct {
         return true;
     }
 
+    const Operation = struct {
+        id: u64 = 0,
+        after_claim: ?u64 = null,
+        kind: enum { automation, user, reply, takeover, resize } = .automation,
+        source: u64 = 0,
+        revision: u64 = 0,
+        epoch: u64 = 0,
+        ownership_epoch: u64 = 0,
+        pixels: ?ipc.ResizePixels = null,
+        size: ipc.Resize = .{ .rows = 24, .cols = 80 },
+        data: []const u8,
+        offset: usize = 0,
+        started: bool = false,
+    };
+
+    fn validSize(size: ipc.Resize) bool {
+        return size.rows > 0 and size.cols > 0 and size.rows <= 4096 and size.cols <= 4096;
+    }
+
+    fn allowed(self: *Daemon, client: *Client, tag: ipc.Tag) bool {
+        _ = self;
+        if (client.role == .watch) return switch (tag) {
+            .Authority, .Info, .History, .CwdQuery, .LabelGet, .Detach => true,
+            else => false,
+        };
+        if (client.role == .interactive) return switch (tag) {
+            .Authority, .UserBatch, .TerminalReply, .TakeOver, .RequestedSize, .Downgrade, .Info, .History, .CwdQuery, .LabelGet, .Detach => true,
+            else => false,
+        };
+        if (client.role == .automation and tag == .AttachRole) return false;
+        return tag != .UserBatch and tag != .TerminalReply and tag != .TakeOver and tag != .RequestedSize and tag != .Downgrade;
+    }
+
+    fn authority(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+        var bytes: [20]u8 = undefined;
+        const leader = self.getLeaderClient();
+        std.mem.writeInt(u64, bytes[0..8], if (leader) |c| c.attachment_id else 0, .little);
+        std.mem.writeInt(u64, bytes[8..16], self.authority_epoch, .little);
+        std.mem.writeInt(u16, bytes[16..18], self.grid.rows, .little);
+        std.mem.writeInt(u16, bytes[18..20], self.grid.cols, .little);
+        try ipc.appendMessage(gpa, &client.write_buf, .Authority, &bytes);
+        client.has_pending_output = true;
+    }
+
+    fn broadcastAuthority(self: *Daemon, gpa: std.mem.Allocator) !void {
+        for (self.clients.items) |c| {
+            if (c.role == .watch or c.role == .interactive) try self.authority(gpa, c);
+        }
+    }
+
+    fn handleTyped(self: *Daemon, gpa: std.mem.Allocator, client: *Client, term: *ghostty_vt.Terminal, tag: ipc.Tag, payload: []const u8) !void {
+        if (tag == .Authority) {
+            if (payload.len == 0) try self.authority(gpa, client);
+            return;
+        }
+        if (tag == .AttachRole) {
+            if (client.role != .pending or payload.len != 6 or payload[0] != 1) return;
+            if (payload[1] != 1 and payload[1] != 2) return;
+            const size = ipc.Resize{ .rows = std.mem.readInt(u16, payload[2..4], .little), .cols = std.mem.readInt(u16, payload[4..6], .little) };
+            if (!validSize(size)) return;
+            client.role = if (payload[1] == 1) .watch else .interactive;
+            client.requested = size;
+            var accepted: [16]u8 = undefined;
+            std.mem.writeInt(u64, accepted[0..8], client.attachment_id, .little);
+            std.mem.writeInt(u64, accepted[8..16], client.revision, .little);
+            try ipc.appendMessage(gpa, &client.write_buf, .AttachAccepted, &accepted);
+            try self.authority(gpa, client);
+            if (util.serializeTerminalState(gpa, term)) |snapshot| {
+                defer gpa.free(snapshot);
+                const restored = util.rewritePromptRedraw(gpa, snapshot) orelse snapshot;
+                defer if (restored.ptr != snapshot.ptr) gpa.free(restored);
+                try ipc.appendMessage(gpa, &client.write_buf, .Output, restored);
+            }
+            self.has_had_client = true;
+            return;
+        }
+        if (payload.len < 16 or client.role != .interactive) return;
+        if (std.mem.readInt(u64, payload[0..8], .little) != client.attachment_id or std.mem.readInt(u64, payload[8..16], .little) != client.revision) return;
+        if (tag == .Downgrade) {
+            if (payload.len != 16) return;
+            client.role = .watch;
+            client.revision += 1;
+            self.dropSource(gpa, client.attachment_id);
+            if (self.leader_client_fd == client.socket_fd) {
+                self.leader_client_fd = null;
+                self.ownership_epoch += 1;
+                self.authority_epoch += 1;
+            }
+            try self.broadcastAuthority(gpa);
+            return;
+        }
+        if (tag == .TerminalReply) {
+            if (payload.len <= 24 or self.leader_client_fd != client.socket_fd) return;
+            const epoch = std.mem.readInt(u64, payload[16..24], .little);
+            if (epoch != self.authority_epoch) return;
+            try self.queueOperation(gpa, .{ .kind = .reply, .source = client.attachment_id, .revision = client.revision, .epoch = epoch, .data = payload[24..] });
+            return;
+        }
+        if (payload.len < 20) return;
+        const size = ipc.Resize{ .rows = std.mem.readInt(u16, payload[16..18], .little), .cols = std.mem.readInt(u16, payload[18..20], .little) };
+        if (!validSize(size)) return;
+        if (tag != .UserBatch and payload.len != 20) return;
+        if (tag == .UserBatch and payload.len == 20) return;
+        client.requested = size;
+        if (tag == .RequestedSize) {
+            try self.queueResize(gpa, client);
+            return;
+        }
+        try self.queueOperation(gpa, .{ .kind = if (tag == .UserBatch) .user else if (tag == .TakeOver) .takeover else .resize, .source = client.attachment_id, .revision = client.revision, .epoch = self.authority_epoch, .ownership_epoch = self.ownership_epoch, .pixels = client.requested_pixels, .size = size, .data = if (tag == .UserBatch) payload[20..] else "" });
+    }
+
+    fn queueOperation(self: *Daemon, gpa: std.mem.Allocator, value: Operation) !void {
+        if (self.queued_bytes + value.data.len > PTY_WRITE_BUF_MAX or self.operations.items.len >= 4096) return error.InputQueueFull;
+        try self.operations.ensureUnusedCapacity(gpa, 1);
+        var op = value;
+        op.data = try gpa.dupe(u8, value.data);
+        op.id = self.next_operation_id;
+        self.next_operation_id += 1;
+        self.operations.appendAssumeCapacity(op);
+        self.queued_bytes += op.data.len;
+    }
+
+    fn queueResize(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+        var after_claim: ?u64 = null;
+        var i = self.operations.items.len;
+        while (i > 0) {
+            i -= 1;
+            const op = self.operations.items[i];
+            if (op.source == client.attachment_id and op.revision == client.revision and
+                (op.kind == .user or op.kind == .takeover) and !op.started)
+            {
+                after_claim = op.id;
+                break;
+            }
+        }
+        if (after_claim == null and self.leader_client_fd != client.socket_fd) return;
+        try self.queueOperation(gpa, .{ .kind = .resize, .source = client.attachment_id, .revision = client.revision, .ownership_epoch = self.ownership_epoch, .after_claim = after_claim, .pixels = client.requested_pixels, .size = client.requested, .data = "" });
+    }
+
+    fn removeOperation(self: *Daemon, gpa: std.mem.Allocator, index: usize) void {
+        const op = self.operations.orderedRemove(index);
+        self.queued_bytes -= op.data.len;
+        gpa.free(op.data);
+    }
+
+    fn dropSource(self: *Daemon, gpa: std.mem.Allocator, source: u64) void {
+        var i = self.operations.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.operations.items[i].source == source) self.removeOperation(gpa, i);
+        }
+    }
+
+    fn flushOperations(self: *Daemon, gpa: std.mem.Allocator, fd: i32, term: *ghostty_vt.Terminal) !void {
+        while (self.operations.items.len > 0) {
+            const op = &self.operations.items[0];
+            var source: ?*Client = null;
+            for (self.clients.items) |c| {
+                if (c.attachment_id == op.source and c.revision == op.revision and c.role != .watch) source = c;
+            }
+            const resize_valid = if (source) |c| self.leader_client_fd == c.socket_fd and
+                (if (op.after_claim) |claim| c.applied_claim == claim and c.claim_ownership_epoch == self.ownership_epoch else op.ownership_epoch == self.ownership_epoch) else false;
+            if ((op.source != 0 and source == null) or (op.kind == .reply and op.epoch != self.authority_epoch) or (op.kind == .resize and !resize_valid)) {
+                self.removeOperation(gpa, 0);
+                continue;
+            }
+            if (!op.started) {
+                if (op.kind == .user or op.kind == .takeover or op.kind == .resize) {
+                    var ws: cross.c.struct_winsize = undefined;
+                    if (cross.c.ioctl(fd, cross.c.TIOCGWINSZ, &ws) != 0) {
+                        self.removeOperation(gpa, 0);
+                        continue;
+                    }
+                    ws.ws_row = op.size.rows;
+                    ws.ws_col = op.size.cols;
+                    if (op.pixels) |pixels| {
+                        ws.ws_xpixel = pixels.xpixel;
+                        ws.ws_ypixel = pixels.ypixel;
+                    }
+                    if (cross.c.ioctl(fd, cross.c.TIOCSWINSZ, &ws) != 0) {
+                        self.removeOperation(gpa, 0);
+                        continue;
+                    }
+                    try resizeTerm(gpa, term, op.size.cols, op.size.rows);
+                    const grid_changed = self.grid.rows != op.size.rows or self.grid.cols != op.size.cols;
+                    self.grid = op.size;
+                    if (op.kind != .resize and (op.kind == .takeover or self.leader_client_fd != source.?.socket_fd)) {
+                        try self.setLeader(gpa, source.?);
+                    } else if (grid_changed) {
+                        try self.broadcastAuthority(gpa);
+                    }
+                    if (op.kind == .user or op.kind == .takeover) {
+                        // A following resize belongs to this ordered claim, not its receipt-time leader.
+                        source.?.applied_claim = op.id;
+                        source.?.claim_ownership_epoch = self.ownership_epoch;
+                    }
+                }
+                op.started = true;
+            }
+            if (op.offset < op.data.len) {
+                const n = lib_posix.write(fd, op.data[op.offset..]) catch |err| {
+                    if (err == error.WouldBlock) return;
+                    self.removeOperation(gpa, 0);
+                    continue;
+                };
+                if (n == 0) return;
+                op.offset += n;
+                if (op.offset < op.data.len) return;
+            }
+            self.removeOperation(gpa, 0);
+        }
+    }
+
     fn setLeader(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
         std.log.info("setting new leader client_fd={d}", .{client.socket_fd});
+        if (self.leader_client_fd != client.socket_fd) self.ownership_epoch += 1;
         self.leader_client_fd = client.socket_fd;
-        // Send a resize message to the client so it can send us back their window size
-        // so we can resize the pty and ghostty state.
-        try ipc.appendMessage(gpa, &client.write_buf, .Resize, "");
-        client.has_pending_output = true;
+        self.authority_epoch += 1;
+        try self.broadcastAuthority(gpa);
     }
 
     fn getLeaderClient(self: *Daemon) ?*Client {
@@ -941,28 +1248,12 @@ pub const Daemon = struct {
     const PTY_WRITE_BUF_MAX = 256 * 1024;
 
     /// Queue bytes for the PTY's stdin. Flushed by daemonLoop on POLLOUT.
-    /// Drops the payload if the buffer is over cap -- same failure mode as
-    /// the old direct-write ptyWrite (drop on EAGAIN), just at a 64x higher
-    /// threshold. Capping avoids OOM when the shell stops reading; dropping
-    /// new (not old) bytes avoids tearing a partially-accepted sequence.
+    /// Automation has no attachment authority. Reject new payloads at the cap;
+    /// never evict a partially forwarded batch to make room.
     fn queuePtyInput(self: *Daemon, gpa: std.mem.Allocator, data: []const u8) void {
         if (data.len == 0) return;
-        if (self.pty_write_buf.items.len + data.len > PTY_WRITE_BUF_MAX) {
-            std.log.warn(
-                "pty input dropped {d} bytes (buffer full, shell not reading)",
-                .{data.len},
-            );
-            return;
-        }
-
-        // NOTE: for local dev only
-        // std.log.debug("buffering pty input data={x}", .{data});
-
-        self.pty_write_buf.appendSlice(gpa, data) catch |err| {
-            std.log.warn(
-                "pty input dropped {d} bytes: {s}",
-                .{ data.len, @errorName(err) },
-            );
+        self.queueOperation(gpa, .{ .data = data }) catch |err| {
+            std.log.warn("pty input rejected: {s}", .{@errorName(err)});
         };
     }
 
@@ -982,21 +1273,12 @@ pub const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        // NOTE: for local dev only
-        // std.log.debug("buffering pty input data={x}", .{payload});
-
-        // client is leader, send entire payload (ansi escape codes + text)
-        if (self.leader_client_fd == client.socket_fd) {
-            if (term.flags.mouse_event == .none and util.isMouseReport(payload)) return;
-            self.queuePtyInput(gpa, payload);
-            return;
-        }
-
-        // check if leader needs to be updated by detecting any user input
+        if (client.role != .legacy) return;
+        if (term.flags.mouse_event == .none and util.isMouseReport(payload)) return;
         if (util.isUserInput(payload)) {
-            try self.setLeader(gpa, client);
-            if (term.flags.mouse_event == .none and util.isMouseReport(payload)) return;
-            self.queuePtyInput(gpa, payload);
+            try self.queueOperation(gpa, .{ .kind = .user, .source = client.attachment_id, .revision = client.revision, .pixels = client.requested_pixels, .size = client.requested, .data = payload });
+        } else if (self.leader_client_fd == client.socket_fd) {
+            try self.queueOperation(gpa, .{ .kind = .reply, .source = client.attachment_id, .revision = client.revision, .epoch = self.authority_epoch, .data = payload });
         }
     }
 
@@ -1048,23 +1330,12 @@ pub const Daemon = struct {
     ) !void {
         if (payload.len != @sizeOf(ipc.Resize)) return;
 
-        client.is_terminal = true;
-
-        if (self.leader_client_fd == null) {
-            try self.setLeader(gpa, client);
-        }
-        const is_leader = self.leader_client_fd == client.socket_fd;
+        _ = pty_fd;
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
-
-        // Resize our terminal (not yet the PTY) to the leader's size before
-        // serializing, so the snapshot is laid out for the width the client
-        // will render it at instead of being wrapped a second time on arrival.
-        // Cursor position stays consistent because it is serialized from the
-        // same, already-resized terminal; the PTY is resized below, so the
-        // shell's own SIGWINCH redraw still arrives after the snapshot.
-        if (is_leader) {
-            try resizeTerm(gpa, term, resize.cols, resize.rows);
-        }
+        if (!validSize(resize)) return;
+        client.role = .legacy;
+        client.is_terminal = true;
+        client.requested = resize;
 
         // Only serialize on re-attach (has_had_client), not first attach, to avoid
         // interfering with shell initialization (DA1 queries, etc.)
@@ -1091,32 +1362,7 @@ pub const Daemon = struct {
             }
         }
 
-        // only resize if leader
-        if (is_leader) {
-            var ws: cross.c.struct_winsize = .{
-                .ws_row = resize.rows,
-                .ws_col = resize.cols,
-                .ws_xpixel = 0,
-                .ws_ypixel = 0,
-            };
-            _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
-
-            // On re-attach, deliver SIGWINCH to the foreground process group so
-            // incremental renderers (Ink, Claude Code, etc.) know to repaint.
-            // If the size changed, TIOCSWINSZ above already sent SIGWINCH; if the size
-            // was unchanged, the kernel suppressed it, so signal the pgrp explicitly.
-            if (self.has_pty_output and self.has_had_client) {
-                var pgrp: lib_posix.pid_t = 0;
-                if (cross.c.ioctl(pty_fd, cross.c.TIOCGPGRP, &pgrp) == 0 and pgrp > 0) {
-                    lib_posix.kill(-pgrp, .WINCH) catch {};
-                }
-            }
-
-            // Mark that we've had a client init, so subsequent clients get terminal state
-            self.has_had_client = true;
-
-            std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
-        }
+        self.has_had_client = true;
     }
 
     pub fn handleResize(
@@ -1127,34 +1373,20 @@ pub const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
+        _ = pty_fd;
+        _ = term;
         if (payload.len != @sizeOf(ipc.Resize)) return;
-        if (self.leader_client_fd == null) {
-            try self.setLeader(gpa, client);
-        }
-        // only leader can resize
-        if (self.leader_client_fd != client.socket_fd) return;
-
-        const resize = std.mem.bytesToValue(ipc.Resize, payload);
-        var ws: cross.c.struct_winsize = .{
-            .ws_row = resize.rows,
-            .ws_col = resize.cols,
-            .ws_xpixel = 0,
-            .ws_ypixel = 0,
-        };
-        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
-        try resizeTerm(gpa, term, resize.cols, resize.rows);
-        std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
+        const size = std.mem.bytesToValue(ipc.Resize, payload);
+        if (!validSize(size)) return;
+        client.requested = size;
+        try self.queueResize(gpa, client);
     }
 
-    pub fn handleResizePixels(self: *Daemon, client: *Client, pty_fd: i32, payload: []const u8) void {
+    pub fn handleResizePixels(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
         if (payload.len != @sizeOf(ipc.ResizePixels)) return;
-        if (self.leader_client_fd != client.socket_fd) return;
         const pixels = std.mem.bytesToValue(ipc.ResizePixels, payload);
-        var ws: cross.c.struct_winsize = undefined;
-        if (cross.c.ioctl(pty_fd, cross.c.TIOCGWINSZ, &ws) != 0) return;
-        ws.ws_xpixel = pixels.xpixel;
-        ws.ws_ypixel = pixels.ypixel;
-        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+        client.requested_pixels = pixels;
+        try self.queueResize(gpa, client);
     }
 
     pub fn handleDetach(self: *Daemon, gpa: std.mem.Allocator, client: *Client, i: usize) void {
@@ -1250,11 +1482,12 @@ pub const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        self.setPwd(term);
-        const format: util.HistoryFormat = if (payload.len > 0)
-            @enumFromInt(payload[0])
+        if (payload.len > 1) return;
+        const format: util.HistoryFormat = if (payload.len == 0)
+            .plain
         else
-            .plain;
+            std.enums.fromInt(util.HistoryFormat, payload[0]) orelse return;
+        self.setPwd(term);
         if (util.serializeTerminal(gpa, term, format)) |output| {
             defer gpa.free(output);
             try ipc.appendMessage(gpa, &client.write_buf, .History, output);
@@ -1539,7 +1772,10 @@ test "hasTerminalClient follows attach, detach and detach-all" {
     const alloc = std.testing.allocator;
     var daemon = testDaemon();
     defer daemon.clients.deinit(alloc);
-    defer daemon.pty_write_buf.deinit(alloc);
+    defer {
+        for (daemon.operations.items) |op| alloc.free(op.data);
+        daemon.operations.deinit(alloc);
+    }
 
     // Real fds (pipes) so Client.deinit's close() is legal.
     const a = try lib_posix.pipe2(.{});
@@ -1572,12 +1808,15 @@ test "send queues PTY input without changing leader" {
     const alloc = std.testing.allocator;
     var daemon = testDaemon();
     daemon.leader_client_fd = 42;
-    defer daemon.pty_write_buf.deinit(alloc);
+    defer {
+        for (daemon.operations.items) |op| alloc.free(op.data);
+        daemon.operations.deinit(alloc);
+    }
 
     daemon.handleSend(alloc, "hello");
 
     try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
-    try std.testing.expectEqualStrings("hello", daemon.pty_write_buf.items);
+    try std.testing.expectEqualStrings("hello", daemon.operations.items[0].data);
 }
 
 test "handleEnvGet returns leader client's environment variables including unsets" {
