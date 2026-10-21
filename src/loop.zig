@@ -1201,11 +1201,9 @@ pub const Daemon = struct {
                     try resizeTerm(gpa, term, op.size.cols, op.size.rows);
                     const grid_changed = self.grid.rows != op.size.rows or self.grid.cols != op.size.cols;
                     self.grid = op.size;
-                    if (op.kind != .resize) {
-                        if (op.kind == .takeover or grid_changed or self.leader_client_fd != source.?.socket_fd)
-                            try self.setLeader(gpa, source.?);
+                    if (op.kind != .resize and (op.kind == .takeover or self.leader_client_fd != source.?.socket_fd)) {
+                        try self.setLeader(gpa, source.?);
                     } else if (grid_changed) {
-                        self.authority_epoch += 1;
                         try self.broadcastAuthority(gpa);
                     }
                     if (op.kind == .user or op.kind == .takeover) {
