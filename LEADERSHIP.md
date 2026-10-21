@@ -37,7 +37,19 @@ drops its unforwarded operations, and clears its leadership while retaining
 the grid. Closing a connection has the same authority/queue cleanup. Reconnect
 gets a new ID, with no restored claim.
 
-Attach never claims or resizes. Initial PTY creation retains the creator's grid.
+The client that creates a non-task session is its first leader. The first valid
+legacy Init or typed Interactive handshake consumes this one-use creation right;
+Watch and automation never consume it. Automation classification permanently
+removes creation eligibility for that connection, including after legacy Init;
+normal user input can still claim leadership. Creator identity is the first
+terminal handshake on a fresh daemon, rather than a token carried across the fork. The
+creator keeps authority until another client claims, it disconnects, or it
+downgrades to Watch. Task sessions have no creation right. Attaching to an
+existing session never claims or resizes. The creator's handshake grid and
+subsequent resizes use the ordered leader path, preserving kernel pixels when
+no pixel size is supplied. A full operation queue closes the creator connection
+before accepting its handshake or consuming creation; a new connection may
+claim once capacity is available.
 Legacy Init stores requested dimensions and serializes the current terminal;
 reattach neither resizes nor synthesizes SIGWINCH. A follower RequestedSize
 stores dimensions only unless it follows that attachment's queued input or
@@ -75,7 +87,10 @@ The maintained real-socket harness covers watch mutation bypasses, positive
 handshake/no legacy fallback, attach/resize non-election, explicit takeover,
 leader disconnect, retained-grid reattach, per-batch size, concurrent batch
 contiguity, stale replies, queued reply invalidation, and queued-input downgrade.
-The fixture records kernel PTY size and actual input receipts. This does not
+The fresh-session cases cover creator cell/pixel settling, exact pre-input
+CPR/OSC reply and lone-ESC bytes, creator yield, retained-grid reattach, task
+non-election, and Watch-first ordering, through both legacy and typed
+handshakes. The fixture records kernel PTY size and actual input receipts. This does not
 prove native Mac reattachment, follower layout/leader indicator, paired-device
 authorization, snapshot generations/gaps, or real TUI/VoiceOver behavior.
 

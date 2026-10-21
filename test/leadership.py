@@ -217,6 +217,9 @@ def handshake_deadlines(binary, root):
 
 
 def main(binary):
+    from creator_leadership import scenarios
+    creator_results = scenarios(binary)
+    assert all(row['result'] == 'pass' for row in creator_results), creator_results
     with tempfile.TemporaryDirectory(prefix='zmx-leadership-') as root:
         old_daemon(binary, root)
         handshake_deadlines(binary, root)
@@ -331,7 +334,7 @@ def main(binary):
             wait(lambda: len(records()) >= 8)
             assert records()[-1] == {'line': '\x03', 'grid': [55, 155]}
             assert w.state() == before, 'automation changed authority'
-            return {'result': 'pass', 'receipts': [{'line': r.get('line', '')[:80], 'bytes': len(r.get('line', '')), 'sha256': hashlib.sha256(r.get('line', '').encode()).hexdigest(), 'grid': r.get('grid')} for r in records()], 'query_receipts': query_receipts, 'scope': 'socket leadership; native gaps remain'}
+            return {'result': 'pass', 'creator_scenarios': creator_results, 'receipts': [{'line': r.get('line', '')[:80], 'bytes': len(r.get('line', '')), 'sha256': hashlib.sha256(r.get('line', '').encode()).hexdigest(), 'grid': r.get('grid')} for r in records()], 'query_receipts': query_receipts, 'scope': 'socket leadership; native gaps remain'}
         finally:
             for c in clients:
                 c.close()
