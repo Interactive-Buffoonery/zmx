@@ -761,6 +761,15 @@ pub fn isUserInput(payload: []const u8) bool {
                     if (!status_reply and (csi.final == 'u' or csi.final == '~')) return true;
                     // Ordinary and modified CSI arrows are keyboard input.
                     if (csi.final >= 'A' and csi.final <= 'D' and csi.intermediates.len == 0) return true;
+                    if (csi.intermediates.len == 0) {
+                        if (csi.final == 'Z' and csi.params.len == 0) return true;
+                        if (csi.final == 'H' or csi.final == 'F') {
+                            // Home/End use no params or 1;<modifier>, unlike cursor positioning.
+                            if (csi.params.len == 0 or
+                                (csi.params.len == 2 and csi.params[0] == 1 and
+                                    csi.params[1] >= 1 and !csi.params_sep.isSet(0))) return true;
+                        }
+                    }
                     // mouse events: CSI M (basic) or CSI < (SGR extended) - EXCLUDE these
                     // only intentional keyboard input should trigger leader switch
                     if (csi.final == 'M' or csi.final == '<') return false;
