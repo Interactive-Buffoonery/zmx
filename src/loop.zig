@@ -592,7 +592,10 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     if (!daemon.allowed(client, msg.header.tag)) continue;
                     if (client.role == .pending) {
                         switch (msg.header.tag) {
-                            .Send, .Run, .Write, .Output => client.role = .automation,
+                            .Send, .Run, .Write, .Output => {
+                                client.role = .automation;
+                                client.creation_eligible = false;
+                            },
                             else => {},
                         }
                     }
@@ -691,6 +694,7 @@ pub const Client = struct {
     socket_fd: i32,
     has_pending_output: bool = false,
     role: AttachmentRole = .pending,
+    creation_eligible: bool = true,
     attachment_id: u64 = 0,
     revision: u64 = 1,
     applied_claim: u64 = 0,
@@ -1232,7 +1236,7 @@ pub const Daemon = struct {
     }
 
     fn claimCreation(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
-        if (!self.creator_pending) return;
+        if (!self.creator_pending or !client.creation_eligible) return;
         self.creator_pending = false;
         // ponytail: creation belongs to the first valid terminal handshake on
         // this fresh daemon. Watch and automation never consume that right.

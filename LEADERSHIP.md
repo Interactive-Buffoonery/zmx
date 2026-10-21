@@ -39,8 +39,10 @@ gets a new ID, with no restored claim.
 
 The client that creates a non-task session is its first leader. The first valid
 legacy Init or typed Interactive handshake consumes this one-use creation right;
-Watch and automation never consume it. Creator identity is the first terminal
-handshake on a fresh daemon, rather than a token carried across the fork. The
+Watch and automation never consume it. Automation classification permanently
+removes creation eligibility for that connection, including after legacy Init;
+normal user input can still claim leadership. Creator identity is the first
+terminal handshake on a fresh daemon, rather than a token carried across the fork. The
 creator keeps authority until another client claims, it disconnects, or it
 downgrades to Watch. Task sessions have no creation right. Attaching to an
 existing session never claims or resizes. Initial PTY creation retains the
