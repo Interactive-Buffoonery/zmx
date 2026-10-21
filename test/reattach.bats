@@ -61,6 +61,9 @@ count() { "$ZMX" history "$1" | grep -o "$2" | wc -l | tr -d ' '; }
   before=$(count test-winch GOT_WINCH)
 
   fake_attach test-winch 50 140      # re-attach must not resize or signal
-  after=$(count test-winch GOT_WINCH)
-  [ "$after" -eq "$before" ]
+  for _ in {1..10}; do
+    sleep 0.1
+    after=$(count test-winch GOT_WINCH)
+    [ "$after" -eq "$before" ]
+  done
 }
