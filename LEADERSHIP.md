@@ -40,7 +40,9 @@ gets a new ID, with no restored claim.
 Attach never claims or resizes. Initial PTY creation retains the creator's grid.
 Legacy Init stores requested dimensions and serializes the current terminal;
 reattach neither resizes nor synthesizes SIGWINCH. A follower RequestedSize
-stores dimensions only. Cells must be 1–4096 in each dimension.
+stores dimensions only unless it follows that attachment's queued input or
+takeover; then it is ordered after that claim. Cells must be 1–4096 in each
+dimension.
 
 All PTY writes use one bounded daemon operation queue (256 KiB of payload,
 4096 operations). Queue capacity and payload ownership are reserved before
@@ -53,8 +55,9 @@ per-batch acknowledgment; callers must not retry ambiguous sends. A full queue
 rejects the new operation without claiming leadership.
 
 Replies are accepted only from the current interactive leader and only for the
-current epoch. Explicit takeover, leader/grid change, disconnect or leader downgrade changes the
-epoch; queued replies are checked again before forwarding. Already forwarded
+current epoch. Explicit takeover, leader change, disconnect or leader downgrade
+changes the epoch. A size-only change broadcasts the grid without changing the
+epoch. Queued replies are checked again before forwarding. Already forwarded
 bytes cannot be withdrawn. Automation Send does not claim or resize. Watch
 attachments affect neither synthetic focus reports nor fallback DA responses.
 A typed leader suppresses the daemon's fallback DA response.
@@ -83,12 +86,12 @@ typed and legacy coalesced input followed by resize, queued cell/pixel sizing,
 and pixel retention on subsequent input. History accepts only an empty payload
 (plain) or exactly one supported format byte; malformed requests are ignored.
 
-Reply epochs change on explicit takeover or an actual leader/grid change.
-Resize validity separately tracks
-uninterrupted ownership: another batch by the same leader preserves its queued
+Reply epochs change on explicit takeover or an actual leader change.
+Resize validity separately tracks uninterrupted ownership: another batch by the same leader preserves its queued
 resize, while an intervening leader change, disconnect or downgrade invalidates
-it. Per-attachment pixel preferences are captured in ordered operations; missing
-pixel preferences preserve the current kernel dimensions. Pixel updates never
+it. A resize following a pending claim is bound to that claim and the ownership
+epoch it establishes, not the leader at receipt. Per-attachment pixel preferences
+are captured in ordered operations; missing pixel preferences preserve the current kernel dimensions. Pixel updates never
 bypass queued input, and a full queue rejects the new resize without terminating
 the daemon or evicting accepted work.
 
@@ -99,11 +102,12 @@ operation queue, checks same daemon/child liveness, verifies complete batch
 receipts after unblocking, and checks queued revocation and unsolicited Authority
 notifications. These socket checks do not replace native or device acceptance.
 
-Legacy keyboard classification accepts C0 controls (except ESC), DEL and ordinary
-CSI arrows before leadership. Standalone ESC before leadership remains an
+Legacy keyboard classification accepts a payload beginning with a C0 control
+(except ESC) or DEL, plus ordinary CSI arrows, Shift-Tab and Home/End (including
+modified Home/End). Standalone ESC while not the current leader remains an
 explicit legacy limitation: it is ambiguous with a terminal reply prefix. No
 timeout or guessing heuristic elects a leader. No-leader DA fallback also runs
-with legacy followers attached. Unchanged-grid input from the same leader keeps
-the reply epoch; explicit takeover still invalidates outstanding replies.
+with legacy followers attached. Input and size-only changes from the same leader
+keep the reply epoch; explicit takeover still invalidates outstanding replies.
 Watch requires acceptance within one elapsed monotonic second, independent of
 output traffic; SessionEnd before acceptance is an unsupported failure.
