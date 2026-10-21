@@ -122,15 +122,97 @@ def scenario(binary, kind):
             elif kind == 'same-leader-reply':
                 a.attach(2); a.op(TAKE, struct.pack('<HH', 24, 80))
                 epoch = wait(lambda: (v if (v := w.state())[0] == a.id else None))[1]
-                a.op(USER, struct.pack('<HH', 24, 80) + b'user\n')
-                a.op(REPLY, struct.pack('<Q', epoch) + b'reply\n')
+                prefix = struct.pack('<QQ', a.id, a.rev)
+                # Changing only the grid retains reply authority under ADR-0036.
+                a.sock.sendall(frame(USER, prefix + struct.pack('<HH', 25, 81) + b'user\n') +
+                               frame(REPLY, prefix + struct.pack('<Q', epoch) + b'reply\n'))
                 wait(lambda: len(records()) == 3)
                 assert w.state()[1] == epoch
-                assert records()[-1]['sha256'] == hashlib.sha256(b'reply').hexdigest()
-                a.op(TAKE, struct.pack('<HH', 24, 80))
-                epoch = wait(lambda: (v[1] if (v := w.state())[1] != epoch else None))
-                a.op(SIZE, struct.pack('<HH', 25, 81))
+                assert records()[-1] == {'bytes': 5, 'sha256': hashlib.sha256(b'reply').hexdigest()}
+                a.sock.sendall(frame(SIZE, prefix + struct.pack('<HH', 26, 82)) +
+                               frame(REPLY, prefix + struct.pack('<Q', epoch) + b'resized-reply\n'))
+                wait(lambda: len(records()) == 4)
+                assert w.state()[1] == epoch and geometry()[:2] == [26, 82]
+                assert records()[-1] == {'bytes': 13, 'sha256': hashlib.sha256(b'resized-reply').hexdigest()}
+                a.op(TAKE, struct.pack('<HH', 26, 82))
                 wait(lambda: w.state()[1] != epoch)
+            elif kind == 'legacy-resize-reply':
+                a.send(7, struct.pack('<HH', 24, 80)); a.send(0, b'claim\n')
+                wait(lambda: len(records()) == 2)
+                epoch = w.state()[1]
+                reply = b'\x1b[24;80R\x1b[?62;22c\x1b]11;rgb:0000/0000/0000\x07\x1b'
+                a.sock.sendall(frame(2, struct.pack('<HH', 37, 97)) + frame(0, reply))
+                a.state()
+                a.send(22, b'\n')
+                wait(lambda: len(records()) == 3)
+                assert records()[-1] == {'bytes': len(reply), 'sha256': hashlib.sha256(reply).hexdigest()}
+                assert geometry()[:2] == [37, 97] and w.state()[1] == epoch
+            elif kind == 'nonclaiming-replies':
+                a.send(7, struct.pack('<HH', 24, 80))
+                replies = [b'\x1b[24;80R', b'\x1b[?62;22c', b'\x1b[>1;4000;0c',
+                           b'\x1b]11;rgb:0000/0000/0000\x07', b'\x1b[?2026;2$y', b'\x1b[2;1H']
+                for reply in replies:
+                    a.send(0, reply); a.state()
+                    assert w.state()[0] == 0, reply.hex()
+                a.send(22, b'\n')
+                wait(lambda: len(records()) == 2)
+                assert records()[-1] == {'bytes': 0, 'sha256': hashlib.sha256(b'').hexdigest()}
+            elif kind.startswith('claim-resize-'):
+                mode = kind.removeprefix('claim-resize-')
+                blocked = mode.startswith('blocked-')
+                legacy = mode.endswith('legacy')
+                user = mode.endswith('user')
+                if legacy:
+                    a.send(7, struct.pack('<HH', 24, 80))
+                else:
+                    a.attach(2)
+                b = Client(root + '/regression'); clients.append(b); b.attach(2)
+                if blocked or mode.startswith('follower-'):
+                    b.op(TAKE, struct.pack('<HH', 24, 80))
+                    wait(lambda: w.state()[0] == b.id)
+                if blocked:
+                    Path(root + '/blocked').touch()
+                    b.send(22, b'block\n')
+                    wait(lambda: Path(root + '/blocked-ready').exists())
+                    b.op(USER, struct.pack('<HH', 25, 81) + b'P' * 131072 + b'\n')
+                    wait(lambda: geometry()[:2] == [25, 81])
+                    assert len(records()) == 2
+                if legacy:
+                    claim = frame(0, b'claim\n')
+                    resize = frame(2, struct.pack('<HH', 37, 97))
+                else:
+                    prefix = struct.pack('<QQ', a.id, a.rev)
+                    claim = frame(USER if user else TAKE, prefix + struct.pack('<HH', 24, 80) + (b'claim\n' if user else b''))
+                    resize = frame(SIZE, prefix + struct.pack('<HH', 37, 97))
+                if mode == 'blocked-intervening':
+                    a.sock.sendall(claim); a.state()
+                    c = Client(root + '/regression'); clients.append(c); c.attach(2)
+                    c.op(TAKE, struct.pack('<HH', 40, 100)); c.state()
+                    a.sock.sendall(resize); a.state()
+                    expected = [40, 100]
+                else:
+                    a.sock.sendall(claim + resize); a.state()
+                    expected = [37, 97]
+                revoked = mode in ('blocked-downgrade', 'blocked-disconnect')
+                if mode == 'blocked-downgrade':
+                    a.op(DOWN); a.state()
+                elif mode == 'blocked-disconnect':
+                    a.send(3); a.receive(14)
+                    a.close(); clients.remove(a)
+                if revoked:
+                    expected = [25, 81]
+                if blocked:
+                    assert geometry()[:2] == [25, 81], 'claim/resize overtook blocked batch'
+                    Path(root + '/blocked').unlink()
+                    wait(lambda: len(records()) >= 3)
+                    assert records()[2] == {'bytes': 131072, 'sha256': hashlib.sha256(b'P' * 131072).hexdigest()}
+                wait(lambda: geometry()[:2] == expected)
+                leader = w.state()[0]
+                assert leader != 0
+                if not legacy:
+                    assert leader == (b.id if revoked else c.id if mode == 'blocked-intervening' else a.id)
+                if legacy or user:
+                    wait(lambda: any(r.get('sha256') == hashlib.sha256(b'claim').hexdigest() for r in records()))
             elif kind == 'history':
                 for payload in (b'\xff', b'\x00\x00', b'\x03'):
                     w.send(8, payload)
@@ -261,7 +343,7 @@ if __name__ == '__main__':
         signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
         binary = os.path.abspath(sys.argv[1])
         report = {'binary_sha256': hashlib.sha256(Path(binary).read_bytes()).hexdigest(), 'sources': {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in [Path('src/loop.zig'), Path(__file__), Path('test/leadership.py')]}, 'scenarios': {}}
-        for kind in ['controls', 'watch-effects', 'same-leader-reply', 'history', 'typed-resize', 'legacy-resize', 'pixels', 'saturation', 'pressure']:
+        for kind in ['controls', 'watch-effects', 'same-leader-reply', 'legacy-resize-reply', 'nonclaiming-replies', 'claim-resize-leaderless-legacy', 'claim-resize-follower-legacy', 'claim-resize-leaderless-takeover', 'claim-resize-follower-user', 'claim-resize-blocked-legacy', 'claim-resize-blocked-user', 'claim-resize-blocked-takeover', 'claim-resize-blocked-intervening', 'claim-resize-blocked-downgrade', 'claim-resize-blocked-disconnect', 'history', 'typed-resize', 'legacy-resize', 'pixels', 'saturation', 'pressure']:
             try:
                 report['scenarios'][kind] = pressure(binary) if kind == 'pressure' else scenario(binary, kind)
             except Exception as error:
