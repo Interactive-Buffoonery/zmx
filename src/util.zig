@@ -744,6 +744,8 @@ pub fn isUserInput(payload: []const u8) bool {
             }
         }
 
+        // Replies start with ESC; bare C0 controls and DEL are keyboard input.
+        if (i == 0 and ((payload[i] < 0x20 and payload[i] != 0x1b) or payload[i] == 0x7f)) return true;
         const actions = parser.next(payload[i]);
         for (actions) |action_opt| {
             const action = action_opt orelse continue;
@@ -753,9 +755,21 @@ pub fn isUserInput(payload: []const u8) bool {
                     // kitty keyboard: CSI ... u or CSI ... ~
                     // legacy modified keys: CSI 27 ; ... ~
                     // arrow/function keys with modifiers: CSI 1 ; <mod> A-D
-                    if (csi.final == 'u' or csi.final == '~') return true;
-                    // modified arrow keys (e.g., Ctrl+F sends CSI 1;5C in legacy mode)
-                    if (csi.final >= 'A' and csi.final <= 'D' and csi.params.len > 1) return true;
+                    // CSI ? flags u is the terminal's reply to a kitty keyboard status
+                    // query, not a key press; skip it and keep scanning the payload
+                    const status_reply = csi.final == 'u' and csi.intermediates.len > 0 and csi.intermediates[0] == '?';
+                    if (!status_reply and (csi.final == 'u' or csi.final == '~')) return true;
+                    // Ordinary and modified CSI arrows are keyboard input.
+                    if (csi.final >= 'A' and csi.final <= 'D' and csi.intermediates.len == 0) return true;
+                    if (csi.intermediates.len == 0) {
+                        if (csi.final == 'Z' and csi.params.len == 0) return true;
+                        if (csi.final == 'H' or csi.final == 'F') {
+                            // Home/End use no params or 1;<modifier>, unlike cursor positioning.
+                            if (csi.params.len == 0 or
+                                (csi.params.len == 2 and csi.params[0] == 1 and
+                                    csi.params[1] >= 1 and !csi.params_sep.isSet(0))) return true;
+                        }
+                    }
                     // mouse events: CSI M (basic) or CSI < (SGR extended) - EXCLUDE these
                     // only intentional keyboard input should trigger leader switch
                     if (csi.final == 'M' or csi.final == '<') return false;
@@ -2301,4 +2315,16 @@ test "stripAnsi: only escape sequences" {
     const result = try stripAnsi(alloc, "\x1b[31m\x1b[1m\x1b[0m");
     defer alloc.free(result);
     try testing.expectEqualStrings("", result);
+}
+
+test "isUserInput: kitty keyboard status reply is a terminal response" {
+    // CSI ? flags u answers the program's CSI ? u query; no key was pressed
+    try testing.expect(!isUserInput("\x1b[?1u"));
+    try testing.expect(!isUserInput("\x1b[?0u"));
+    try testing.expect(!isUserInput("\x1b[?31u"));
+    // a real key coalesced with the reply still counts
+    try testing.expect(isUserInput("\x1b[?1ua"));
+    try testing.expect(isUserInput("\x1b[?1u\r"));
+    try testing.expect(isUserInput("\x1b[?1u\x1b[97;1u"));
+    try testing.expect(!isUserInput("\x1b[?1u\x1b[97;1:3u"));
 }

@@ -41,32 +41,29 @@ count() { "$ZMX" history "$1" | grep -o "$2" | wc -l | tr -d ' '; }
   [ "$(count test-da DA1_TIMEOUT)" -eq 0 ]
 }
 
-@test "daemon leaves DA1 to the client while one is attached" {
-  # The session's own command probes after a delay; a client is attached by
-  # then, so the daemon must stay quiet and (with no real terminal behind the
-  # fake client) the probe times out.
+@test "daemon answers DA1 with a leaderless legacy client attached" {
+  # Attach does not elect a leader, so the daemon supplies fallback DA1.
   "$ZMX" run test-da2 -d bash -c "sleep 1; $(da1_probe 1); sleep 30"
   wait_for_session test-da2
   fake_attach test-da2 24 80 5 &
-  wait_for_output test-da2 "DA1_TIMEOUT" 5
+  wait_for_output test-da2 "DA1_ANSWERED" 5
   kill %1 2>/dev/null || true
 }
 
-@test "re-attach at the same size delivers SIGWINCH to foreground process" {
+@test "re-attach retains grid without synthetic SIGWINCH" {
   # The trap prints a word assembled at runtime so it can't be confused with
   # the echoed command line in history.
   "$ZMX" run test-winch -d bash -c 'trap "printf \"GOT_%s\n\" WINCH" WINCH; echo READY; while :; do sleep 0.1; done'
   wait_for_output test-winch "READY"
 
-  fake_attach test-winch 24 80       # first attach: sets the initial size
+  fake_attach test-winch 24 80       # attach never claims size authority
   sleep 0.5
   before=$(count test-winch GOT_WINCH)
 
-  fake_attach test-winch 24 80       # re-attach at the same size
-  for _ in $(seq 30); do
-    after=$(count test-winch GOT_WINCH)
-    [ "$after" -gt "$before" ] && break
+  fake_attach test-winch 50 140      # re-attach must not resize or signal
+  for _ in {1..10}; do
     sleep 0.1
+    after=$(count test-winch GOT_WINCH)
+    [ "$after" -eq "$before" ]
   done
-  [ "$after" -gt "$before" ]
 }
