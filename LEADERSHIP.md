@@ -99,7 +99,7 @@ operation queue, checks same daemon/child liveness, verifies complete batch
 receipts after unblocking, and checks queued revocation and unsolicited Authority
 notifications. These socket checks do not replace native or device acceptance.
 
-Legacy keyboard classification accepts C0 controls except ESC, DEL and ordinary
+Legacy keyboard classification accepts C0 controls (except ESC), DEL and ordinary
 CSI arrows before leadership. Standalone ESC before leadership remains an
 explicit legacy limitation: it is ambiguous with a terminal reply prefix. No
 timeout or guessing heuristic elects a leader. No-leader DA fallback also runs
