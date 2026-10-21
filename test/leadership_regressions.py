@@ -86,16 +86,20 @@ def scenario(binary, kind):
             w = Client(root + '/regression'); clients.append(w); w.attach(1)
             if kind == 'controls':
                 a.send(7, struct.pack('<HH', 24, 80))
-                keys = [bytes([c]) for c in range(32) if c not in (10, 27)] + [b'\x7f'] + [b'\x1b[' + bytes([c]) for c in b'ABCD']
+                keys = [bytes([c]) for c in range(32) if c not in (10, 27)] + [b'\x7f'] + [b'\x1b[' + bytes([c]) for c in b'ABCDZHF'] + [b'\x1b[1;' + str(modifier).encode() + bytes([final]) for modifier in range(2, 9) for final in b'HF']
                 for key in keys:
                     a.close(); clients.remove(a)
                     wait(lambda: w.state()[0] == 0)
                     a = Client(root + '/regression'); clients.append(a)
                     a.send(7, struct.pack('<HH', 24, 80))
                     a.send(0, key)
-                    wait(lambda: w.state()[0] != 0)
+                    try:
+                        wait(lambda: w.state()[0] != 0)
+                    except AssertionError as error:
+                        raise AssertionError(('leaderless key did not claim', key.hex())) from error
                     a.send(22, b'\n')
                 wait(lambda: len(records()) == len(keys) + 1)
+                assert [r['bytes'] for r in records()[1:]] == [len(k) for k in keys]
                 assert [r['sha256'] for r in records()[1:]] == [hashlib.sha256(k).hexdigest() for k in keys]
                 assert w.state()[0] != 0
             elif kind == 'watch-effects':
@@ -190,12 +194,19 @@ def pressure(binary):
         clients = []
         def rows():
             return read_receipts(root + '/receipts')
+        sequence = 0
         def geometry():
-            Path(root + '/query').write_text('pressure')
-            try:
-                return json.loads(Path(root + '/geometry').read_text())[1]
-            except (FileNotFoundError, json.JSONDecodeError):
-                return None
+            nonlocal sequence
+            sequence += 1
+            token = str(sequence)
+            Path(root + '/query').write_text(token)
+            def sample():
+                try:
+                    data = json.loads(Path(root + '/geometry').read_text())
+                    return data[1] if data[0] == token else None
+                except (FileNotFoundError, json.JSONDecodeError):
+                    return None
+            return wait(sample)
         try:
             subprocess.run([binary, 'run', 'regression', '-d', sys.executable, os.path.abspath(__file__), '--fixture', root], env=env, check=True, capture_output=True)
             identity = wait(rows)[0]
