@@ -337,6 +337,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
 
     const init_size = ipc.getTerminalSize(pty_fd);
     daemon.grid = .{ .rows = init_size.rows, .cols = init_size.cols };
+    daemon.creator_pending = !daemon.is_task_mode;
     var term = try initTerminal(gpa, io, init_size, daemon.cfg);
     defer term.deinit(gpa);
     var vt_stream = term.vtStream();
@@ -591,13 +592,20 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     if (!daemon.allowed(client, msg.header.tag)) continue;
                     if (client.role == .pending) {
                         switch (msg.header.tag) {
-                            .Send, .Run, .Write, .Output => client.role = .automation,
+                            .Send, .Run, .Write, .Output => {
+                                client.role = .automation;
+                                client.creation_eligible = false;
+                            },
                             else => {},
                         }
                     }
                     switch (msg.header.tag) {
                         .AttachRole, .Authority, .UserBatch, .TerminalReply, .TakeOver, .RequestedSize, .Downgrade => daemon.handleTyped(gpa, client, &term, msg.header.tag, msg.payload) catch |err| {
                             if (err != error.InputQueueFull) return err;
+                            if (msg.header.tag == .AttachRole) {
+                                _ = daemon.closeClient(gpa, client, i, false);
+                                continue :clients_loop;
+                            }
                             std.log.warn("typed operation rejected: queue full", .{});
                         },
                         .Input => daemon.handleInput(gpa, client, &term, msg.payload) catch |err| {
@@ -605,7 +613,11 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         },
                         .Send => daemon.handleSend(gpa, msg.payload),
                         .Output => try daemon.handleOutput(gpa, msg.payload, &term, &vt_stream),
-                        .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
+                        .Init => daemon.handleInit(gpa, client, pty_fd, &term, msg.payload) catch |err| {
+                            if (err != error.InputQueueFull) return err;
+                            _ = daemon.closeClient(gpa, client, i, false);
+                            continue :clients_loop;
+                        },
                         .Switch => try daemon.handleSwitch(gpa, msg.payload),
                         .Resize => daemon.handleResize(gpa, client, pty_fd, &term, msg.payload) catch |err| {
                             if (err != error.InputQueueFull) return err;
@@ -690,6 +702,7 @@ pub const Client = struct {
     socket_fd: i32,
     has_pending_output: bool = false,
     role: AttachmentRole = .pending,
+    creation_eligible: bool = true,
     attachment_id: u64 = 0,
     revision: u64 = 1,
     applied_claim: u64 = 0,
@@ -740,6 +753,7 @@ pub const Daemon = struct {
     // This control which client is the leader.  The leader controls terminal state and
     // cols/rows of session.
     leader_client_fd: ?i32 = null,
+    creator_pending: bool = false,
     running: bool = true,
     pid: i32 = undefined,
     command: ?[]const []const u8 = null,
@@ -1075,12 +1089,14 @@ pub const Daemon = struct {
             if (payload[1] != 1 and payload[1] != 2) return;
             const size = ipc.Resize{ .rows = std.mem.readInt(u16, payload[2..4], .little), .cols = std.mem.readInt(u16, payload[4..6], .little) };
             if (!validSize(size)) return;
+            if (payload[1] == 2) try self.reserveCreationResize(gpa, client);
             client.role = if (payload[1] == 1) .watch else .interactive;
             client.requested = size;
             var accepted: [16]u8 = undefined;
             std.mem.writeInt(u64, accepted[0..8], client.attachment_id, .little);
             std.mem.writeInt(u64, accepted[8..16], client.revision, .little);
             try ipc.appendMessage(gpa, &client.write_buf, .AttachAccepted, &accepted);
+            if (client.role == .interactive) try self.claimCreation(gpa, client);
             try self.authority(gpa, client);
             if (util.serializeTerminalState(gpa, term)) |snapshot| {
                 defer gpa.free(snapshot);
@@ -1228,6 +1244,23 @@ pub const Daemon = struct {
         }
     }
 
+    fn reserveCreationResize(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+        if (!self.creator_pending or !client.creation_eligible) return;
+        // Reject before accepting the handshake or consuming creation. The
+        // empty resize needs an operation slot, but no payload capacity.
+        if (self.operations.items.len >= 4096) return error.InputQueueFull;
+        try self.operations.ensureUnusedCapacity(gpa, 1);
+    }
+
+    fn claimCreation(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+        if (!self.creator_pending or !client.creation_eligible) return;
+        self.creator_pending = false;
+        // ponytail: creation belongs to the first valid terminal handshake on
+        // this fresh daemon. Watch and automation never consume that right.
+        try self.setLeader(gpa, client);
+        try self.queueResize(gpa, client);
+    }
+
     fn setLeader(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
         std.log.info("setting new leader client_fd={d}", .{client.socket_fd});
         if (self.leader_client_fd != client.socket_fd) self.ownership_epoch += 1;
@@ -1333,9 +1366,11 @@ pub const Daemon = struct {
         _ = pty_fd;
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
         if (!validSize(resize)) return;
+        try self.reserveCreationResize(gpa, client);
         client.role = .legacy;
         client.is_terminal = true;
         client.requested = resize;
+        try self.claimCreation(gpa, client);
 
         // Only serialize on re-attach (has_had_client), not first attach, to avoid
         // interfering with shell initialization (DA1 queries, etc.)
@@ -1513,6 +1548,7 @@ pub const Daemon = struct {
         self.task_exit_code = null;
         self.task_ended_at = null;
         self.is_task_mode = true;
+        self.creator_pending = false;
         self.task_id = util.generateTaskId(io);
 
         if (payload.len == 0) return;
