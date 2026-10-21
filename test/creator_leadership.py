@@ -68,6 +68,7 @@ def scenario(binary, kind, typed=False):
                 value = Client(root + '/creator'); clients.append(value)
                 return value
             initial = geometry()
+            automation_bytes = b''
             watcher = client()
             if kind == 'watch-first':
                 watcher.attach(1, 61, 161)
@@ -79,7 +80,14 @@ def scenario(binary, kind, typed=False):
                 before = watcher.state()
                 tag = {'automation-send': 22, 'automation-output': 1,
                        'automation-write': 12, 'run-before-creator': 9}[kind]
-                automation.send(tag)
+                if kind == 'automation-write':
+                    path = os.fsencode(Path(root, 'written'))
+                    automation.send(tag, struct.pack('<I', len(path)) + path)
+                    automation.receive(10)
+                    automation_bytes = b"printf '%s' '' | base64 -d > '" + path + b"'\r"
+                    wait(lambda: received() == automation_bytes)
+                else:
+                    automation.send(tag)
                 assert watcher.state() == before, ('automation claimed', kind)
                 assert geometry() == initial, ('automation resized', kind)
                 # Init remains compatible, but cannot restore creation eligibility.
@@ -150,7 +158,7 @@ def scenario(binary, kind, typed=False):
             if kind.startswith('automation-'):
                 # The converted legacy terminal can still claim through real input.
                 automation.send(0, b'normal-user')
-                wait(lambda: received() == b'normal-user')
+                wait(lambda: received() == automation_bytes + b'normal-user')
                 assert watcher.state()[0] != state[0], 'converted user input did not claim'
                 assert geometry()[:2] == [60, 160], 'converted user input lost requested grid'
             data = received()
