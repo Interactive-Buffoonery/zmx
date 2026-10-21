@@ -97,41 +97,58 @@ def query_fixture(path):
     with open(path, 'a', buffering=1) as out:
         out.write(json.dumps({'ready': True}) + '\n')
         pending = b''
+        awaiting_reply = False
+        deadline = None
         while True:
-            pending += os.read(0, 4096)
-            if b'\n' not in pending:
+            # Focus reports and DA replies are separate stream records even
+            # when a legacy Init makes them arrive in the same PTY read.
+            if pending.startswith((b'\x1b[I', b'\x1b[O')):
+                out.write(json.dumps({'focus': 'in' if pending[2] == ord('I') else 'out'}) + '\n')
+                pending = pending[3:]
                 continue
-            line, pending = pending.split(b'\n', 1)
-            assert line == b'PROBE', line
-            os.write(1, b'\x1b[c')
-            response = b''
-            deadline = time.monotonic() + 2
-            while not response.endswith(b'c') and time.monotonic() < deadline:
-                if select.select([0], [], [], .1)[0]:
-                    response += os.read(0, 4096)
-            out.write(json.dumps({'reply': response.hex()}) + '\n')
+            boundary = pending.find(b'c' if awaiting_reply else b'\n')
+            if boundary >= 0:
+                record, pending = pending[:boundary + 1], pending[boundary + 1:]
+                if awaiting_reply:
+                    out.write(json.dumps({'reply': record.hex()}) + '\n')
+                    awaiting_reply = False
+                    deadline = None
+                else:
+                    assert record == b'PROBE\n', record
+                    os.write(1, b'\x1b[c')
+                    awaiting_reply = True
+                    deadline = time.monotonic() + 2
+                continue
+            if deadline is not None:
+                assert time.monotonic() < deadline, ('no DA reply', pending.hex())
+            if select.select([0], [], [], .1)[0]:
+                pending += os.read(0, 4096)
 
 def watch_queries(binary, root, env):
     receipts = root + '/query-receipts'
     clients = []
     def rows():
         return read_receipts(receipts)
+    def replies():
+        return [r['reply'] for r in rows() if 'reply' in r]
     try:
         subprocess.run([binary, 'run', 'queries', '-d', sys.executable, os.path.abspath(__file__), '--query-fixture', receipts], env=env, check=True, capture_output=True)
         wait(rows)
         sender = Client(root + '/queries'); clients.append(sender)
         sender.send(22, b'PROBE\n')
-        wait(lambda: len(rows()) == 2)
+        wait(lambda: len(replies()) == 1)
         watcher = Client(root + '/queries'); clients.append(watcher)
         watcher.attach(1)
         sender.send(22, b'PROBE\n')
-        wait(lambda: len(rows()) == 3)
+        wait(lambda: len(replies()) == 2)
+        assert not any('focus' in r for r in rows()), rows()
         watcher.close(); clients.remove(watcher)
         sender.send(7, struct.pack('<HH', 24, 80))
         sender.send(22, b'PROBE\n')
-        wait(lambda: len(rows()) == 4)
-        replies = [r['reply'] for r in rows() if 'reply' in r]
-        assert replies[0] and len(set(replies)) == 1, replies
+        wait(lambda: len(replies()) == 3)
+        wait(lambda: any('focus' in r for r in rows()))
+        assert [r['focus'] for r in rows() if 'focus' in r] == ['in'], rows()
+        assert replies()[0] and len(set(replies())) == 1, replies()
         return rows()
     finally:
         for client in clients:
