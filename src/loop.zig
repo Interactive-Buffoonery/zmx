@@ -602,6 +602,10 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     switch (msg.header.tag) {
                         .AttachRole, .Authority, .UserBatch, .TerminalReply, .TakeOver, .RequestedSize, .Downgrade => daemon.handleTyped(gpa, client, &term, msg.header.tag, msg.payload) catch |err| {
                             if (err != error.InputQueueFull) return err;
+                            if (msg.header.tag == .AttachRole) {
+                                _ = daemon.closeClient(gpa, client, i, false);
+                                continue :clients_loop;
+                            }
                             std.log.warn("typed operation rejected: queue full", .{});
                         },
                         .Input => daemon.handleInput(gpa, client, &term, msg.payload) catch |err| {
@@ -609,7 +613,11 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         },
                         .Send => daemon.handleSend(gpa, msg.payload),
                         .Output => try daemon.handleOutput(gpa, msg.payload, &term, &vt_stream),
-                        .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
+                        .Init => daemon.handleInit(gpa, client, pty_fd, &term, msg.payload) catch |err| {
+                            if (err != error.InputQueueFull) return err;
+                            _ = daemon.closeClient(gpa, client, i, false);
+                            continue :clients_loop;
+                        },
                         .Switch => try daemon.handleSwitch(gpa, msg.payload),
                         .Resize => daemon.handleResize(gpa, client, pty_fd, &term, msg.payload) catch |err| {
                             if (err != error.InputQueueFull) return err;
@@ -1081,6 +1089,7 @@ pub const Daemon = struct {
             if (payload[1] != 1 and payload[1] != 2) return;
             const size = ipc.Resize{ .rows = std.mem.readInt(u16, payload[2..4], .little), .cols = std.mem.readInt(u16, payload[4..6], .little) };
             if (!validSize(size)) return;
+            if (payload[1] == 2) try self.reserveCreationResize(gpa, client);
             client.role = if (payload[1] == 1) .watch else .interactive;
             client.requested = size;
             var accepted: [16]u8 = undefined;
@@ -1235,12 +1244,21 @@ pub const Daemon = struct {
         }
     }
 
+    fn reserveCreationResize(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+        if (!self.creator_pending or !client.creation_eligible) return;
+        // Reject before accepting the handshake or consuming creation. The
+        // empty resize needs an operation slot, but no payload capacity.
+        if (self.operations.items.len >= 4096) return error.InputQueueFull;
+        try self.operations.ensureUnusedCapacity(gpa, 1);
+    }
+
     fn claimCreation(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
         if (!self.creator_pending or !client.creation_eligible) return;
         self.creator_pending = false;
         // ponytail: creation belongs to the first valid terminal handshake on
         // this fresh daemon. Watch and automation never consume that right.
         try self.setLeader(gpa, client);
+        try self.queueResize(gpa, client);
     }
 
     fn setLeader(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
@@ -1348,6 +1366,7 @@ pub const Daemon = struct {
         _ = pty_fd;
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
         if (!validSize(resize)) return;
+        try self.reserveCreationResize(gpa, client);
         client.role = .legacy;
         client.is_terminal = true;
         client.requested = resize;
