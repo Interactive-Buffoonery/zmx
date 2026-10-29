@@ -1870,6 +1870,7 @@ test "terminal retains the configured scrollback without the default byte cap" {
 
 fn testDaemon() Daemon {
     return .{
+        .io = std.testing.io,
         .cfg = undefined,
         .clients = .empty,
         .leader_client_fd = null,
