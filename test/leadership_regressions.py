@@ -183,6 +183,8 @@ def scenario(binary, kind):
                     p.send(7, struct.pack('<HH', 24, 80)); p.send(STATE); p.receive(STATE)
                     b.op(DOWN)
                     wait(lambda: w.state()[0] == 0)
+                    a.state(); p.state()
+                    assert w.state()[0] == 0, 'ambiguous Mac panes elected'
                 if blocked or mode.startswith('follower-'):
                     b.op(TAKE, struct.pack('<HH', 24, 80))
                     wait(lambda: w.state()[0] == b.id)

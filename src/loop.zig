@@ -853,10 +853,9 @@ pub const Daemon = struct {
         client.deinit(gpa);
         gpa.destroy(client);
         _ = self.clients.orderedRemove(i);
-        if (was_leader) {
-            self.broadcastAuthority(gpa) catch {};
-            self.electSoleTerminal(gpa);
-        }
+        if (was_leader) self.broadcastAuthority(gpa) catch {};
+        // Any departure can leave a single Mac pane, not only the leader's.
+        if (self.leader_client_fd == null) self.electSoleTerminal(gpa);
         std.log.info("client disconnected fd={d} remaining={d}", .{ fd, self.clients.items.len });
         if (shutdown_on_last and self.clients.items.len == 0) {
             self.shutdown(gpa);

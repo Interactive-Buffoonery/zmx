@@ -56,14 +56,17 @@ attachment's queued input or takeover; then it is ordered after that claim.
 Cells must be 1–4096 in each dimension.
 
 Leaderless recovery applies only to legacy terminal attachments (Mac panes)
-that are still eligible for creation. While no client leads, such an
+that have not been classified as automation. This includes task sessions.
+While no client leads, such an
 attachment's Init or Resize queues an ordered recovery claim with its
 requested size. The claim applies only if the session is still leaderless
 when it reaches the queue head, so earlier queued input or takeover wins.
-When the leader disconnects or downgrades and exactly one such attachment
-remains, it queues the same claim. With two or more, the session stays
+Whenever any client disconnects, or the leader downgrades, and the session is
+leaderless with exactly one such attachment, it queues the same claim. With two or more, the session stays
 leaderless until one of them resizes or types. Typed attachments, Watch and
 automation never recover leadership; the phone keeps its explicit claim.
+Automation is classified only before Init, so a client that sends Init and
+then Send or Run stays a legacy terminal.
 
 All PTY writes use one bounded daemon operation queue (256 KiB of payload,
 4096 operations). Queue capacity and payload ownership are reserved before
@@ -99,8 +102,7 @@ leader disconnect, retained-grid reattach, per-batch size, concurrent batch
 contiguity, stale replies, queued reply invalidation, and queued-input downgrade.
 The fresh-session cases cover creator cell/pixel settling, exact pre-input
 CPR/OSC reply and lone-ESC bytes, creator yield, typed retained-grid and legacy
-recovering reattach, task
-non-election, and Watch-first ordering, through both legacy and typed
+recovering reattach, typed task non-election, and Watch-first ordering, through both legacy and typed
 handshakes. The fixture records kernel PTY size and actual input receipts. This does not
 prove native Mac reattachment, follower layout/leader indicator, paired-device
 authorization, snapshot generations/gaps, or real TUI/VoiceOver behavior.
