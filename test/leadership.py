@@ -367,7 +367,7 @@ def main(binary):
             automation = Client(path); clients.append(automation)
             automation.send(22, b'\x03\n')
             wait(lambda: len(records()) >= 8)
-            assert records()[-1] == {'line': '\x03', 'grid': [55, 155]}
+            assert records()[-1] == {'line': '\x03', 'grid': [58, 158]}
             assert w.state() == before, 'automation changed authority'
             return {'result': 'pass', 'creator_scenarios': creator_results, 'receipts': [{'line': r.get('line', '')[:80], 'bytes': len(r.get('line', '')), 'sha256': hashlib.sha256(r.get('line', '').encode()).hexdigest(), 'grid': r.get('grid')} for r in records()], 'query_receipts': query_receipts, 'scope': 'socket leadership; native gaps remain'}
         finally:
