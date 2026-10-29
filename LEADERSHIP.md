@@ -44,17 +44,29 @@ removes creation eligibility for that connection, including after legacy Init;
 normal user input can still claim leadership. Creator identity is the first
 terminal handshake on a fresh daemon, rather than a token carried across the fork. The
 creator keeps authority until another client claims, it disconnects, or it
-downgrades to Watch. Task sessions have no creation right. Attaching to an
-existing session never claims or resizes. The creator's handshake grid and
+downgrades to Watch. Task sessions have no creation right. A typed attachment
+to an existing session never claims or resizes. The creator's handshake grid and
 subsequent resizes use the ordered leader path, preserving kernel pixels when
 no pixel size is supplied. A full operation queue closes the creator connection
 before accepting its handshake or consuming creation; a new connection may
 claim once capacity is available.
-Legacy Init stores requested dimensions and serializes the current terminal;
-reattach neither resizes nor synthesizes SIGWINCH. A follower RequestedSize
-stores dimensions only unless it follows that attachment's queued input or
-takeover; then it is ordered after that claim. Cells must be 1–4096 in each
-dimension.
+Legacy Init stores requested dimensions and serializes the current terminal.
+A follower RequestedSize stores dimensions only unless it follows that
+attachment's queued input or takeover; then it is ordered after that claim.
+Cells must be 1–4096 in each dimension.
+
+Leaderless recovery applies only to legacy terminal attachments (Mac panes)
+that have not been classified as automation. This includes task sessions.
+While no client leads, such an attachment's Init, Resize or ResizePixels
+queues an ordered recovery claim with its requested size. The claim applies
+only if the session is still leaderless when it reaches the queue head, so
+earlier queued input or takeover wins. Whenever any client disconnects, or
+the leader downgrades, and the session is leaderless with exactly one such
+attachment, it queues the same claim. With two or more, the session stays
+leaderless until one of them resizes or types. Typed attachments, Watch and
+automation never recover leadership; the phone keeps its explicit claim.
+Automation is classified only before Init, so a client that sends Init and
+then Send or Run stays a legacy terminal.
 
 All PTY writes use one bounded daemon operation queue (256 KiB of payload,
 4096 operations). Queue capacity and payload ownership are reserved before
@@ -84,15 +96,17 @@ input seam. This work does not claim that native/relay acceptance.
 
 Run `python3 test/leadership.py ./zig-out/bin/zmx` under the host's heavy gate.
 The maintained real-socket harness covers watch mutation bypasses, positive
-handshake/no legacy fallback, attach/resize non-election, explicit takeover,
-leader disconnect, retained-grid reattach, per-batch size, concurrent batch
-contiguity, stale replies, queued reply invalidation, and queued-input downgrade.
-The fresh-session cases cover creator cell/pixel settling, exact pre-input
-CPR/OSC reply and lone-ESC bytes, creator yield, retained-grid reattach, task
-non-election, and Watch-first ordering, through both legacy and typed
-handshakes. The fixture records kernel PTY size and actual input receipts. This does not
-prove native Mac reattachment, follower layout/leader indicator, paired-device
-authorization, snapshot generations/gaps, or real TUI/VoiceOver behavior.
+handshake/no legacy fallback, typed attach/resize non-election, Mac pane
+recovery and sole-survivor election, explicit takeover, leader disconnect,
+retained-grid reattach, per-batch size, concurrent batch contiguity, stale
+replies, queued reply invalidation, and queued-input downgrade. The
+fresh-session cases cover creator cell/pixel settling, exact pre-input CPR/OSC
+reply and lone-ESC bytes, creator yield, typed retained-grid and legacy
+recovering reattach, typed task non-election, and Watch-first ordering, through
+both legacy and typed handshakes. The fixture records kernel PTY size and actual
+input receipts. This does not prove native Mac reattachment, follower
+layout/leader indicator, paired-device authorization, snapshot generations/gaps,
+or real TUI/VoiceOver behavior.
 
 ## Queue regression checks
 
@@ -121,8 +135,8 @@ Legacy keyboard classification accepts a payload beginning with a C0 control
 (except ESC) or DEL, plus ordinary CSI arrows, Shift-Tab and Home/End (including
 modified Home/End). Standalone ESC while not the current leader remains an
 explicit legacy limitation: it is ambiguous with a terminal reply prefix. No
-timeout or guessing heuristic elects a leader. No-leader DA fallback also runs
-with legacy followers attached. Input and size-only changes from the same leader
+timeout or guessing heuristic elects a leader on ESC. No-leader DA fallback
+also runs with legacy followers attached. Input and size-only changes from the same leader
 keep the reply epoch; explicit takeover still invalidates outstanding replies.
 Watch requires acceptance within one elapsed monotonic second, independent of
 output traffic; SessionEnd before acceptance is an unsupported failure.

@@ -141,10 +141,15 @@ def scenario(binary, kind, typed=False):
             state = creator.state()
             if kind != 'watch-first':
                 watcher.attach(1)
-            if kind in ('task', 'run-before-creator'):
+            if kind in ('task', 'run-before-creator') and typed:
                 assert state[0] == 0, ('task attach claimed', state)
-                (creator.op(SIZE, struct.pack('<HH', 37, 97)) if typed else creator.send(2, struct.pack('<HH', 37, 97))); creator.state()
+                creator.op(SIZE, struct.pack('<HH', 37, 97)); creator.state()
                 assert geometry() == initial, 'task attach resized'
+            elif kind in ('task', 'run-before-creator'):
+                # No creation right, but a leaderless Mac pane still leads.
+                wait(lambda: watcher.state()[0] != 0 and geometry()[:2] == [24, 80])
+                creator.send(2, struct.pack('<HH', 37, 97))
+                wait(lambda: geometry()[:2] == [37, 97])
             else:
                 assert state[0] != 0, ('creator did not lead', state)
                 if typed:
@@ -193,14 +198,14 @@ def scenario(binary, kind, typed=False):
                 elif kind == 'reattach':
                     creator.close(); clients.remove(creator)
                     wait(lambda: watcher.state()[0] == 0)
-                    for role in ('legacy', 'typed'):
-                        replacement = client()
-                        if role == 'legacy':
-                            replacement.send(7, struct.pack('<HH', 60, 160))
-                        else:
-                            replacement.attach(2, 60, 160)
-                        assert replacement.state()[0] == 0, 'reattach claimed'
-                        assert geometry() == settled, 'reattach resized'
+                    typed_replacement = client()
+                    typed_replacement.attach(2, 60, 160)
+                    assert typed_replacement.state()[0] == 0, 'typed reattach claimed'
+                    assert geometry() == settled, 'typed reattach resized'
+                    # A Mac pane reattaching to a leaderless session leads at its size.
+                    replacement = client()
+                    replacement.send(7, struct.pack('<HH', 61, 161))
+                    wait(lambda: watcher.state()[0] not in (0, typed_replacement.id) and geometry()[:2] == [61, 161])
             if kind.startswith('automation-'):
                 # The converted legacy terminal can still claim through real input.
                 automation.send(0, b'normal-user')
