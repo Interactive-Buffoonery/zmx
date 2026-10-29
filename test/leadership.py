@@ -334,7 +334,7 @@ def main(binary):
             assert w.state()[0] == mac_id, 'phone attach claimed'
             phone.op(TAKE, struct.pack('<HH', 20, 40))
             wait(lambda: w.state()[0] == phone.id and w.state()[2:] == (20, 40))
-            mac.send(2, struct.pack('<HH', 56, 156))
+            mac.send(2, struct.pack('<HH', 56, 156)); mac.state()
             assert w.state()[0] == phone.id and w.state()[2:] == (20, 40), 'follower Mac resize applied'
             # The phone leaving hands the sole Mac pane its latest size.
             phone.close(); clients.remove(phone)
@@ -349,7 +349,7 @@ def main(binary):
             phone.close(); clients.remove(phone)
             # Two Mac panes: no automatic pick; the first to resize leads.
             mac2 = Client(path); clients.append(mac2)
-            mac2.send(7, struct.pack('<HH', 57, 157))
+            mac2.send(7, struct.pack('<HH', 57, 157)); mac2.state()
             assert w.state()[0] == mac_id and w.state()[2:] == (56, 156), 'second Mac attach claimed'
             phone = Client(path); clients.append(phone)
             phone.attach(2, 22, 42)
@@ -357,17 +357,27 @@ def main(binary):
             wait(lambda: w.state()[0] == phone.id)
             phone.close(); clients.remove(phone)
             wait(lambda: w.state()[0] == 0)
-            assert w.state()[2:] == (22, 42), 'ambiguous Mac panes elected'
+            mac.state(); mac2.state()
+            assert w.state()[0] == 0 and w.state()[2:] == (22, 42), 'ambiguous Mac panes elected'
             mac2.send(2, struct.pack('<HH', 58, 158))
             wait(lambda: w.state()[0] not in (0, mac_id) and w.state()[2:] == (58, 158))
             mac2_id = w.state()[0]
-            mac.send(2, struct.pack('<HH', 59, 159))
+            mac.send(2, struct.pack('<HH', 59, 159)); mac.state()
             assert w.state()[0] == mac2_id and w.state()[2:] == (58, 158), 'follower Mac resize applied'
+            # A follower Mac pane left alone after the phone goes is elected too.
+            phone = Client(path); clients.append(phone)
+            phone.attach(2, 23, 43)
+            phone.op(TAKE, struct.pack('<HH', 23, 43))
+            wait(lambda: w.state()[0] == phone.id)
+            phone.close(); clients.remove(phone)
+            wait(lambda: w.state()[0] == 0)
+            mac2.close(); clients.remove(mac2)
+            wait(lambda: w.state()[0] == mac_id and w.state()[2:] == (59, 159))
             before = w.state()
             automation = Client(path); clients.append(automation)
             automation.send(22, b'\x03\n')
             wait(lambda: len(records()) >= 8)
-            assert records()[-1] == {'line': '\x03', 'grid': [58, 158]}
+            assert records()[-1] == {'line': '\x03', 'grid': [59, 159]}
             assert w.state() == before, 'automation changed authority'
             return {'result': 'pass', 'creator_scenarios': creator_results, 'receipts': [{'line': r.get('line', '')[:80], 'bytes': len(r.get('line', '')), 'sha256': hashlib.sha256(r.get('line', '').encode()).hexdigest(), 'grid': r.get('grid')} for r in records()], 'query_receipts': query_receipts, 'scope': 'socket leadership; native gaps remain'}
         finally:
