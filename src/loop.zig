@@ -1185,7 +1185,7 @@ pub const Daemon = struct {
         return client.role == .legacy and client.is_terminal and client.creation_eligible;
     }
 
-    /// After the leader leaves, a sole remaining Mac pane leads at its own size.
+    /// In a leaderless session, a sole remaining Mac pane leads at its own size.
     fn electSoleTerminal(self: *Daemon, gpa: std.mem.Allocator) void {
         var sole: ?*Client = null;
         for (self.clients.items) |c| {
@@ -1193,7 +1193,12 @@ pub const Daemon = struct {
             if (sole != null) return;
             sole = c;
         }
-        if (sole) |c| self.queueResize(gpa, c) catch |err| {
+        const c = sole orelse return;
+        // A stalled queue must not grow by one resize per departure.
+        for (self.operations.items) |op| {
+            if (op.kind == .recover and op.source == c.attachment_id) return;
+        }
+        self.queueResize(gpa, c) catch |err| {
             std.log.warn("leadership recovery not queued: {s}", .{@errorName(err)});
         };
     }
