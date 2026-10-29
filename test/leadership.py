@@ -4,7 +4,7 @@
 No renderer is impersonated: the fixture records bytes and kernel PTY size.
 Native presentation, relay authorization and snapshot boundaries are separate.
 """
-import json, os, select, socket, struct, subprocess, sys, tempfile, time, tty, threading, signal, hashlib
+import errno, json, os, select, socket, struct, subprocess, sys, tempfile, time, tty, threading, signal, hashlib
 
 ATTACH, ACCEPT, STATE, USER, REPLY, TAKE, SIZE, DOWN = range(26, 34)
 HEADER = struct.Struct('<BIxxx')
@@ -20,6 +20,7 @@ class Client:
         self.sock.settimeout(2)
         self.sock.connect(path)
         self.buf = b''
+        self.seen = []  # every Authority (leader, epoch, rows, cols) received
     def send(self, tag, data=b''):
         self.sock.sendall(HEADER.pack(tag, len(data)) + data)
     def receive(self, tag):
@@ -29,6 +30,8 @@ class Client:
                 kind, size = HEADER.unpack(self.buf[:8])
                 if len(self.buf) >= 8 + size:
                     data, self.buf = self.buf[8:8+size], self.buf[8+size:]
+                    if kind == STATE:
+                        self.seen.append(struct.unpack('<QQHH', data))
                     if kind == tag:
                         return data
                     continue
@@ -52,20 +55,29 @@ class Client:
             data, self.buf = self.buf[8:8+size], self.buf[8+size:]
             if kind == STATE:
                 latest = data
+                self.seen.append(struct.unpack('<QQHH', data))
         return struct.unpack('<QQHH', latest)
     def op(self, tag, data=b''):
         self.send(tag, struct.pack('<QQ', self.id, self.rev) + data)
     def close(self):
         self.sock.close()
 
-def wait(predicate):
-    deadline = time.monotonic() + 3
+def wait(predicate, timeout=3):
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = predicate()
         if value:
             return value
         time.sleep(.01)
     raise AssertionError('deadline expired')
+
+GRACE = 5  # LEADER_GRACE_MS
+
+def hold(predicate, seconds, message):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        assert predicate(), message
+        time.sleep(.05)
 
 def read_receipts(path):
     try:
@@ -200,6 +212,10 @@ def handshake_deadlines(binary, root):
                         conn.sendall(HEADER.pack(1, 2) + b'OK')
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except OSError as error:
+                # macOS reports a client that hung up mid-send as ENOTCONN.
+                if error.errno != errno.ENOTCONN:
+                    errors.append(repr(error))
             except Exception as error:
                 errors.append(repr(error))
         thread = threading.Thread(target=serve); thread.start()
@@ -336,9 +352,30 @@ def main(binary):
             wait(lambda: w.state()[0] == phone.id and w.state()[2:] == (20, 40))
             mac.send(2, struct.pack('<HH', 56, 156)); mac.state()
             assert w.state()[0] == phone.id and w.state()[2:] == (20, 40), 'follower Mac resize applied'
-            # The phone leaving hands the sole Mac pane its latest size.
+            # A dropped phone keeps its grid for a grace period, then the
+            # sole Mac pane leads at its latest size.
             phone.close(); clients.remove(phone)
-            wait(lambda: w.state()[0] == mac_id and w.state()[2:] == (56, 156))
+            wait(lambda: w.state()[0] == 0)
+            hold(lambda: w.state()[0] == 0 and w.state()[2:] == (20, 40), 1, 'grace period skipped')
+            wait(lambda: w.state()[0] == mac_id and w.state()[2:] == (56, 156), GRACE + 3)
+            # A phone that reconnects within the grace period leads again
+            # without the Mac pane's grid in between.
+            phone = Client(path); clients.append(phone)
+            phone.attach(2, 20, 40)
+            phone.op(TAKE, struct.pack('<HH', 20, 40))
+            wait(lambda: w.state()[0] == phone.id)
+            w.seen.clear()
+            phone.close(); clients.remove(phone)
+            phone = Client(path); clients.append(phone)
+            phone.attach(2, 19, 39)
+            phone.op(TAKE, struct.pack('<HH', 19, 39))
+            wait(lambda: w.state()[0] == phone.id and w.state()[2:] == (19, 39))
+            assert not any(s[2:] == (56, 156) for s in w.seen), w.seen
+            # The Mac pane resizing during the grace period leads at once.
+            phone.close(); clients.remove(phone)
+            wait(lambda: w.state()[0] == 0)
+            mac.send(2, struct.pack('<HH', 56, 156))
+            wait(lambda: w.state()[0] == mac_id and w.state()[2:] == (56, 156), 1)
             # Same after the phone downgrades to Watch.
             phone = Client(path); clients.append(phone)
             phone.attach(2, 21, 41)
@@ -347,7 +384,7 @@ def main(binary):
             phone.op(DOWN)
             wait(lambda: w.state()[0] == mac_id and w.state()[2:] == (56, 156))
             phone.close(); clients.remove(phone)
-            # Two Mac panes: no automatic pick; the first to resize leads.
+            # Two Mac panes: the one that most recently attached or resized is elected.
             mac2 = Client(path); clients.append(mac2)
             mac2.send(7, struct.pack('<HH', 57, 157)); mac2.state()
             assert w.state()[0] == mac_id and w.state()[2:] == (56, 156), 'second Mac attach claimed'
@@ -355,22 +392,35 @@ def main(binary):
             phone.attach(2, 22, 42)
             phone.op(TAKE, struct.pack('<HH', 22, 42))
             wait(lambda: w.state()[0] == phone.id)
-            phone.close(); clients.remove(phone)
-            wait(lambda: w.state()[0] == 0)
-            mac.state(); mac2.state()
-            assert w.state()[0] == 0 and w.state()[2:] == (22, 42), 'ambiguous Mac panes elected'
-            mac2.send(2, struct.pack('<HH', 58, 158))
-            wait(lambda: w.state()[0] not in (0, mac_id) and w.state()[2:] == (58, 158))
+            phone.op(DOWN)
+            wait(lambda: w.state()[0] not in (0, mac_id, phone.id) and w.state()[2:] == (57, 157))
             mac2_id = w.state()[0]
+            phone.close(); clients.remove(phone)
             mac.send(2, struct.pack('<HH', 59, 159)); mac.state()
-            assert w.state()[0] == mac2_id and w.state()[2:] == (58, 158), 'follower Mac resize applied'
-            # A follower Mac pane left alone after the phone goes is elected too.
+            assert w.state()[0] == mac2_id and w.state()[2:] == (57, 157), 'follower Mac resize applied'
+            # That follower resize (or a focus nudge) wins the next election.
             phone = Client(path); clients.append(phone)
             phone.attach(2, 23, 43)
             phone.op(TAKE, struct.pack('<HH', 23, 43))
             wait(lambda: w.state()[0] == phone.id)
+            phone.op(DOWN)
+            wait(lambda: w.state()[0] == mac_id and w.state()[2:] == (59, 159))
+            phone.close(); clients.remove(phone)
+            # Another pane leaving during the grace period does not cut it
+            # short, and at expiry the most recent of the rest wins.
+            mac3 = Client(path); clients.append(mac3)
+            mac3.send(7, struct.pack('<HH', 60, 160)); mac3.state()
+            phone = Client(path); clients.append(phone)
+            phone.attach(2, 24, 44)
+            phone.op(TAKE, struct.pack('<HH', 24, 44))
+            wait(lambda: w.state()[0] == phone.id)
+            mac2.send(2, struct.pack('<HH', 58, 158)); mac2.state()
             phone.close(); clients.remove(phone)
             wait(lambda: w.state()[0] == 0)
+            mac3.close(); clients.remove(mac3)
+            mac.state(); mac2.state()
+            hold(lambda: w.state()[0] == 0 and w.state()[2:] == (24, 44), GRACE - 1, 'grace period cut short')
+            wait(lambda: w.state()[0] == mac2_id and w.state()[2:] == (58, 158), 3)
             mac2.close(); clients.remove(mac2)
             wait(lambda: w.state()[0] == mac_id and w.state()[2:] == (59, 159))
             before = w.state()
