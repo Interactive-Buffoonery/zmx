@@ -322,12 +322,47 @@ def main(binary):
             assert w.state()[2:] == (42, 102)
             mac = Client(path); clients.append(mac)
             mac.send(7, struct.pack('<HH', 55, 155))
-            mac.send(6)
-            mac.receive(6)
-            assert w.state()[0] == 0 and w.state()[2:] == (42, 102)
+            # A leaderless session follows the reattached Mac pane's size.
+            wait(lambda: w.state()[0] != 0 and w.state()[2:] == (55, 155))
+            mac_id = w.state()[0]
             mac.send(0, b'MAC\n')
             wait(lambda: len(records()) >= 7)
             assert records()[-1] == {'line': 'MAC', 'grid': [55, 155]}
+            # Phone takes over; Mac resizes stay stored, not applied.
+            phone = Client(path); clients.append(phone)
+            phone.attach(2, 20, 40)
+            assert w.state()[0] == mac_id, 'phone attach claimed'
+            phone.op(TAKE, struct.pack('<HH', 20, 40))
+            wait(lambda: w.state()[0] == phone.id and w.state()[2:] == (20, 40))
+            mac.send(2, struct.pack('<HH', 56, 156))
+            assert w.state()[0] == phone.id and w.state()[2:] == (20, 40), 'follower Mac resize applied'
+            # The phone leaving hands the sole Mac pane its latest size.
+            phone.close(); clients.remove(phone)
+            wait(lambda: w.state()[0] == mac_id and w.state()[2:] == (56, 156))
+            # Same after the phone downgrades to Watch.
+            phone = Client(path); clients.append(phone)
+            phone.attach(2, 21, 41)
+            phone.op(TAKE, struct.pack('<HH', 21, 41))
+            wait(lambda: w.state()[0] == phone.id and w.state()[2:] == (21, 41))
+            phone.op(DOWN)
+            wait(lambda: w.state()[0] == mac_id and w.state()[2:] == (56, 156))
+            phone.close(); clients.remove(phone)
+            # Two Mac panes: no automatic pick; the first to resize leads.
+            mac2 = Client(path); clients.append(mac2)
+            mac2.send(7, struct.pack('<HH', 57, 157))
+            assert w.state()[0] == mac_id and w.state()[2:] == (56, 156), 'second Mac attach claimed'
+            phone = Client(path); clients.append(phone)
+            phone.attach(2, 22, 42)
+            phone.op(TAKE, struct.pack('<HH', 22, 42))
+            wait(lambda: w.state()[0] == phone.id)
+            phone.close(); clients.remove(phone)
+            wait(lambda: w.state()[0] == 0)
+            assert w.state()[2:] == (22, 42), 'ambiguous Mac panes elected'
+            mac2.send(2, struct.pack('<HH', 58, 158))
+            wait(lambda: w.state()[0] not in (0, mac_id) and w.state()[2:] == (58, 158))
+            mac2_id = w.state()[0]
+            mac.send(2, struct.pack('<HH', 59, 159))
+            assert w.state()[0] == mac2_id and w.state()[2:] == (58, 158), 'follower Mac resize applied'
             before = w.state()
             automation = Client(path); clients.append(automation)
             automation.send(22, b'\x03\n')
