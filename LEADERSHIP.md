@@ -61,10 +61,16 @@ While no client leads, such an attachment's Init, Resize or ResizePixels
 queues an ordered recovery claim with its requested size. The claim applies
 only if the session is still leaderless when it reaches the queue head, so
 earlier queued input or takeover wins. Whenever any client disconnects, or
-the leader downgrades, and the session is leaderless with exactly one such
-attachment, it queues the same claim. With two or more, the session stays
-leaderless until one of them resizes or types. Typed attachments, Watch and
-automation never recover leadership; the phone keeps its explicit claim.
+the leader downgrades, and the session is leaderless, the same claim is
+queued for the attachment whose Init, Resize or ResizePixels arrived most
+recently. awesoMux sends its pane's attach client SIGWINCH on focus, so the
+pane last looked at wins. A typed leader whose socket closes holds the
+session leaderless for 5 seconds first, so a phone that reconnects does not
+reflow the grid twice; other departures do not shorten the wait, and any
+claim, including a Mac pane's resize, ends it. A downgrade elects at once.
+Typed attachments, Watch and automation never recover leadership; the phone
+keeps its explicit claim. A re-attaching pane's queued claim is applied
+before its snapshot is serialized, so the snapshot matches its grid.
 Automation is classified only before Init, so a client that sends Init and
 then Send or Run stays a legacy terminal.
 
@@ -94,19 +100,19 @@ Legacy followers suppress recognized replies at the daemon, but complete Mac
 renderer reply suppression and authority presentation require a typed native
 input seam. This work does not claim that native/relay acceptance.
 
-Run `python3 test/leadership.py ./zig-out/bin/zmx` under the host's heavy gate.
-The maintained real-socket harness covers watch mutation bypasses, positive
-handshake/no legacy fallback, typed attach/resize non-election, Mac pane
-recovery and sole-survivor election, explicit takeover, leader disconnect,
-retained-grid reattach, per-batch size, concurrent batch contiguity, stale
-replies, queued reply invalidation, and queued-input downgrade. The
-fresh-session cases cover creator cell/pixel settling, exact pre-input CPR/OSC
-reply and lone-ESC bytes, creator yield, typed retained-grid and legacy
-recovering reattach, typed task non-election, and Watch-first ordering, through
-both legacy and typed handshakes. The fixture records kernel PTY size and actual
-input receipts. This does not prove native Mac reattachment, follower
-layout/leader indicator, paired-device authorization, snapshot generations/gaps,
-or real TUI/VoiceOver behavior.
+Run `python3 test/leadership.py ./zig-out/bin/zmx` under the host's heavy
+gate. The maintained real-socket harness covers watch mutation bypasses,
+positive handshake/no legacy fallback, typed attach/resize non-election, Mac
+pane recovery and most-recent election, the typed-leader grace period,
+explicit takeover, leader disconnect, retained-grid reattach, per-batch size,
+concurrent batch contiguity, stale replies, queued reply invalidation, and
+queued-input downgrade. The fresh-session cases cover creator cell/pixel
+settling, exact pre-input CPR/OSC reply and lone-ESC bytes, creator yield,
+typed retained-grid and legacy recovering reattach, typed task non-election,
+and Watch-first ordering, through both legacy and typed handshakes. The
+fixture records kernel PTY size and actual input receipts. This does not prove
+native Mac reattachment, follower layout/leader indicator, paired-device
+authorization, snapshot generations/gaps, or real TUI/VoiceOver behavior.
 
 ## Queue regression checks
 
