@@ -68,19 +68,6 @@ count() { "$ZMX" history "$1" | grep -o "$2" | wc -l | tr -d ' '; }
   [ "$(count test-da DA1_TIMEOUT)" -eq 0 ]
 }
 
-@test "daemon answers DA1 with two leaderless legacy clients attached" {
-  # The first pane leads; once it leaves, two panes remain and neither is
-  # elected, so the daemon supplies fallback DA1.
-  "$ZMX" run test-da2 -d bash -c "sleep 2; $(da1_probe 1); sleep 30"
-  wait_for_session test-da2
-  fake_attach test-da2 24 80 0.5 &
-  sleep 0.2
-  fake_attach test-da2 24 80 5 &
-  fake_attach test-da2 24 80 5 &
-  wait_for_output test-da2 "DA1_ANSWERED" 5
-  kill %1 %2 %3 2>/dev/null || true
-}
-
 @test "sole legacy re-attach resizes only when its grid changes" {
   # The trap prints a word assembled at runtime so it can't be confused with
   # the echoed command line in history.

@@ -176,15 +176,14 @@ def scenario(binary, kind):
                     a.attach(2)
                 b = Client(root + '/regression'); clients.append(b); b.attach(2)
                 if mode == 'leaderless-legacy':
-                    # With two Mac panes attached, neither is elected when the leader leaves.
+                    # With two Mac panes attached, the most recent one is elected
+                    # when the leader leaves; the other still claims by typing.
                     p = Client(root + '/regression'); clients.append(p)
                     b.op(TAKE, struct.pack('<HH', 24, 80))
                     wait(lambda: w.state()[0] == b.id)
-                    p.send(7, struct.pack('<HH', 24, 80)); p.send(STATE); p.receive(STATE)
+                    p.send(7, struct.pack('<HH', 26, 82)); p.send(STATE); p.receive(STATE)
                     b.op(DOWN)
-                    wait(lambda: w.state()[0] == 0)
-                    a.state(); p.state()
-                    assert w.state()[0] == 0, 'ambiguous Mac panes elected'
+                    wait(lambda: w.state()[0] not in (0, b.id) and w.state()[2:] == (26, 82))
                 if blocked or mode.startswith('follower-'):
                     b.op(TAKE, struct.pack('<HH', 24, 80))
                     wait(lambda: w.state()[0] == b.id)

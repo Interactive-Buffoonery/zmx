@@ -352,6 +352,8 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
     var had_terminal_client = daemon.hasTerminalClient();
 
     daemon_loop: while (daemon.running) {
+        daemon.now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+        daemon.expireRecoveryGrace(gpa);
         // The PTY is nonblocking. Empty takeover/resize barriers must run even
         // when its input buffer is full; a partial batch still holds the head.
         try daemon.flushOperations(gpa, pty_fd, &term);
@@ -397,7 +399,12 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        const timeout: i32 = if (daemon.recovery_deadline_ms) |deadline|
+            @intCast(std.math.clamp(deadline - daemon.now_ms, 0, LEADER_GRACE_MS))
+        else
+            -1;
+        _ = try lib_posix.poll(poll_fds.items, timeout);
+        daemon.now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
@@ -692,6 +699,9 @@ const ClientResult = struct {
     cwd: ?[]const u8 = null,
 };
 
+/// How long a dropped phone or iPad keeps a leaderless session at its size.
+const LEADER_GRACE_MS = 5000;
+
 const AttachmentRole = enum { pending, legacy, watch, interactive, automation };
 
 /// Client represents each terminal that has connected to a session.
@@ -709,6 +719,8 @@ pub const Client = struct {
     claim_ownership_epoch: u64 = 0,
     requested: ipc.Resize = .{ .rows = 24, .cols = 80 },
     requested_pixels: ?ipc.ResizePixels = null,
+    /// When this pane last attached or resized; the latest wins an election.
+    attention: u64 = 0,
     is_terminal: bool = false, // sent .Init (a `zmx attach`), not a run/send/tail client
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
@@ -745,6 +757,11 @@ pub const Daemon = struct {
     queued_bytes: usize = 0,
     next_attachment_id: u64 = 1,
     next_operation_id: u64 = 1,
+    next_attention: u64 = 1,
+    /// Set by the loop each iteration so handlers need no clock.
+    now_ms: i64 = 0,
+    /// A dropped typed leader may reconnect; elect a Mac pane only after this.
+    recovery_deadline_ms: ?i64 = null,
     authority_epoch: u64 = 1,
     ownership_epoch: u64 = 1,
     grid: ipc.Resize = .{ .rows = 24, .cols = 80 },
@@ -840,6 +857,7 @@ pub const Daemon = struct {
         const fd = client.socket_fd;
         // leader is disconnected, remove ref and let another client claim leader on input
         const was_leader = self.leader_client_fd == client.socket_fd;
+        const typed_leader = was_leader and client.role == .interactive;
         if (was_leader) {
             std.log.info(
                 "unsetting leader session={s} fd={d}",
@@ -854,8 +872,13 @@ pub const Daemon = struct {
         gpa.destroy(client);
         _ = self.clients.orderedRemove(i);
         if (was_leader) self.broadcastAuthority(gpa) catch {};
-        // Any departure can leave a single Mac pane, not only the leader's.
-        if (self.leader_client_fd == null) self.electSoleTerminal(gpa);
+        if (typed_leader) {
+            // A phone that drops usually reconnects within moments; electing a
+            // Mac pane now would reflow twice.
+            self.recovery_deadline_ms = self.now_ms + LEADER_GRACE_MS;
+        } else if (self.leader_client_fd == null) {
+            self.electRecentTerminal(gpa);
+        }
         std.log.info("client disconnected fd={d} remaining={d}", .{ fd, self.clients.items.len });
         if (shutdown_on_last and self.clients.items.len == 0) {
             self.shutdown(gpa);
@@ -1123,7 +1146,7 @@ pub const Daemon = struct {
                 self.authority_epoch += 1;
             }
             try self.broadcastAuthority(gpa);
-            if (was_leader) self.electSoleTerminal(gpa);
+            if (was_leader) self.electRecentTerminal(gpa);
             return;
         }
         if (tag == .TerminalReply) {
@@ -1179,21 +1202,35 @@ pub const Daemon = struct {
         try self.queueOperation(gpa, .{ .kind = .resize, .source = client.attachment_id, .revision = client.revision, .ownership_epoch = self.ownership_epoch, .after_claim = after_claim, .pixels = client.requested_pixels, .size = client.requested, .data = "" });
     }
 
+    fn noteAttention(self: *Daemon, client: *Client) void {
+        client.attention = self.next_attention;
+        self.next_attention += 1;
+    }
+
+    /// Runs the election once a dropped typed leader's grace period ends.
+    fn expireRecoveryGrace(self: *Daemon, gpa: std.mem.Allocator) void {
+        const deadline = self.recovery_deadline_ms orelse return;
+        if (self.now_ms < deadline) return;
+        self.recovery_deadline_ms = null;
+        if (self.leader_client_fd == null) self.electRecentTerminal(gpa);
+    }
+
     /// A Mac terminal pane (legacy attach) may lead a leaderless session
     /// without typing. Typed relays, watchers and automation must claim.
     fn recoversLeadership(client: *const Client) bool {
         return client.role == .legacy and client.is_terminal and client.creation_eligible;
     }
 
-    /// In a leaderless session, a sole remaining Mac pane leads at its own size.
-    fn electSoleTerminal(self: *Daemon, gpa: std.mem.Allocator) void {
-        var sole: ?*Client = null;
+    /// In a leaderless session, the Mac pane that most recently attached or
+    /// resized leads at its own size. Focus reaches here as a resize.
+    fn electRecentTerminal(self: *Daemon, gpa: std.mem.Allocator) void {
+        if (self.recovery_deadline_ms != null) return;
+        var recent: ?*Client = null;
         for (self.clients.items) |c| {
             if (!recoversLeadership(c)) continue;
-            if (sole != null) return;
-            sole = c;
+            if (recent == null or c.attention > recent.?.attention) recent = c;
         }
-        const c = sole orelse return;
+        const c = recent orelse return;
         // A stalled queue must not grow by one resize per departure.
         for (self.operations.items) |op| {
             if (op.kind == .recover and op.source == c.attachment_id) return;
@@ -1296,6 +1333,7 @@ pub const Daemon = struct {
 
     fn setLeader(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
         std.log.info("setting new leader client_fd={d}", .{client.socket_fd});
+        self.recovery_deadline_ms = null;
         if (self.leader_client_fd != client.socket_fd) self.ownership_epoch += 1;
         self.leader_client_fd = client.socket_fd;
         self.authority_epoch += 1;
@@ -1402,6 +1440,7 @@ pub const Daemon = struct {
         client.role = .legacy;
         client.is_terminal = true;
         client.requested = resize;
+        self.noteAttention(client);
         try self.claimCreation(gpa, client);
         if (self.leader_client_fd == null) self.queueResize(gpa, client) catch |err| {
             // Reattach still succeeds; the pane's next resize retries.
@@ -1453,6 +1492,7 @@ pub const Daemon = struct {
         const size = std.mem.bytesToValue(ipc.Resize, payload);
         if (!validSize(size)) return;
         client.requested = size;
+        self.noteAttention(client);
         try self.queueResize(gpa, client);
     }
 
@@ -1460,6 +1500,7 @@ pub const Daemon = struct {
         if (payload.len != @sizeOf(ipc.ResizePixels)) return;
         const pixels = std.mem.bytesToValue(ipc.ResizePixels, payload);
         client.requested_pixels = pixels;
+        self.noteAttention(client);
         try self.queueResize(gpa, client);
     }
 
