@@ -93,11 +93,13 @@ input seam. This work does not claim that native/relay acceptance.
 
 Run `python3 test/leadership.py ./zig-out/bin/zmx` under the host's heavy gate.
 The maintained real-socket harness covers watch mutation bypasses, positive
-handshake/no legacy fallback, attach/resize non-election, explicit takeover,
+handshake/no legacy fallback, typed attach/resize non-election, Mac pane
+recovery and sole-survivor election, explicit takeover,
 leader disconnect, retained-grid reattach, per-batch size, concurrent batch
 contiguity, stale replies, queued reply invalidation, and queued-input downgrade.
 The fresh-session cases cover creator cell/pixel settling, exact pre-input
-CPR/OSC reply and lone-ESC bytes, creator yield, retained-grid reattach, task
+CPR/OSC reply and lone-ESC bytes, creator yield, typed retained-grid and legacy
+recovering reattach, task
 non-election, and Watch-first ordering, through both legacy and typed
 handshakes. The fixture records kernel PTY size and actual input receipts. This does not
 prove native Mac reattachment, follower layout/leader indicator, paired-device
