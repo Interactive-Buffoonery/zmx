@@ -57,12 +57,12 @@ Cells must be 1–4096 in each dimension.
 
 Leaderless recovery applies only to legacy terminal attachments (Mac panes)
 that have not been classified as automation. This includes task sessions.
-While no client leads, such an
-attachment's Init or Resize queues an ordered recovery claim with its
-requested size. The claim applies only if the session is still leaderless
-when it reaches the queue head, so earlier queued input or takeover wins.
-Whenever any client disconnects, or the leader downgrades, and the session is
-leaderless with exactly one such attachment, it queues the same claim. With two or more, the session stays
+While no client leads, such an attachment's Init, Resize or ResizePixels
+queues an ordered recovery claim with its requested size. The claim applies
+only if the session is still leaderless when it reaches the queue head, so
+earlier queued input or takeover wins. Whenever any client disconnects, or
+the leader downgrades, and the session is leaderless with exactly one such
+attachment, it queues the same claim. With two or more, the session stays
 leaderless until one of them resizes or types. Typed attachments, Watch and
 automation never recover leadership; the phone keeps its explicit claim.
 Automation is classified only before Init, so a client that sends Init and
@@ -97,15 +97,16 @@ input seam. This work does not claim that native/relay acceptance.
 Run `python3 test/leadership.py ./zig-out/bin/zmx` under the host's heavy gate.
 The maintained real-socket harness covers watch mutation bypasses, positive
 handshake/no legacy fallback, typed attach/resize non-election, Mac pane
-recovery and sole-survivor election, explicit takeover,
-leader disconnect, retained-grid reattach, per-batch size, concurrent batch
-contiguity, stale replies, queued reply invalidation, and queued-input downgrade.
-The fresh-session cases cover creator cell/pixel settling, exact pre-input
-CPR/OSC reply and lone-ESC bytes, creator yield, typed retained-grid and legacy
-recovering reattach, typed task non-election, and Watch-first ordering, through both legacy and typed
-handshakes. The fixture records kernel PTY size and actual input receipts. This does not
-prove native Mac reattachment, follower layout/leader indicator, paired-device
-authorization, snapshot generations/gaps, or real TUI/VoiceOver behavior.
+recovery and sole-survivor election, explicit takeover, leader disconnect,
+retained-grid reattach, per-batch size, concurrent batch contiguity, stale
+replies, queued reply invalidation, and queued-input downgrade. The
+fresh-session cases cover creator cell/pixel settling, exact pre-input CPR/OSC
+reply and lone-ESC bytes, creator yield, typed retained-grid and legacy
+recovering reattach, typed task non-election, and Watch-first ordering, through
+both legacy and typed handshakes. The fixture records kernel PTY size and actual
+input receipts. This does not prove native Mac reattachment, follower
+layout/leader indicator, paired-device authorization, snapshot generations/gaps,
+or real TUI/VoiceOver behavior.
 
 ## Queue regression checks
 
@@ -134,8 +135,8 @@ Legacy keyboard classification accepts a payload beginning with a C0 control
 (except ESC) or DEL, plus ordinary CSI arrows, Shift-Tab and Home/End (including
 modified Home/End). Standalone ESC while not the current leader remains an
 explicit legacy limitation: it is ambiguous with a terminal reply prefix. No
-timeout or guessing heuristic elects a leader. No-leader DA fallback also runs
-with legacy followers attached. Input and size-only changes from the same leader
+timeout or guessing heuristic elects a leader on ESC. No-leader DA fallback
+also runs with legacy followers attached. Input and size-only changes from the same leader
 keep the reply epoch; explicit takeover still invalidates outstanding replies.
 Watch requires acceptance within one elapsed monotonic second, independent of
 output traffic; SessionEnd before acceptance is an unsupported failure.
