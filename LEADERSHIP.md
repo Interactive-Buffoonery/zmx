@@ -44,17 +44,26 @@ removes creation eligibility for that connection, including after legacy Init;
 normal user input can still claim leadership. Creator identity is the first
 terminal handshake on a fresh daemon, rather than a token carried across the fork. The
 creator keeps authority until another client claims, it disconnects, or it
-downgrades to Watch. Task sessions have no creation right. Attaching to an
-existing session never claims or resizes. The creator's handshake grid and
+downgrades to Watch. Task sessions have no creation right. A typed attachment
+to an existing session never claims or resizes. The creator's handshake grid and
 subsequent resizes use the ordered leader path, preserving kernel pixels when
 no pixel size is supplied. A full operation queue closes the creator connection
 before accepting its handshake or consuming creation; a new connection may
 claim once capacity is available.
-Legacy Init stores requested dimensions and serializes the current terminal;
-reattach neither resizes nor synthesizes SIGWINCH. A follower RequestedSize
-stores dimensions only unless it follows that attachment's queued input or
-takeover; then it is ordered after that claim. Cells must be 1–4096 in each
-dimension.
+Legacy Init stores requested dimensions and serializes the current terminal.
+A follower RequestedSize stores dimensions only unless it follows that
+attachment's queued input or takeover; then it is ordered after that claim.
+Cells must be 1–4096 in each dimension.
+
+Leaderless recovery applies only to legacy terminal attachments (Mac panes)
+that are still eligible for creation. While no client leads, such an
+attachment's Init or Resize queues an ordered recovery claim with its
+requested size. The claim applies only if the session is still leaderless
+when it reaches the queue head, so earlier queued input or takeover wins.
+When the leader disconnects or downgrades and exactly one such attachment
+remains, it queues the same claim. With two or more, the session stays
+leaderless until one of them resizes or types. Typed attachments, Watch and
+automation never recover leadership; the phone keeps its explicit claim.
 
 All PTY writes use one bounded daemon operation queue (256 KiB of payload,
 4096 operations). Queue capacity and payload ownership are reserved before
