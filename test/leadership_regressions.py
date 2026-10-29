@@ -85,18 +85,22 @@ def scenario(binary, kind):
             a = Client(root + '/regression'); clients.append(a)
             w = Client(root + '/regression'); clients.append(w); w.attach(1)
             if kind == 'controls':
+                # A typed leader keeps each fresh Mac pane a follower, so only the key can claim.
+                t = Client(root + '/regression'); clients.append(t); t.attach(2)
                 a.send(7, struct.pack('<HH', 24, 80))
                 keys = [bytes([c]) for c in range(32) if c not in (10, 27)] + [b'\x7f'] + [b'\x1b[' + bytes([c]) for c in b'ABCDZHF'] + [b'\x1b[1;' + str(modifier).encode() + bytes([final]) for modifier in range(2, 9) for final in b'HF']
                 for key in keys:
                     a.close(); clients.remove(a)
                     wait(lambda: w.state()[0] == 0)
+                    t.op(TAKE, struct.pack('<HH', 24, 80))
+                    wait(lambda: w.state()[0] == t.id)
                     a = Client(root + '/regression'); clients.append(a)
                     a.send(7, struct.pack('<HH', 24, 80))
                     a.send(0, key)
                     try:
-                        wait(lambda: w.state()[0] != 0)
+                        wait(lambda: w.state()[0] not in (0, t.id))
                     except AssertionError as error:
-                        raise AssertionError(('leaderless key did not claim', key.hex())) from error
+                        raise AssertionError(('follower key did not claim', key.hex())) from error
                     a.send(22, b'\n')
                 wait(lambda: len(records()) == len(keys) + 1)
                 assert [r['bytes'] for r in records()[1:]] == [len(k) for k in keys]
@@ -148,12 +152,16 @@ def scenario(binary, kind):
                 assert records()[-1] == {'bytes': len(reply), 'sha256': hashlib.sha256(reply).hexdigest()}
                 assert geometry()[:2] == [37, 97] and w.state()[1] == epoch
             elif kind == 'nonclaiming-replies':
+                # A legacy Init recovers a leaderless session, so a typed leader keeps `a` a follower.
+                b = Client(root + '/regression'); clients.append(b); b.attach(2)
+                b.op(TAKE, struct.pack('<HH', 24, 80))
+                wait(lambda: w.state()[0] == b.id)
                 a.send(7, struct.pack('<HH', 24, 80))
                 replies = [b'\x1b[24;80R', b'\x1b[?62;22c', b'\x1b[>1;4000;0c',
                            b'\x1b]11;rgb:0000/0000/0000\x07', b'\x1b[?2026;2$y', b'\x1b[2;1H']
                 for reply in replies:
                     a.send(0, reply); a.state()
-                    assert w.state()[0] == 0, reply.hex()
+                    assert w.state()[0] == b.id, reply.hex()
                 a.send(22, b'\n')
                 wait(lambda: len(records()) == 2)
                 assert records()[-1] == {'bytes': 0, 'sha256': hashlib.sha256(b'').hexdigest()}
@@ -167,6 +175,16 @@ def scenario(binary, kind):
                 else:
                     a.attach(2)
                 b = Client(root + '/regression'); clients.append(b); b.attach(2)
+                if mode == 'leaderless-legacy':
+                    # With two Mac panes attached, neither is elected when the leader leaves.
+                    p = Client(root + '/regression'); clients.append(p)
+                    b.op(TAKE, struct.pack('<HH', 24, 80))
+                    wait(lambda: w.state()[0] == b.id)
+                    p.send(7, struct.pack('<HH', 24, 80)); p.send(STATE); p.receive(STATE)
+                    b.op(DOWN)
+                    wait(lambda: w.state()[0] == 0)
+                    a.state(); p.state()
+                    assert w.state()[0] == 0, 'ambiguous Mac panes elected'
                 if blocked or mode.startswith('follower-'):
                     b.op(TAKE, struct.pack('<HH', 24, 80))
                     wait(lambda: w.state()[0] == b.id)

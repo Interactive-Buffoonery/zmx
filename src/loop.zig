@@ -854,6 +854,8 @@ pub const Daemon = struct {
         gpa.destroy(client);
         _ = self.clients.orderedRemove(i);
         if (was_leader) self.broadcastAuthority(gpa) catch {};
+        // Any departure can leave a single Mac pane, not only the leader's.
+        if (self.leader_client_fd == null) self.electSoleTerminal(gpa);
         std.log.info("client disconnected fd={d} remaining={d}", .{ fd, self.clients.items.len });
         if (shutdown_on_last and self.clients.items.len == 0) {
             self.shutdown(gpa);
@@ -1032,7 +1034,7 @@ pub const Daemon = struct {
     const Operation = struct {
         id: u64 = 0,
         after_claim: ?u64 = null,
-        kind: enum { automation, user, reply, takeover, resize } = .automation,
+        kind: enum { automation, user, reply, takeover, resize, recover } = .automation,
         source: u64 = 0,
         revision: u64 = 0,
         epoch: u64 = 0,
@@ -1114,12 +1116,14 @@ pub const Daemon = struct {
             client.role = .watch;
             client.revision += 1;
             self.dropSource(gpa, client.attachment_id);
-            if (self.leader_client_fd == client.socket_fd) {
+            const was_leader = self.leader_client_fd == client.socket_fd;
+            if (was_leader) {
                 self.leader_client_fd = null;
                 self.ownership_epoch += 1;
                 self.authority_epoch += 1;
             }
             try self.broadcastAuthority(gpa);
+            if (was_leader) self.electSoleTerminal(gpa);
             return;
         }
         if (tag == .TerminalReply) {
@@ -1160,14 +1164,43 @@ pub const Daemon = struct {
             i -= 1;
             const op = self.operations.items[i];
             if (op.source == client.attachment_id and op.revision == client.revision and
-                (op.kind == .user or op.kind == .takeover) and !op.started)
+                (op.kind == .user or op.kind == .takeover or op.kind == .recover) and !op.started)
             {
                 after_claim = op.id;
                 break;
             }
         }
+        if (after_claim == null and self.leader_client_fd == null and recoversLeadership(client)) {
+            // Checked again at flush: an earlier queued claim wins.
+            try self.queueOperation(gpa, .{ .kind = .recover, .source = client.attachment_id, .revision = client.revision, .pixels = client.requested_pixels, .size = client.requested, .data = "" });
+            return;
+        }
         if (after_claim == null and self.leader_client_fd != client.socket_fd) return;
         try self.queueOperation(gpa, .{ .kind = .resize, .source = client.attachment_id, .revision = client.revision, .ownership_epoch = self.ownership_epoch, .after_claim = after_claim, .pixels = client.requested_pixels, .size = client.requested, .data = "" });
+    }
+
+    /// A Mac terminal pane (legacy attach) may lead a leaderless session
+    /// without typing. Typed relays, watchers and automation must claim.
+    fn recoversLeadership(client: *const Client) bool {
+        return client.role == .legacy and client.is_terminal and client.creation_eligible;
+    }
+
+    /// In a leaderless session, a sole remaining Mac pane leads at its own size.
+    fn electSoleTerminal(self: *Daemon, gpa: std.mem.Allocator) void {
+        var sole: ?*Client = null;
+        for (self.clients.items) |c| {
+            if (!recoversLeadership(c)) continue;
+            if (sole != null) return;
+            sole = c;
+        }
+        const c = sole orelse return;
+        // A stalled queue must not grow by one resize per departure.
+        for (self.operations.items) |op| {
+            if (op.kind == .recover and op.source == c.attachment_id) return;
+        }
+        self.queueResize(gpa, c) catch |err| {
+            std.log.warn("leadership recovery not queued: {s}", .{@errorName(err)});
+        };
     }
 
     fn removeOperation(self: *Daemon, gpa: std.mem.Allocator, index: usize) void {
@@ -1193,12 +1226,12 @@ pub const Daemon = struct {
             }
             const resize_valid = if (source) |c| self.leader_client_fd == c.socket_fd and
                 (if (op.after_claim) |claim| c.applied_claim == claim and c.claim_ownership_epoch == self.ownership_epoch else op.ownership_epoch == self.ownership_epoch) else false;
-            if ((op.source != 0 and source == null) or (op.kind == .reply and op.epoch != self.authority_epoch) or (op.kind == .resize and !resize_valid)) {
+            if ((op.source != 0 and source == null) or (op.kind == .reply and op.epoch != self.authority_epoch) or (op.kind == .resize and !resize_valid) or (op.kind == .recover and self.leader_client_fd != null)) {
                 self.removeOperation(gpa, 0);
                 continue;
             }
             if (!op.started) {
-                if (op.kind == .user or op.kind == .takeover or op.kind == .resize) {
+                if (op.kind == .user or op.kind == .takeover or op.kind == .resize or op.kind == .recover) {
                     var ws: cross.c.struct_winsize = undefined;
                     if (cross.c.ioctl(fd, cross.c.TIOCGWINSZ, &ws) != 0) {
                         self.removeOperation(gpa, 0);
@@ -1222,7 +1255,7 @@ pub const Daemon = struct {
                     } else if (grid_changed) {
                         try self.broadcastAuthority(gpa);
                     }
-                    if (op.kind == .user or op.kind == .takeover) {
+                    if (op.kind == .user or op.kind == .takeover or op.kind == .recover) {
                         // A following resize belongs to this ordered claim, not its receipt-time leader.
                         source.?.applied_claim = op.id;
                         source.?.claim_ownership_epoch = self.ownership_epoch;
@@ -1371,6 +1404,10 @@ pub const Daemon = struct {
         client.is_terminal = true;
         client.requested = resize;
         try self.claimCreation(gpa, client);
+        if (self.leader_client_fd == null) self.queueResize(gpa, client) catch |err| {
+            // Reattach still succeeds; the pane's next resize retries.
+            if (err != error.InputQueueFull) return err;
+        };
 
         // Only serialize on re-attach (has_had_client), not first attach, to avoid
         // interfering with shell initialization (DA1 queries, etc.)
