@@ -4,7 +4,7 @@
 No renderer is impersonated: the fixture records bytes and kernel PTY size.
 Native presentation, relay authorization and snapshot boundaries are separate.
 """
-import json, os, select, socket, struct, subprocess, sys, tempfile, time, tty, threading, signal, hashlib
+import errno, json, os, select, socket, struct, subprocess, sys, tempfile, time, tty, threading, signal, hashlib
 
 ATTACH, ACCEPT, STATE, USER, REPLY, TAKE, SIZE, DOWN = range(26, 34)
 HEADER = struct.Struct('<BIxxx')
@@ -212,6 +212,10 @@ def handshake_deadlines(binary, root):
                         conn.sendall(HEADER.pack(1, 2) + b'OK')
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except OSError as error:
+                # macOS reports a client that hung up mid-send as ENOTCONN.
+                if error.errno != errno.ENOTCONN:
+                    errors.append(repr(error))
             except Exception as error:
                 errors.append(repr(error))
         thread = threading.Thread(target=serve); thread.start()
