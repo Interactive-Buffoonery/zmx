@@ -1396,7 +1396,6 @@ pub const Daemon = struct {
     ) !void {
         if (payload.len != @sizeOf(ipc.Resize)) return;
 
-        _ = pty_fd;
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
         if (!validSize(resize)) return;
         try self.reserveCreationResize(gpa, client);
@@ -1417,6 +1416,9 @@ pub const Daemon = struct {
                 "cursor before serialize: x={d} y={d} pending_wrap={}",
                 .{ cursor.x, cursor.y, cursor.pending_wrap },
             );
+            // Apply a queued recovery first so the snapshot is laid out at
+            // the grid this pane will see, not the previous leader's.
+            try self.flushOperations(gpa, pty_fd, term);
             if (util.serializeTerminalState(gpa, term)) |term_output| {
                 std.log.debug("serialize terminal state", .{});
                 // Rewrite OSC 133;A to include redraw=0 so the outer terminal
