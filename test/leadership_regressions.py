@@ -148,12 +148,16 @@ def scenario(binary, kind):
                 assert records()[-1] == {'bytes': len(reply), 'sha256': hashlib.sha256(reply).hexdigest()}
                 assert geometry()[:2] == [37, 97] and w.state()[1] == epoch
             elif kind == 'nonclaiming-replies':
+                # A legacy Init recovers a leaderless session, so a typed leader keeps `a` a follower.
+                b = Client(root + '/regression'); clients.append(b); b.attach(2)
+                b.op(TAKE, struct.pack('<HH', 24, 80))
+                wait(lambda: w.state()[0] == b.id)
                 a.send(7, struct.pack('<HH', 24, 80))
                 replies = [b'\x1b[24;80R', b'\x1b[?62;22c', b'\x1b[>1;4000;0c',
                            b'\x1b]11;rgb:0000/0000/0000\x07', b'\x1b[?2026;2$y', b'\x1b[2;1H']
                 for reply in replies:
                     a.send(0, reply); a.state()
-                    assert w.state()[0] == 0, reply.hex()
+                    assert w.state()[0] == b.id, reply.hex()
                 a.send(22, b'\n')
                 wait(lambda: len(records()) == 2)
                 assert records()[-1] == {'bytes': 0, 'sha256': hashlib.sha256(b'').hexdigest()}
