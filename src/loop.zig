@@ -758,6 +758,7 @@ pub const Daemon = struct {
     next_attachment_id: u64 = 1,
     next_operation_id: u64 = 1,
     next_attention: u64 = 1,
+    io: std.Io,
     /// Set by the loop each iteration so handlers need no clock.
     now_ms: i64 = 0,
     /// A dropped typed leader may reconnect; elect a Mac pane only after this.
@@ -802,6 +803,7 @@ pub const Daemon = struct {
     /// into the init fn.
     pub fn init(io: std.Io, cfg: *Cfg, sesh_name: []const u8, socket_path: []const u8) Daemon {
         return .{
+            .io = io,
             .cfg = cfg,
             .session_name = sesh_name,
             .socket_path = socket_path,
@@ -874,7 +876,9 @@ pub const Daemon = struct {
         if (was_leader) self.broadcastAuthority(gpa) catch {};
         if (typed_leader) {
             // A phone that drops usually reconnects within moments; electing a
-            // Mac pane now would reflow twice.
+            // Mac pane now would reflow twice. Read the clock here: earlier
+            // work in this iteration may have taken a while.
+            self.now_ms = std.Io.Clock.awake.now(self.io).toMilliseconds();
             self.recovery_deadline_ms = self.now_ms + LEADER_GRACE_MS;
         } else if (self.leader_client_fd == null) {
             self.electRecentTerminal(gpa);
@@ -1943,6 +1947,7 @@ test "handleEnvGet returns leader client's environment variables including unset
     };
 
     var daemon = Daemon{
+        .io = std.testing.io,
         .cfg = &cfg,
         .clients = .empty,
         .session_name = "test",
