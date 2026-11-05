@@ -144,6 +144,12 @@ Commands:
 It never creates a replacement or removes an unresponsive session socket, and
 cannot be combined with `--labels`.
 
+Ordinary attach creates missing sessions and recovers sockets whose connection
+is refused. Probe timeouts and incompatible replies fail without removing the
+existing socket: an unresponsive daemon may still own a running shell. Retry
+after it becomes responsive. Run `python3 test/reconnect.py /path/to/zmx` for the
+isolated reconnect regression.
+
 ### list output
 
 `list` emits tab-separated `key=value` fields, one session per line. Parse by

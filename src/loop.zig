@@ -930,6 +930,8 @@ pub const Daemon = struct {
                         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(150), .real) catch {};
                         continue;
                     }
+                    // A slow or incompatible daemon may still own live work.
+                    if (err != error.ConnectionRefused) return err;
                     std.log.warn(
                         "session probe failed ({s}, attempts={d}), recreating session={s}",
                         .{ @errorName(err), probe_attempt, sesh_name },
