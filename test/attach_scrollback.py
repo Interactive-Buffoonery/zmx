@@ -128,6 +128,17 @@ def main(binary):
             replay(data, 6, cols)
             return Path(root + '/text.state').read_text().splitlines()
 
+        long_line = b'A' * 100
+        data = snapshot('wrap-retained', long_line + b'\r\n' + b'x\r\n' * 10 + b'END')
+        check('receiver retaining DECAWM off keeps long history', replay(b'\x1b[?7l' + data, 6, 40), replay(data, 6, 40))
+
+        data = snapshot('origin-saved', b'\x1b[2;5r\x1b[?6h\x1b[?1049h\x1b[?6lEND')
+        after_exit = replay(data + b'\x1b[?1049l\x1b[1;1HX', 6, 40)
+        check('1049 exit restores saved origin mode', after_exit[1], 'X')
+
+        data = snapshot('origin-alt', b'\x1b[?1049h\x1b[2;5r\x1b[?6hEND')
+        check('alt keeps its own origin mode', replay(data + b'\x1b[1;1HX', 6, 40)[1], 'XND')
+
         for code, style, blink in [(1, 'block', True), (2, 'block', False),
                                    (3, 'underline', True), (4, 'underline', False),
                                    (5, 'bar', True), (6, 'bar', False)]:
