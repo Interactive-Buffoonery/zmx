@@ -8,7 +8,9 @@ import fcntl
 import pty
 import re
 import select
+import shutil
 import termios
+import tempfile
 from pathlib import Path
 import socket
 import struct
@@ -65,7 +67,7 @@ def fixture(payload):
 
 
 def main(binary):
-    root = subprocess.check_output(['mktemp', '-d', '/tmp/zsp.XXXXXX'], text=True).strip()
+    root = tempfile.mkdtemp(prefix='zsp.', dir='/tmp')
     env = {k: v for k, v in os.environ.items() if not k.startswith(('ZMX_', 'AMX_STATUS_'))}
     env.update(ZMX_DIR=root, SHELL='/bin/sh')
     replay_bin = str(Path(__file__).resolve().parents[1] / 'zig-out/bin/terminal-replay')
@@ -355,11 +357,26 @@ def main(binary):
         print(f'{total - failures}/{total} regression cases passed')
         return bool(failures)
     finally:
+        original_error = sys.exc_info()[1]
+        cleanup_errors = []
         for c in clients:
-            c.close()
+            try:
+                c.close()
+            except Exception as error:
+                cleanup_errors.append(error)
         for name in sessions:
-            subprocess.run([binary, 'kill', name, '--force'], env=env, capture_output=True)
-        subprocess.run(['trash', root])
+            try:
+                subprocess.run([binary, 'kill', name, '--force'], env=env, capture_output=True)
+            except Exception as error:
+                cleanup_errors.append(error)
+        try:
+            shutil.rmtree(root)
+        except Exception as error:
+            cleanup_errors.append(error)
+        if cleanup_errors:
+            print(f'Fixture cleanup failed: {cleanup_errors!r}', file=sys.stderr, flush=True)
+            if original_error is None and not failures:
+                raise RuntimeError('fixture cleanup failed') from cleanup_errors[0]
 
 
 if __name__ == '__main__':
