@@ -8,6 +8,8 @@ const docsSections = ["Why", "What's Included", "Notes"];
 const marker = "<!-- zmx-pr-template-validation -->";
 const codesmithFooterPattern =
   /<!-- codesmith:footer -->[\s\S]*?<!-- \/codesmith:footer -->/g;
+const kodySummaryPattern =
+  /<!-- kody-pr-summary:start -->[\s\S]*?<!-- kody-pr-summary:end -->/g;
 const templatePlaceholderHints = [
   "explain why",
   "what changed, and why should this change exist",
@@ -77,7 +79,9 @@ function hasTemplatePlaceholder(body) {
 }
 
 export function validatePullRequest({ body = "", files = [] }) {
-  const bodyWithoutManagedFooters = body.replace(codesmithFooterPattern, "");
+  const bodyWithoutManagedFooters = body
+    .replace(codesmithFooterPattern, "")
+    .replace(kodySummaryPattern, "");
   const sections = parseSections(bodyWithoutManagedFooters);
   const docsOnly = isDocsOnly(files);
   const required = docsOnly ? docsSections : fullSections;

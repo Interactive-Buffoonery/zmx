@@ -54,3 +54,11 @@ test("rejects an untouched template and empty bodies", async () => {
   assert.equal(validatePullRequest({ body: template, files: ["src/main.zig"] }).valid, false);
   assert.equal(validatePullRequest({ body: "", files: [] }).valid, false);
 });
+
+test("Kody summaries cannot fill or replace author sections", () => {
+  const summary = `\n<!-- kody-pr-summary:start -->\n${fullBody}\n<!-- kody-pr-summary:end -->`;
+  assert.equal(validatePullRequest({ body: summary, files: ["src/main.zig"] }).valid, false);
+  assert.equal(validatePullRequest({ body: fullBody.replace("Models: n/a", "Models:") + summary, files: ["src/main.zig"] }).valid, false);
+  const incompleteSummary = "\n<!-- kody-pr-summary:start -->\n## Notes\nModels:\n<!-- kody-pr-summary:end -->";
+  assert.equal(validatePullRequest({ body: fullBody + incompleteSummary, files: ["src/main.zig"] }).valid, true);
+});
