@@ -5,6 +5,7 @@ Run with a built zmx/amx path. Uses only a private socket directory and leaves
 its report and logs in the printed fixture directory.
 """
 import ctypes
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -13,8 +14,10 @@ import re
 import signal
 import socket
 import subprocess
+import struct
 import sys
 import tempfile
+import termios
 import threading
 
 from leadership import HEADER, environment, wait
@@ -84,6 +87,7 @@ def run(binary):
 
     def attach():
         master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
         descriptors.append(master)
         status = root / ("attach-" + str(len(clients)) + ".jsonl")
         status.touch(mode=0o600)
