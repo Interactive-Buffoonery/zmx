@@ -825,6 +825,39 @@ fn writeColorOverrides(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal)
     writeDynamicColor(writer, .foreground, colors.foreground);
     writeDynamicColor(writer, .background, colors.background);
     writeDynamicColor(writer, .cursor, colors.cursor);
+    var it = colors.palette.mask.iterator(.{});
+    while (it.next()) |i| {
+        const c = colors.palette.current[i];
+        writer.print("\x1b]4;{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}\x1b\\", .{
+            i, c.r, c.g, c.b,
+        }) catch |err| {
+            std.log.warn("failed to format palette color err={s}", .{@errorName(err)});
+        };
+    }
+}
+
+fn hasCustomTabstops(term: *const ghostty_vt.Terminal) bool {
+    for (0..term.cols) |col| {
+        // Match Ghostty Tabstops.reset, which excludes the final column.
+        const default = col > 0 and col % 8 == 0 and col < term.cols - 1;
+        if (term.tabstops.get(col) != default) return true;
+    }
+    return false;
+}
+
+fn writeCursorStyle(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal, screen: *const ghostty_vt.Screen) void {
+    // A default cursor must keep the attaching client's configured shape.
+    if (term.cursor.is_default) return;
+    const steady: u8 = switch (screen.cursor.cursor_style) {
+        .block => 2,
+        .underline => 4,
+        .bar => 6,
+        else => return,
+    };
+    const code = steady - @as(u8, if (term.modes.get(.cursor_blinking)) 1 else 0);
+    writer.print("\x1b[{d} q", .{code}) catch |err| {
+        std.log.warn("failed to format cursor style err={s}", .{@errorName(err)});
+    };
 }
 
 fn serializeScreenHistory(screen: *const ghostty_vt.Screen, writer: *std.Io.Writer, client_rows: u16, unwrap: bool) void {
@@ -916,6 +949,7 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         ) };
         primary_fmt.extra = .all;
         primary_fmt.format(&builder.writer) catch return null;
+        writeCursorStyle(&builder.writer, term, primary);
 
         // Mode aliases may coexist. Enter once, while still on primary, so
         // 1049 saves its cursor rather than overwriting it with the alt cursor.
@@ -955,7 +989,7 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         .palette = false,
         .modes = true,
         .scrolling_region = true,
-        .tabstops = false, // tabstop restoration moves cursor after CUP, corrupting position
+        .tabstops = hasCustomTabstops(term),
         .pwd = false, // emitted below without the sentinel the formatter includes
         .keyboard = true,
         .screen = .all,
@@ -966,6 +1000,7 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         return null;
     };
 
+    writeCursorStyle(&builder.writer, term, term.screens.active);
     writePwd(&builder.writer, term);
 
     // The formatter has no title extra and never emits OSC 0/1/2, so the title

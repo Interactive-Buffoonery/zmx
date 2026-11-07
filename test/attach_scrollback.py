@@ -6,6 +6,7 @@ zig build test-replay && python3 test/attach_scrollback.py zig-out/bin/zmx
 import os
 import fcntl
 import pty
+import re
 import select
 import termios
 from pathlib import Path
@@ -109,10 +110,54 @@ def main(binary):
         total += 1
         ok = actual == expected
         failures += not ok
+        if isinstance(actual, (int, bool)):
+            actual, expected = [actual], [expected]
         mismatch = next((i for i, (a, b) in enumerate(zip(actual, expected)) if a != b), min(len(actual), len(expected)))
-        print(f'{"PASS" if ok else "FAIL"} {label}: got={len(actual)} expected={len(expected)} first_mismatch={mismatch}', flush=True)
+        print(f'{"PASS" if ok else "FAIL"} {label}: got={actual!r} expected={expected!r}' if label.startswith('state ') else f'{"PASS" if ok else "FAIL"} {label}: got={len(actual)} expected={len(expected)} first_mismatch={mismatch}', flush=True)
 
     try:
+        def snapshot(name, payload):
+            start(name, payload, 6, 40)
+            c = Client(root, name)
+            try:
+                return c.attach(1, 6, 40)
+            finally:
+                c.close()
+
+        def state(data, cols=40):
+            replay(data, 6, cols)
+            return Path(root + '/text.state').read_text().splitlines()
+
+        for code, style, blink in [(1, 'block', True), (2, 'block', False),
+                                   (3, 'underline', True), (4, 'underline', False),
+                                   (5, 'bar', True), (6, 'bar', False)]:
+            data = snapshot(f'cursor{code}', f'END\x1b[{code} q'.encode())
+            check(f'state cursor {code}', state(data)[0],
+                  f'cursor={style},{str(blink).lower()},false at=3,0')
+        for prefix, label in [(b'', 'shared'), (b'\x1b[2 q', 'alt only')]:
+            payload = b'\x1b[5 q\x1b[?1049h' + prefix + b'ALT\r\nEND'
+            data = snapshot('primarystyle' + label[:1], payload)
+            check(f'state primary cursor style after exit, {label}', state(data + b'\x1b[?1049l')[0].split(' ')[0], state(b'\x1bc' + payload + b'\x1b[?1049l')[0].split(' ')[0])
+        data = snapshot('defaults', b'END')
+        check('state default extra bytes', len(re.findall(rb'\x1b\[[0-9]* q|\x1b\]4;[^\x1b]*\x1b\\|\x1b\[3g|\x1bH', data)), 0)
+        data = snapshot('cursorreset', b'END\x1b[5 q\x1b[0 q')
+        check('state cursor reset', state(data)[0], 'cursor=block,false,true at=3,0')
+        check('state cursor reset bytes', b' q' in data, False)
+        colors = b'END\x1b]4;1;rgb:12/34/56\x1b\\\x1b]4;255;rgb:ab/cd/ef\x1b\\'
+        data = snapshot('palette', colors)
+        check('state palette 1', state(data)[2], '1=123456')
+        check('state palette 255', state(data)[256], '255=abcdef')
+        check('state palette emitted entries', data.count(b'\x1b]4;'), 2)
+        data = snapshot('palettereset', colors + b'\x1b]104\x1b\\')
+        check('state palette reset bytes', data.count(b'\x1b]4;'), 0)
+        for name, tabs in [('customtabs', b'\x1b[3g\x1b[14G\x1bH\x1b[30G\x1bH'),
+                           ('notabs', b'\x1b[3g')]:
+            payload = tabs + b'\x1b[3;2HEND'
+            data = snapshot(name, payload)
+            check(f'state {name} cursor', state(data)[0], state(b'\x1bc' + payload)[0])
+            for cols in (40, 60, 10):
+                check(f'state {name} TAB cols={cols}', replay(data + b'\t@', 6, cols),
+                      replay(b'\x1bc' + payload + b'\t@', 6, cols))
         expected = [str(i) for i in range(1, 501)] + ['END']
         payload = ('\r\n'.join(expected)).encode()
         start('numbers', payload, 24, 80)
