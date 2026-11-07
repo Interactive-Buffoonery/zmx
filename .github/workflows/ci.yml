@@ -40,5 +40,8 @@ jobs:
       - name: Unit tests
         run: zig build test
 
+      - name: Attach regression
+        run: zig build && zig build test-replay && python3 test/attach_scrollback.py zig-out/bin/zmx
+
       - name: PR automation tests
         run: node --test .github/scripts/test/*.test.mjs
