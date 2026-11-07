@@ -2162,6 +2162,18 @@ test "isUserInput: arrow keys with modifier params CSI A-D" {
     try testing.expect(isUserInput("\x1b[1;3B")); // Alt+Down
 }
 
+test "isUserInput: CSI arrows exclude intermediate sequences" {
+    const finals = "ABCD";
+    for (finals) |final| {
+        var ordinary = [_]u8{ 0x1b, '[', final };
+        var modified = [_]u8{ 0x1b, '[', '1', ';', '5', final };
+        var intermediate = [_]u8{ 0x1b, '[', '1', ';', '5', ' ', final };
+        try testing.expect(isUserInput(&ordinary));
+        try testing.expect(isUserInput(&modified));
+        try testing.expect(!isUserInput(&intermediate));
+    }
+}
+
 test "isUserInput: function keys with modifiers CSI 27 ; ~" {
     // Legacy modified keys: CSI 27 ; ... ~
     try testing.expect(isUserInput("\x1b[15;2~")); // F4 with modifier
