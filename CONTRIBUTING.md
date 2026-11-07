@@ -11,10 +11,13 @@ zig fmt --check build.zig build.zig.zon src
 zig build test
 ```
 
-Run affected real-session checks too. CI currently covers Linux unit tests;
-it does not prove macOS or awesoMux behavior. After PR #29 merges, add
-`zig build && zig build test-replay && python3 test/attach_scrollback.py zig-out/bin/zmx`
-to CI for the attach regression.
+Run affected real-session checks too. CI covers Linux formatting, unit tests,
+terminal replay tests, PR automation tests, and the real-daemon attach regression.
+It does not prove macOS or awesoMux behavior. For attach changes, also run:
+
+```sh
+zig build && zig build test-replay && python3 test/attach_scrollback.py zig-out/bin/zmx
+```
 
 Use the exact [PR template](.github/pull_request_template.md) sections, remove
 placeholders, and use simple English or ASD-STE100. List models after `Models:`
