@@ -30,6 +30,14 @@ pub const Tag = enum(u8) {
     EnvGet = 23,
     EnvSet = 24,
     EnvData = 25,
+    AttachRole = 26,
+    AttachAccepted = 27,
+    Authority = 28,
+    UserBatch = 29,
+    TerminalReply = 30,
+    TakeOver = 31,
+    RequestedSize = 32,
+    Downgrade = 33,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -333,7 +341,7 @@ const SessionProbeError = error{
     InfoSizeMismatch,
 };
 
-const SessionProbeResult = struct {
+pub const SessionProbeResult = struct {
     fd: i32,
     info: Info,
     labels: ?[]const u8,
@@ -341,7 +349,13 @@ const SessionProbeResult = struct {
 
     pub fn deinit(self: *const SessionProbeResult) void {
         if (self.labels) |lbl| self.alloc.free(lbl);
-        lib_posix.close(self.fd);
+        if (self.fd >= 0) lib_posix.close(self.fd);
+    }
+
+    pub fn takeFd(self: *SessionProbeResult) i32 {
+        const fd = self.fd;
+        self.fd = -1;
+        return fd;
     }
 };
 
@@ -467,15 +481,18 @@ test "SessionEnd payload round trips with zeroed padding" {
 
 test "Tag wire values are frozen" {
     inline for (.{
-        .{ Tag.Input, 0 },      .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
-        .{ Tag.Detach, 3 },     .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
-        .{ Tag.Info, 6 },       .{ Tag.Init, 7 },          .{ Tag.History, 8 },
-        .{ Tag.Run, 9 },        .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
-        .{ Tag.Write, 12 },     .{ Tag.TaskComplete, 13 }, .{ Tag.SessionEnd, 14 },
-        .{ Tag.CwdQuery, 15 },  .{ Tag.CwdResponse, 16 },  .{ Tag.ResizePixels, 17 },
-        .{ Tag.LabelGet, 18 },  .{ Tag.LabelSet, 19 },     .{ Tag.LabelClear, 20 },
-        .{ Tag.LabelData, 21 }, .{ Tag.Send, 22 },         .{ Tag.EnvGet, 23 },
-        .{ Tag.EnvSet, 24 },    .{ Tag.EnvData, 25 },
+        .{ Tag.Input, 0 },           .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
+        .{ Tag.Detach, 3 },          .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
+        .{ Tag.Info, 6 },            .{ Tag.Init, 7 },          .{ Tag.History, 8 },
+        .{ Tag.Run, 9 },             .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
+        .{ Tag.Write, 12 },          .{ Tag.TaskComplete, 13 }, .{ Tag.SessionEnd, 14 },
+        .{ Tag.CwdQuery, 15 },       .{ Tag.CwdResponse, 16 },  .{ Tag.ResizePixels, 17 },
+        .{ Tag.LabelGet, 18 },       .{ Tag.LabelSet, 19 },     .{ Tag.LabelClear, 20 },
+        .{ Tag.LabelData, 21 },      .{ Tag.Send, 22 },         .{ Tag.EnvGet, 23 },
+        .{ Tag.EnvSet, 24 },         .{ Tag.EnvData, 25 },      .{ Tag.AttachRole, 26 },
+        .{ Tag.AttachAccepted, 27 }, .{ Tag.Authority, 28 },    .{ Tag.UserBatch, 29 },
+        .{ Tag.TerminalReply, 30 },  .{ Tag.TakeOver, 31 },     .{ Tag.RequestedSize, 32 },
+        .{ Tag.Downgrade, 33 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 

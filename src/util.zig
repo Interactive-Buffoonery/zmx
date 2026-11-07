@@ -744,6 +744,8 @@ pub fn isUserInput(payload: []const u8) bool {
             }
         }
 
+        // Replies start with ESC; bare C0 controls and DEL are keyboard input.
+        if (i == 0 and ((payload[i] < 0x20 and payload[i] != 0x1b) or payload[i] == 0x7f)) return true;
         const actions = parser.next(payload[i]);
         for (actions) |action_opt| {
             const action = action_opt orelse continue;
@@ -757,8 +759,17 @@ pub fn isUserInput(payload: []const u8) bool {
                     // query, not a key press; skip it and keep scanning the payload
                     const status_reply = csi.final == 'u' and csi.intermediates.len > 0 and csi.intermediates[0] == '?';
                     if (!status_reply and (csi.final == 'u' or csi.final == '~')) return true;
-                    // modified arrow keys (e.g., Ctrl+F sends CSI 1;5C in legacy mode)
-                    if (csi.final >= 'A' and csi.final <= 'D' and csi.params.len > 1) return true;
+                    // Ordinary and modified CSI arrows are keyboard input.
+                    if (csi.final >= 'A' and csi.final <= 'D' and csi.intermediates.len == 0) return true;
+                    if (csi.intermediates.len == 0) {
+                        if (csi.final == 'Z' and csi.params.len == 0) return true;
+                        if (csi.final == 'H' or csi.final == 'F') {
+                            // Home/End use no params or 1;<modifier>, unlike cursor positioning.
+                            if (csi.params.len == 0 or
+                                (csi.params.len == 2 and csi.params[0] == 1 and
+                                    csi.params[1] >= 1 and !csi.params_sep.isSet(0))) return true;
+                        }
+                    }
                     // mouse events: CSI M (basic) or CSI < (SGR extended) - EXCLUDE these
                     // only intentional keyboard input should trigger leader switch
                     if (csi.final == 'M' or csi.final == '<') return false;
@@ -1036,10 +1047,18 @@ pub fn writeSessionLine(
         session.created_at,
     });
     if (session.cwd) |cwd| {
-        try writer.print("\tcwd={s}", .{cwd});
+        const encoded_len = std.base64.standard.Encoder.calcSize(cwd.len);
+        const encoded = try std.heap.page_allocator.alloc(u8, encoded_len);
+        defer std.heap.page_allocator.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, cwd);
+        try writer.print("\tcwd_b64={s}", .{encoded});
     }
     if (session.cmd) |cmd| {
-        try writer.print("\tcmd={s}", .{cmd});
+        const encoded_len = std.base64.standard.Encoder.calcSize(cmd.len);
+        const encoded = try std.heap.page_allocator.alloc(u8, encoded_len);
+        defer std.heap.page_allocator.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, cmd);
+        try writer.print("\tcmd_b64={s}", .{encoded});
     }
     if (session.task_ended_at) |ended_at| {
         if (ended_at > 0) {
@@ -1128,6 +1147,51 @@ test "writeSessionLine formats output for current session and short output" {
         try writeSessionLine(&builder.writer, case.session, case.short, case.current_session);
         try testing.expectEqualStrings(case.expected, builder.writer.buffered());
     }
+}
+
+test "writeSessionLine base64-encodes cwd and emits labels as tab-separated fields" {
+    const session = SessionEntry{
+        .name = "dev",
+        .pid = 123,
+        .clients_len = 0,
+        .is_error = false,
+        .error_name = null,
+        .cwd = "/Users/eD/Development/awesomux",
+        .labels = "awesomux.workspace-title=V29yaw awesomux.group-id=MTExMQ",
+        .created_at = 10,
+        .task_ended_at = null,
+        .task_exit_code = null,
+        .daemon_pid = 99,
+    };
+    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer builder.deinit();
+
+    try writeSessionLine(&builder.writer, session, false, null);
+
+    try testing.expectEqualStrings(
+        "name=dev\tpid=123\tclients=0\tcreated=10\tcwd_b64=L1VzZXJzL2VEL0RldmVsb3BtZW50L2F3ZXNvbXV4\tawesomux.workspace-title=V29yaw\tawesomux.group-id=MTExMQ\tdaemon_pid=99\n",
+        builder.writer.buffered(),
+    );
+}
+
+test "writeSessionLine frames delimiter-bearing cwd" {
+    const session = SessionEntry{
+        .name = "dev",
+        .pid = 123,
+        .clients_len = 1,
+        .is_error = false,
+        .error_name = null,
+        .cwd = "/tmp/x\tclients=0\nname=fake",
+        .created_at = 10,
+        .task_ended_at = null,
+        .task_exit_code = null,
+    };
+    var builder: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer builder.deinit();
+
+    try writeSessionLine(&builder.writer, session, false, null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, builder.writer.buffered(), "\n"));
+    try testing.expect(std.mem.indexOf(u8, builder.writer.buffered(), "\tclients=0") == null);
 }
 
 test "shellNeedsQuoting" {
@@ -2096,6 +2160,18 @@ test "isUserInput: arrow keys with modifier params CSI A-D" {
     try testing.expect(isUserInput("\x1b[1;5D")); // Ctrl+Left
     try testing.expect(isUserInput("\x1b[1;3A")); // Alt+Up
     try testing.expect(isUserInput("\x1b[1;3B")); // Alt+Down
+}
+
+test "isUserInput: CSI arrows exclude intermediate sequences" {
+    const finals = "ABCD";
+    for (finals) |final| {
+        var ordinary = [_]u8{ 0x1b, '[', final };
+        var modified = [_]u8{ 0x1b, '[', '1', ';', '5', final };
+        var intermediate = [_]u8{ 0x1b, '[', '1', ';', '5', ' ', final };
+        try testing.expect(isUserInput(&ordinary));
+        try testing.expect(isUserInput(&modified));
+        try testing.expect(!isUserInput(&intermediate));
+    }
 }
 
 test "isUserInput: function keys with modifiers CSI 27 ; ~" {
