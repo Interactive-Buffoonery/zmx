@@ -136,6 +136,12 @@ def main(binary):
         after_exit = replay(data + b'\x1b[?1049l\x1b[1;1HX', 6, 40)
         check('1049 exit restores saved origin mode', after_exit[1], 'X')
 
+        data = snapshot('origin-margins', b'\x1b[2;5r\x1b[?6h\x1b[3;7HP\x1b[?1049h\x1b[?6lEND')
+        check('retained margins do not shift the primary cursor', replay(b'\x1b[2;5r' + data + b'\x1b[?1049l@', 6, 40)[3], '      P@')
+
+        data = snapshot('history-margins', b'\r\n'.join(b'%d' % i for i in range(30)) + b'\r\nEND')
+        check('retained margins keep history', replay(b'\x1b[2;5r\x1b[?6h' + data, 6, 40), replay(data, 6, 40))
+
         data = snapshot('origin-alt', b'\x1b[?1049h\x1b[2;5r\x1b[?6hEND')
         check('alt keeps its own origin mode', replay(data + b'\x1b[1;1HX', 6, 40)[1], 'XND')
 
