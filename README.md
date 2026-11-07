@@ -25,8 +25,8 @@
 > - **Typed roles and authority** — watch-only or interactive clients, explicit takeover,
 >   leaderless recovery with reconnect grace, and an ordered input/resize queue.
 > - **Framed list metadata** — Base64 paths and commands, with reserved label names.
-> - **Daemon-liveness verification** in `ensureSession`, with probe retry, so a stale
->   socket is recreated instead of hanging.
+> - **Daemon-liveness verification** — retry probes and recover refused sockets;
+>   timeouts and incompatible replies preserve the socket and fail the attach.
 > - **Mouse-report gating fixes** — stale SGR mouse reports are dropped when the
 >   effective mouse mode disagrees, instead of landing as literal text.
 > - **Real session-end exit codes** — the daemon reports the trailing command's actual
