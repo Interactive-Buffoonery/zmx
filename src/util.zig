@@ -923,11 +923,12 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     // between a program and its current terminal client. Replaying it to a
     // newly attached client can leave that client deferring renders until its
     // local timeout fires, so temporarily exclude it from restored state and
-    // restore the original mode before returning.
+    // restore the original mode on every exit.
     const had_synchronized_output = term.modes.get(.synchronized_output);
     if (had_synchronized_output) {
         term.modes.set(.synchronized_output, false);
     }
+    defer if (had_synchronized_output) term.modes.set(.synchronized_output, true);
 
     // If state contains color override, restore it.
     writeColorOverrides(&builder.writer, term);
@@ -1015,11 +1016,6 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
 
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
-
-    // Restore the original synchronized_output mode before returning
-    if (had_synchronized_output) {
-        term.modes.set(.synchronized_output, true);
-    }
 
     return alloc.dupe(u8, output) catch |err| {
         std.log.warn("failed to allocate terminal state err={s}", .{@errorName(err)});
@@ -1768,6 +1764,22 @@ test "serializeTerminalState excludes synchronized output replay" {
     // but NOT synchronized output (DECSET 2026)
     try testing.expect(std.mem.indexOf(u8, output, "\x1b[?2004h") != null);
     try testing.expect(std.mem.indexOf(u8, output, "\x1b[?2026h") == null);
+}
+
+test "serializeTerminalState restores synchronized output after a failed write" {
+    const alloc = testing.allocator;
+
+    var term = try ghostty_vt.Terminal.init(testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("primary\x1b[?1049h\x1b[?2026halt");
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try testing.expect(serializeTerminalState(failing.allocator(), &term, 24) == null);
+    try testing.expect(term.modes.get(.synchronized_output));
 }
 
 test "serializeTerminalState replays the title" {
