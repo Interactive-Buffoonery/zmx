@@ -827,24 +827,8 @@ fn writeColorOverrides(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal)
     writeDynamicColor(writer, .cursor, colors.cursor);
 }
 
-pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal, client_rows: u16) ?[]const u8 {
-    var builder: std.Io.Writer.Allocating = .init(alloc);
-    defer builder.deinit();
-
-    // Synchronized output (DECSET 2026) is a transient rendering handshake
-    // between a program and its current terminal client. Replaying it to a
-    // newly attached client can leave that client deferring renders until its
-    // local timeout fires, so temporarily exclude it from restored state and
-    // restore the original mode before returning.
-    const had_synchronized_output = term.modes.get(.synchronized_output);
-    if (had_synchronized_output) {
-        term.modes.set(.synchronized_output, false);
-    }
-
-    // If state contains color override, restore it.
-    writeColorOverrides(&builder.writer, term);
-
-    const pages = &term.screens.active.pages;
+fn serializeScreenHistory(screen: *const ghostty_vt.Screen, writer: *std.Io.Writer, client_rows: u16, unwrap: bool) void {
+    const pages = &screen.pages;
     const screen_top = pages.getTopLeft(.screen);
     const active_top = pages.getTopLeft(.active);
     const has_scrollback = !screen_top.eql(active_top);
@@ -871,9 +855,9 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
             // CUP assumes the source row layout. A session with DECAWM off stays
             // hard-wrapped because a receiver reattached without RIS is still in
             // that mode and would truncate an unwrapped line.
-            var scroll_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .{
+            var scroll_fmt = ghostty_vt.formatter.ScreenFormatter.init(screen, .{
                 .emit = .vt,
-                .unwrap = term.modes.get(.wraparound),
+                .unwrap = unwrap,
             });
             scroll_fmt.content = .{
                 .selection = ghostty_vt.Selection.init(
@@ -883,22 +867,69 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
                 ),
             };
             scroll_fmt.extra = .none; // no modes, cursor, keyboard — just content
-            scroll_fmt.format(&builder.writer) catch |err| {
+            scroll_fmt.format(writer) catch |err| {
                 std.log.warn("failed to format scrollback err={s}", .{@errorName(err)});
             };
         }
 
         // The receiver may be taller than the daemon (Watch or follower).
         // Move every replayed row into its history before clearing the screen.
-        for (0..client_rows) |_| builder.writer.writeAll("\r\n") catch {};
+        for (0..client_rows) |_| writer.writeAll("\r\n") catch {};
 
         // Home the cursor and reset SGR so phase 1 styles don't bleed into
         // phase 2.
-        builder.writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch {};
+        writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch {};
+    }
+}
+
+pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal, client_rows: u16) ?[]const u8 {
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    // Synchronized output (DECSET 2026) is a transient rendering handshake
+    // between a program and its current terminal client. Replaying it to a
+    // newly attached client can leave that client deferring renders until its
+    // local timeout fires, so temporarily exclude it from restored state and
+    // restore the original mode before returning.
+    const had_synchronized_output = term.modes.get(.synchronized_output);
+    if (had_synchronized_output) {
+        term.modes.set(.synchronized_output, false);
     }
 
+    // If state contains color override, restore it.
+    writeColorOverrides(&builder.writer, term);
+
+    // Leave any receiver alt buffer before restoring history. 1047 avoids a
+    // stray 1049 cursor restore; the viewport replay below sets the cursor.
+    // A client that died on alt left its primary uncleared.
+    builder.writer.writeAll("\x1b[?1047l\x1b[0m\x1b[H\x1b[2J") catch {};
+    const primary = term.screens.get(.primary).?;
+    serializeScreenHistory(primary, &builder.writer, client_rows, term.modes.get(.wraparound));
+
+    var format_term = term.*;
+    if (term.screens.active_key == .alternate) {
+        var primary_fmt = ghostty_vt.formatter.ScreenFormatter.init(primary, .vt);
+        primary_fmt.content = .{ .selection = ghostty_vt.Selection.init(
+            primary.pages.getTopLeft(.active),
+            primary.pages.pin(.{ .active = .{ .x = @intCast(primary.pages.cols - 1), .y = @intCast(primary.pages.rows - 1) } }).?,
+            false,
+        ) };
+        primary_fmt.extra = .all;
+        primary_fmt.format(&builder.writer) catch return null;
+
+        // Mode aliases may coexist. Enter once, while still on primary, so
+        // 1049 saves its cursor rather than overwriting it with the alt cursor.
+        const mode: u16 = if (term.modes.get(.alt_screen_save_cursor_clear_enter)) 1049 else if (term.modes.get(.alt_screen)) 1047 else 47;
+        // The primary's pen, charset, and protection must not reach alt.
+        builder.writer.print("\x1b[?{d}h\x1b[0m\x1b(B\x0f\x1b[0\"q\x1b[2J\x1b[H", .{mode}) catch return null;
+    }
+    format_term.modes.set(.alt_screen_legacy, false);
+    format_term.modes.set(.alt_screen, false);
+    format_term.modes.set(.alt_screen_save_cursor_clear_enter, false);
+    const pages = &term.screens.active.pages;
+
     // Phase 2: visible screen with full extras (modes, cursor, keyboard, etc.)
-    var vis_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
+    var vis_fmt = ghostty_vt.formatter.TerminalFormatter.init(&format_term, .vt);
 
     // Restrict content to the active viewport only
     const active_tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } });

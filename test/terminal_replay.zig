@@ -20,6 +20,7 @@ pub fn main(init: std.process.Init) !void {
         .rows = rows,
         .cols = cols,
         .max_scrollback_lines = 10000,
+        .max_scrollback_bytes = null,
     });
     defer term.deinit(alloc);
     var stream = term.vtStream();
