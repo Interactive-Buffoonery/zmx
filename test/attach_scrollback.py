@@ -69,6 +69,7 @@ def main(binary):
     env.update(ZMX_DIR=root, SHELL='/bin/sh')
     replay_bin = str(Path(__file__).resolve().parents[1] / 'zig-out/bin/terminal-replay')
     clients = []
+    sessions = []
     failures = 0
     total = 0
 
@@ -81,6 +82,7 @@ def main(binary):
         return [line.rstrip() for line in Path(root + '/text').read_text().splitlines()]
 
     def start(name, payload, rows, cols):
+        sessions.append(name)
         Path(root + '/payload').write_bytes(b'\x1bc' + payload)
         subprocess.run([binary, 'run', name, '-d', sys.executable, str(Path(__file__).resolve()), '--fixture', root + '/payload'], env=env, check=True, capture_output=True)
         for _ in range(400):
@@ -123,6 +125,71 @@ def main(binary):
             lines = replay(data, rows, cols)
             check(f'numbers {role} {rows}x{cols}', [s for s in lines if s], expected)
             print(f'  physical nontrailing rows={len("\n".join(lines).rstrip().splitlines())}')
+        # Compare every physical row, including blanks; '@' probes both cursors.
+        primary = ('\r\n'.join(str(i) for i in range(1, 501))).encode() + b'\x1b[2;7H'
+        for mode in (1049, 1047, 47, 'mixed'):
+            enter = b'\x1b[?1049h\x1b[?47h\x1b[?1047h' if mode == 'mixed' else f'\x1b[?{mode}h'.encode()
+            leave = b'\x1b[?1049l' if mode == 'mixed' else f'\x1b[?{mode}l'.encode()
+            payload = primary + enter + b'\x1b[HALT\x1b[3;1HEND\x1b[2;6H'
+            name = f'alt{mode}'
+            start(name, payload, 4, 20)
+            for role, rows in [('legacy', 4), (1, 8), (2, 8)]:
+                c = Client(root, name)
+                try:
+                    data = c.attach(role, rows, 20)
+                finally:
+                    c.close()
+                label = f'alt {mode} role={role} rows={rows}'
+                for prefix, receiver in [(b'', 'fresh'), (b'\x1b[?1049hOLDALT', 'already-alt')]:
+                    expected_alt = replay(b'\x1bc' + payload + b'@', 4, 20) + [''] * (rows - 4)
+                    check(label + ' ' + receiver + ' active cursor', replay(prefix + data + b'@', rows, 20), expected_alt)
+                    expected_primary = replay(b'\x1bc' + payload + leave + b'@', 4, 20) + [''] * (rows - 4)
+                    check(label + ' ' + receiver + ' primary cursor', replay(prefix + data + leave + b'@', rows, 20), expected_primary)
+                print(f'  {label} snapshot_bytes={len(data)}')
+        small_primary = b'1\r\n2\r\n3\r\n4\r\n5\x1b]2;END\x07'
+        start('primary', small_primary, 4, 10)
+        c = Client(root, 'primary')
+        try:
+            data = c.attach('legacy', 4, 10)
+        finally:
+            c.close()
+        for prefix, receiver in [(b'', 'fresh guard'), (b'\x1b[?1049hOLDALT', 'already-alt')]:
+            check('non-alt ' + receiver + ' cursor', replay(prefix + data + b'@', 4, 10), replay(b'\x1bc' + small_primary + b'@', 4, 10))
+        large_primary = ('\r\n'.join(str(i) for i in range(1, 10001))).encode()
+        start('largealt', large_primary + b'\x1b[?1049hEND', 24, 80)
+        c = Client(root, 'largealt')
+        try:
+            data = c.attach(1, 24, 80)
+        finally:
+            c.close()
+        print(f'SIZE 10000-line primary + alt: {len(data)} bytes (limit={8 * 1024 * 1024})')
+        check('10000-line snapshot fits phone', [len(data) < 8 * 1024 * 1024], [True])
+        check('10000-line primary after exit cursor', replay(data + b'\x1b[?1049l@', 24, 80), [str(i) for i in range(1, 10000)] + ['10000@'])
+        # A primary that never reset its pen or charset must not restyle alt.
+        leak = b'prompt\x1b(0\x1b[?1049h\x1b(Bqqq\r\nEND'
+        start('charset', leak, 6, 20)
+        c = Client(root, 'charset')
+        try:
+            data = c.attach('legacy', 6, 20)
+        finally:
+            c.close()
+        check('primary charset stays out of alt', replay(data, 6, 20), replay(b'\x1bc' + leak, 6, 20))
+        # Client died on alt: its uncleared primary must not show through.
+        stale = b'STALE\r\nSTALE2\x1b[?1049h'
+        start('nohist', b'hi\r\nEND', 6, 20)
+        c = Client(root, 'nohist')
+        try:
+            data = c.attach('legacy', 6, 20)
+        finally:
+            c.close()
+        check('stale receiver primary, no history', replay(stale + data, 6, 20), replay(b'\x1bc' + b'hi\r\nEND', 6, 20))
+        start('hist', b'\r\n'.join(str(i).encode() for i in range(1, 11)) + b'\r\nEND', 4, 20)
+        c = Client(root, 'hist')
+        try:
+            data = c.attach('legacy', 4, 20)
+        finally:
+            c.close()
+        check('stale receiver primary, history', [s for s in replay(stale + data, 4, 20) if s], [str(i) for i in range(1, 11)] + ['END'])
         # Long logical lines in history must reflow; the viewport keeps source layout.
         logical = ['L' * 100] + [str(i) for i in range(10)] + ['x' * 100] + [str(i) for i in range(40)] + ['END']
         start('wrap', '\r\n'.join(logical).encode(), 24, 40)
@@ -228,7 +295,7 @@ def main(binary):
     finally:
         for c in clients:
             c.close()
-        for name in ['numbers', 'wrap', 'nowrap', 'blankcont', 'wider', 'stale', 'blank', 'boundary', 'narrow']:
+        for name in sessions:
             subprocess.run([binary, 'kill', name, '--force'], env=env, capture_output=True)
         subprocess.run(['trash', root])
 
