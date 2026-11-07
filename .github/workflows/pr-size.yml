@@ -1,0 +1,175 @@
+name: PR Size
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: pr-size-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    name: Label PR size
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out trusted base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch pull request as passive Git data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          head_ref="refs/remotes/pull/${PR_NUMBER}/head"
+          # Expand GH_TOKEN only inside Git's credential-helper subprocess.
+          # shellcheck disable=SC2016
+          git -c credential.helper= \
+            -c 'credential.helper=!f() { test "$1" = get && printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f' \
+            fetch --no-tags origin \
+            "+refs/pull/${PR_NUMBER}/head:${head_ref}"
+          fetched_sha="$(git rev-parse "${head_ref}^{commit}")"
+          if [[ "$fetched_sha" != "$PR_HEAD_SHA" ]]; then
+            echo "error: fetched PR head $fetched_sha does not match event SHA $PR_HEAD_SHA" >&2
+            exit 1
+          fi
+
+      - name: Sync PR size label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          labels_json='[
+            {"name":"size:XS","color":"0e8a16","description":"0-9 effective changed lines."},
+            {"name":"size:S","color":"5ebd3e","description":"10-29 effective changed lines."},
+            {"name":"size:M","color":"fbca04","description":"30-99 effective changed lines."},
+            {"name":"size:L","color":"fe7d37","description":"100-499 effective changed lines."},
+            {"name":"size:XL","color":"d93f0b","description":"500-999 effective changed lines."},
+            {"name":"size:XXL","color":"b60205","description":"1,000+ effective changed lines."}
+          ]'
+
+          head_ref="refs/remotes/pull/${PR_NUMBER}/head"
+          total_changed=0
+          non_test_changed=0
+          test_changed=0
+
+          while IFS=$'\t' read -r additions deletions filename; do
+            [[ -z "$filename" ]] && continue
+            [[ "$additions" == "-" ]] && additions=0
+            [[ "$deletions" == "-" ]] && deletions=0
+            changed=$((additions + deletions))
+            total_changed=$((total_changed + changed))
+
+            if [[ "$filename" == test/* ||
+                  "$filename" == Tests/* ||
+                  "$filename" == */Tests/* ||
+                  "$filename" == */__tests__/* ||
+                  "$filename" == *.test.* ||
+                  "$filename" == *.spec.* ]]; then
+              test_changed=$((test_changed + changed))
+            else
+              non_test_changed=$((non_test_changed + changed))
+            fi
+          done < <(
+            git diff --numstat --ignore-all-space --ignore-blank-lines \
+              "${BASE_SHA}...${head_ref}"
+          )
+
+          if [[ "$non_test_changed" -eq 0 ]]; then
+            effective_changed="$test_changed"
+          else
+            effective_changed="$non_test_changed"
+          fi
+
+          if [[ "$effective_changed" -lt 10 ]]; then
+            next_label="size:XS"
+          elif [[ "$effective_changed" -lt 30 ]]; then
+            next_label="size:S"
+          elif [[ "$effective_changed" -lt 100 ]]; then
+            next_label="size:M"
+          elif [[ "$effective_changed" -lt 500 ]]; then
+            next_label="size:L"
+          elif [[ "$effective_changed" -lt 1000 ]]; then
+            next_label="size:XL"
+          else
+            next_label="size:XXL"
+          fi
+
+          while IFS= read -r label; do
+            name="$(jq -r '.name' <<< "$label")"
+            color="$(jq -r '.color' <<< "$label")"
+            description="$(jq -r '.description' <<< "$label")"
+            ./.github/scripts/ensure-repository-label.sh \
+              "$GITHUB_REPOSITORY" "$name" "$color" "$description"
+          done < <(jq -c '.[]' <<< "$labels_json")
+
+          current_labels="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels" --jq '.[].name')"
+          managed_labels="$(jq -r '.[].name' <<< "$labels_json")"
+
+          while IFS= read -r label; do
+            if [[ -z "$label" || "$label" == "$next_label" ]]; then
+              continue
+            fi
+
+            if grep -Fxq "$label" <<< "$current_labels"; then
+              encoded_label="$(jq -rn --arg value "$label" '$value | @uri')"
+              gh api \
+                --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/${encoded_label}" \
+                >/dev/null || true
+            fi
+          done <<< "$managed_labels"
+
+          if ! grep -Fxq "$next_label" <<< "$current_labels"; then
+            gh api \
+              --method POST \
+              "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels" \
+              -f labels[]="$next_label" \
+              >/dev/null
+          fi
+
+          marker='<!-- zmx-pr-size-xxl -->'
+          comment_id="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+              --jq ".[] | select(.user.login == \"github-actions[bot]\" and .user.type == \"Bot\") | select(.body | contains(\"${marker}\")) | .id" | tail -1
+          )"
+
+          if [[ "$next_label" == "size:XXL" ]]; then
+            body="$(printf '%s\n' \
+              "$marker" \
+              "## Large pull request" \
+              "" \
+              "This PR has ${effective_changed} effective changed lines and is labeled \`size:XXL\`." \
+              "The label is informational and does not block merging. Please consider splitting the" \
+              "change where practical so each part is easier to review. See \`CONTRIBUTING.md\` for" \
+              "the project's small-PR guidance.")"
+            if [[ -n "$comment_id" ]]; then
+              gh api --method PATCH \
+                "repos/${GITHUB_REPOSITORY}/issues/comments/${comment_id}" \
+                -f body="$body" >/dev/null
+            else
+              gh api --method POST \
+                "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+                -f body="$body" >/dev/null
+            fi
+          elif [[ -n "$comment_id" ]]; then
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/issues/comments/${comment_id}" >/dev/null
+          fi
+
+          echo "PR #${PR_NUMBER}: ${total_changed} total, ${non_test_changed} production, ${test_changed} test, ${effective_changed} effective -> ${next_label}"
