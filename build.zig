@@ -99,6 +99,19 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_exe_unit_tests.step);
     }
 
+    // Replay captured attach bytes with the same terminal core as the daemon.
+    {
+        const replay_mod = b.createModule(.{
+            .root_source_file = b.path("test/terminal_replay.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        replay_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
+        const replay = b.addExecutable(.{ .name = "terminal-replay", .root_module = replay_mod });
+        const step = b.step("test-replay", "Build the attach regression terminal");
+        step.dependOn(&b.addInstallArtifact(replay, .{}).step);
+    }
+
     // Check for LSP integration
     {
         const check = b.step("check", "Check if zmx compiles");

@@ -825,26 +825,43 @@ fn writeColorOverrides(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal)
     writeDynamicColor(writer, .foreground, colors.foreground);
     writeDynamicColor(writer, .background, colors.background);
     writeDynamicColor(writer, .cursor, colors.cursor);
+    var it = colors.palette.mask.iterator(.{});
+    while (it.next()) |i| {
+        const c = colors.palette.current[i];
+        writer.print("\x1b]4;{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}\x1b\\", .{
+            i, c.r, c.g, c.b,
+        }) catch |err| {
+            std.log.warn("failed to format palette color err={s}", .{@errorName(err)});
+        };
+    }
 }
 
-pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
-    var builder: std.Io.Writer.Allocating = .init(alloc);
-    defer builder.deinit();
-
-    // Synchronized output (DECSET 2026) is a transient rendering handshake
-    // between a program and its current terminal client. Replaying it to a
-    // newly attached client can leave that client deferring renders until its
-    // local timeout fires, so temporarily exclude it from restored state and
-    // restore the original mode before returning.
-    const had_synchronized_output = term.modes.get(.synchronized_output);
-    if (had_synchronized_output) {
-        term.modes.set(.synchronized_output, false);
+fn hasCustomTabstops(term: *const ghostty_vt.Terminal) bool {
+    for (0..term.cols) |col| {
+        // Match Ghostty Tabstops.reset, which excludes the final column.
+        const default = col > 0 and col % 8 == 0 and col < term.cols - 1;
+        if (term.tabstops.get(col) != default) return true;
     }
+    return false;
+}
 
-    // If state contains color override, restore it.
-    writeColorOverrides(&builder.writer, term);
+fn writeCursorStyle(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal, screen: *const ghostty_vt.Screen) void {
+    // A default cursor must keep the attaching client's configured shape.
+    if (term.cursor.is_default) return;
+    const steady: u8 = switch (screen.cursor.cursor_style) {
+        .block => 2,
+        .underline => 4,
+        .bar => 6,
+        else => return,
+    };
+    const code = steady - @as(u8, if (term.modes.get(.cursor_blinking)) 1 else 0);
+    writer.print("\x1b[{d} q", .{code}) catch |err| {
+        std.log.warn("failed to format cursor style err={s}", .{@errorName(err)});
+    };
+}
 
-    const pages = &term.screens.active.pages;
+fn serializeScreenHistory(screen: *const ghostty_vt.Screen, writer: *std.Io.Writer, client_rows: u16, unwrap: bool) void {
+    const pages = &screen.pages;
     const screen_top = pages.getTopLeft(.screen);
     const active_top = pages.getTopLeft(.active);
     const has_scrollback = !screen_top.eql(active_top);
@@ -867,7 +884,14 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
             var sb_bottom = sb_bottom_row;
             sb_bottom.x = @intCast(pages.cols - 1);
 
-            var scroll_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
+            // Keep history lines logical so they reflow. History only: phase 2's
+            // CUP assumes the source row layout. A session with DECAWM off stays
+            // hard-wrapped because a receiver reattached without RIS is still in
+            // that mode and would truncate an unwrapped line.
+            var scroll_fmt = ghostty_vt.formatter.ScreenFormatter.init(screen, .{
+                .emit = .vt,
+                .unwrap = unwrap,
+            });
             scroll_fmt.content = .{
                 .selection = ghostty_vt.Selection.init(
                     screen_top,
@@ -876,19 +900,83 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
                 ),
             };
             scroll_fmt.extra = .none; // no modes, cursor, keyboard — just content
-            scroll_fmt.format(&builder.writer) catch |err| {
+            scroll_fmt.format(writer) catch |err| {
                 std.log.warn("failed to format scrollback err={s}", .{@errorName(err)});
             };
         }
 
-        // Clear visible screen after scrollback. \x1b[2J clears only the visible
-        // rows (not the scrollback buffer). \x1b[H homes the cursor. \x1b[0m resets
-        // SGR style so phase 1 styles don't bleed into phase 2.
-        builder.writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch {};
+        // The receiver may be taller than the daemon (Watch or follower).
+        // Move every replayed row into its history before clearing the screen.
+        for (0..client_rows) |_| writer.writeAll("\r\n") catch {};
+
+        // Home the cursor and reset SGR so phase 1 styles don't bleed into
+        // phase 2.
+        writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch {};
     }
+}
+
+pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal, client_rows: u16) ?[]const u8 {
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    // Synchronized output (DECSET 2026) is a transient rendering handshake
+    // between a program and its current terminal client. Replaying it to a
+    // newly attached client can leave that client deferring renders until its
+    // local timeout fires, so temporarily exclude it from restored state and
+    // restore the original mode on every exit.
+    const had_synchronized_output = term.modes.get(.synchronized_output);
+    if (had_synchronized_output) {
+        term.modes.set(.synchronized_output, false);
+    }
+    defer if (had_synchronized_output) term.modes.set(.synchronized_output, true);
+
+    // If state contains color override, restore it.
+    writeColorOverrides(&builder.writer, term);
+
+    // Leave any receiver alt buffer before restoring history. 1047 avoids a
+    // stray 1049 cursor restore; the viewport replay below sets the cursor.
+    // A client that died on alt left its primary uncleared. A receiver
+    // reattached without RIS can also keep origin mode and margins, which would
+    // confine history and shift absolute positions. Phase 2 restores the source's.
+    builder.writer.writeAll("\x1b[?1047l\x1b[?6l\x1b[r\x1b[0m\x1b[H\x1b[2J") catch {};
+    // A receiver reattached without RIS can still have DECAWM off, which would
+    // truncate unwrapped history. When the source has it off, phase 2 sets it.
+    if (term.modes.get(.wraparound)) builder.writer.writeAll("\x1b[?7h") catch {};
+    const primary = term.screens.get(.primary).?;
+    serializeScreenHistory(primary, &builder.writer, client_rows, term.modes.get(.wraparound));
+
+    var format_term = term.*;
+    if (term.screens.active_key == .alternate) {
+        var primary_fmt = ghostty_vt.formatter.ScreenFormatter.init(primary, .vt);
+        primary_fmt.content = .{ .selection = ghostty_vt.Selection.init(
+            primary.pages.getTopLeft(.active),
+            primary.pages.pin(.{ .active = .{ .x = @intCast(primary.pages.cols - 1), .y = @intCast(primary.pages.rows - 1) } }).?,
+            false,
+        ) };
+        primary_fmt.extra = .all;
+        const enters_1049 = term.modes.get(.alt_screen_save_cursor_clear_enter);
+        // 1049 saves DECOM with the cursor. Setting it homes the cursor, so do
+        // this before the primary formatter positions it.
+        const saved_origin = enters_1049 and if (primary.saved_cursor) |saved| saved.origin else false;
+        if (saved_origin) builder.writer.writeAll("\x1b[?6h") catch return null;
+        primary_fmt.format(&builder.writer) catch return null;
+        writeCursorStyle(&builder.writer, term, primary);
+
+        // Mode aliases may coexist. Enter once, while still on primary, so
+        // 1049 saves its cursor rather than overwriting it with the alt cursor.
+        const mode: u16 = if (enters_1049) 1049 else if (term.modes.get(.alt_screen)) 1047 else 47;
+        // The primary's pen, charset, and protection must not reach alt.
+        builder.writer.print("\x1b[?{d}h\x1b[0m\x1b(B\x0f\x1b[0\"q\x1b[2J\x1b[H", .{mode}) catch return null;
+        // Phase 2 sets the alternate screen's own DECOM.
+        if (saved_origin) builder.writer.writeAll("\x1b[?6l") catch return null;
+    }
+    format_term.modes.set(.alt_screen_legacy, false);
+    format_term.modes.set(.alt_screen, false);
+    format_term.modes.set(.alt_screen_save_cursor_clear_enter, false);
+    const pages = &term.screens.active.pages;
 
     // Phase 2: visible screen with full extras (modes, cursor, keyboard, etc.)
-    var vis_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
+    var vis_fmt = ghostty_vt.formatter.TerminalFormatter.init(&format_term, .vt);
 
     // Restrict content to the active viewport only
     const active_tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } });
@@ -914,7 +1002,7 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         .palette = false,
         .modes = true,
         .scrolling_region = true,
-        .tabstops = false, // tabstop restoration moves cursor after CUP, corrupting position
+        .tabstops = hasCustomTabstops(term),
         .pwd = false, // emitted below without the sentinel the formatter includes
         .keyboard = true,
         .screen = .all,
@@ -925,6 +1013,7 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         return null;
     };
 
+    writeCursorStyle(&builder.writer, term, term.screens.active);
     writePwd(&builder.writer, term);
 
     // The formatter has no title extra and never emits OSC 0/1/2, so the title
@@ -939,11 +1028,6 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
 
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
-
-    // Restore the original synchronized_output mode before returning
-    if (had_synchronized_output) {
-        term.modes.set(.synchronized_output, true);
-    }
 
     return alloc.dupe(u8, output) catch |err| {
         std.log.warn("failed to allocate terminal state err={s}", .{@errorName(err)});
@@ -1685,13 +1769,29 @@ test "serializeTerminalState excludes synchronized output replay" {
     try testing.expect(term.modes.get(.bracketed_paste));
     try testing.expect(term.modes.get(.synchronized_output));
 
-    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    const output = serializeTerminalState(alloc, &term, term.screens.active.pages.rows) orelse return error.TestUnexpectedNull;
     defer alloc.free(output);
 
     // The serialized output should contain bracketed paste (DECSET 2004)
     // but NOT synchronized output (DECSET 2026)
     try testing.expect(std.mem.indexOf(u8, output, "\x1b[?2004h") != null);
     try testing.expect(std.mem.indexOf(u8, output, "\x1b[?2026h") == null);
+}
+
+test "serializeTerminalState restores synchronized output after a failed write" {
+    const alloc = testing.allocator;
+
+    var term = try ghostty_vt.Terminal.init(testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("primary\x1b[?1049h\x1b[?2026halt");
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try testing.expect(serializeTerminalState(failing.allocator(), &term, 24) == null);
+    try testing.expect(term.modes.get(.synchronized_output));
 }
 
 test "serializeTerminalState replays the title" {
@@ -1710,7 +1810,7 @@ test "serializeTerminalState replays the title" {
     stream.nextSlice("\x1b]2;my title\x07");
     stream.nextSlice("hello");
 
-    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    const output = serializeTerminalState(alloc, &term, term.screens.active.pages.rows) orelse return error.TestUnexpectedNull;
     defer alloc.free(output);
 
     try testing.expect(std.mem.indexOf(u8, output, "\x1b]2;my title\x07") != null);
@@ -1731,7 +1831,7 @@ test "serializeTerminalState omits the title when none is set" {
 
     stream.nextSlice("hello");
 
-    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    const output = serializeTerminalState(alloc, &term, term.screens.active.pages.rows) orelse return error.TestUnexpectedNull;
     defer alloc.free(output);
 
     try testing.expect(std.mem.indexOf(u8, output, "\x1b]2;") == null);
@@ -1753,7 +1853,7 @@ test "serializeTerminalState replays the pwd without a NUL sentinel" {
     stream.nextSlice("\x1b]7;file://myhost/private/tmp\x1b\\");
     stream.nextSlice("hello");
 
-    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    const output = serializeTerminalState(alloc, &term, term.screens.active.pages.rows) orelse return error.TestUnexpectedNull;
     defer alloc.free(output);
 
     try testing.expect(std.mem.indexOf(u8, output, "\x1b]7;file://myhost/private/tmp\x1b\\") != null);
@@ -1775,7 +1875,7 @@ test "serializeTerminalState omits the pwd when none is set" {
 
     stream.nextSlice("hello");
 
-    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    const output = serializeTerminalState(alloc, &term, term.screens.active.pages.rows) orelse return error.TestUnexpectedNull;
     defer alloc.free(output);
 
     try testing.expect(std.mem.indexOf(u8, output, "\x1b]7;") == null);
@@ -1833,7 +1933,7 @@ fn expectCursorAt(term: *ghostty_vt.Terminal, row: usize, col: usize) !void {
 }
 
 fn serializeRoundtrip(alloc: std.mem.Allocator, io: std.Io, source: *ghostty_vt.Terminal) !ghostty_vt.Terminal {
-    const serialized = serializeTerminalState(alloc, source) orelse
+    const serialized = serializeTerminalState(alloc, source, source.screens.active.pages.rows) orelse
         return error.SerializationFailed;
     defer alloc.free(serialized);
 
@@ -1974,7 +2074,7 @@ test "serializeTerminalState nested roundtrip preserves content" {
     const inner_cursor_y = inner.screens.active.cursor.y;
 
     // Serialize inner (simulates inner daemon re-attach to inner client)
-    const inner_serialized = serializeTerminalState(alloc, &inner) orelse
+    const inner_serialized = serializeTerminalState(alloc, &inner, inner.screens.active.pages.rows) orelse
         return error.SerializationFailed;
     defer alloc.free(inner_serialized);
 
@@ -2070,7 +2170,7 @@ test "serializeTerminalState scrollback + size mismatch nested roundtrip" {
     const inner_cursor_y = inner.screens.active.cursor.y;
 
     // Inner serialize → outer processes → outer serialize → client
-    const inner_ser = serializeTerminalState(alloc, &inner) orelse
+    const inner_ser = serializeTerminalState(alloc, &inner, inner.screens.active.pages.rows) orelse
         return error.SerializationFailed;
     defer alloc.free(inner_ser);
 

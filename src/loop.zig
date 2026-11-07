@@ -1129,7 +1129,7 @@ pub const Daemon = struct {
             try ipc.appendMessage(gpa, &client.write_buf, .AttachAccepted, &accepted);
             if (client.role == .interactive) try self.claimCreation(gpa, client);
             try self.authority(gpa, client);
-            if (util.serializeTerminalState(gpa, term)) |snapshot| {
+            if (util.serializeTerminalState(gpa, term, client.requested.rows)) |snapshot| {
                 defer gpa.free(snapshot);
                 const restored = util.rewritePromptRedraw(gpa, snapshot) orelse snapshot;
                 defer if (restored.ptr != snapshot.ptr) gpa.free(restored);
@@ -1464,7 +1464,7 @@ pub const Daemon = struct {
             // Apply a queued recovery first so the snapshot is laid out at
             // the grid this pane will see, not the previous leader's.
             try self.flushOperations(gpa, pty_fd, term);
-            if (util.serializeTerminalState(gpa, term)) |term_output| {
+            if (util.serializeTerminalState(gpa, term, client.requested.rows)) |term_output| {
                 std.log.debug("serialize terminal state", .{});
                 // Rewrite OSC 133;A to include redraw=0 so the outer terminal
                 // does not clear prompt lines on resize (issue #111).
