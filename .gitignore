@@ -17,3 +17,13 @@ prior_art/
 result
 result-*
 .direnv/
+
+# Local agent state; keep the shared merge-risk skill
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/merge-risk/
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/merge-risk
