@@ -27,6 +27,8 @@
 > - **Framed list metadata** — Base64 paths and commands, with reserved label names.
 > - **Daemon-liveness verification** — retry probes and recover refused sockets;
 >   timeouts and incompatible replies preserve the socket and fail the attach.
+> - **Reattach replay repairs** — preserve full scrollback, primary/alternate screens,
+>   cursor shape, palette, tab stops, wrap mode, and retained margins.
 > - **Mouse-report gating fixes** — stale SGR mouse reports are dropped when the
 >   effective mouse mode disagrees, instead of landing as literal text.
 > - **Real session-end exit codes** — the daemon reports the trailing command's actual
