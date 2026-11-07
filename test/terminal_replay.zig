@@ -27,6 +27,20 @@ pub fn main(init: std.process.Init) !void {
     defer stream.deinit();
     stream.nextSlice(bytes);
     if (args.next()) |width| try term.resize(alloc, .{ .cols = try std.fmt.parseInt(u16, width, 10), .rows = rows });
+    var state: std.Io.Writer.Allocating = .init(alloc);
+    const cursor = term.screens.active.cursor;
+    try state.writer.print("cursor={s},{},{} at={},{}\n", .{
+        @tagName(cursor.cursor_style), term.modes.get(.cursor_blinking),
+        term.cursor.is_default,        cursor.x,
+        cursor.y,
+    });
+    for (term.colors.palette.current, 0..) |rgb, i| {
+        try state.writer.print("{}={x:0>2}{x:0>2}{x:0>2}\n", .{ i, rgb.r, rgb.g, rgb.b });
+    }
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = try std.fmt.allocPrint(alloc, "{s}.state", .{output}),
+        .data = state.written(),
+    });
     var text: std.Io.Writer.Allocating = .init(alloc);
     var it = term.screens.active.pages.rowIterator(.right_down, .{ .screen = .{} }, null);
     while (it.next()) |pin| {
