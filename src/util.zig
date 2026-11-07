@@ -935,8 +935,10 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
 
     // Leave any receiver alt buffer before restoring history. 1047 avoids a
     // stray 1049 cursor restore; the viewport replay below sets the cursor.
-    // A client that died on alt left its primary uncleared.
-    builder.writer.writeAll("\x1b[?1047l\x1b[0m\x1b[H\x1b[2J") catch {};
+    // A client that died on alt left its primary uncleared. A receiver
+    // reattached without RIS can also keep origin mode and margins, which would
+    // confine history and shift absolute positions. Phase 2 restores the source's.
+    builder.writer.writeAll("\x1b[?1047l\x1b[?6l\x1b[r\x1b[0m\x1b[H\x1b[2J") catch {};
     // A receiver reattached without RIS can still have DECAWM off, which would
     // truncate unwrapped history. When the source has it off, phase 2 sets it.
     if (term.modes.get(.wraparound)) builder.writer.writeAll("\x1b[?7h") catch {};
@@ -955,10 +957,8 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         const enters_1049 = term.modes.get(.alt_screen_save_cursor_clear_enter);
         // 1049 saves DECOM with the cursor. Setting it homes the cursor, so do
         // this before the primary formatter positions it.
-        if (enters_1049) {
-            const saved_origin = if (primary.saved_cursor) |saved| saved.origin else false;
-            builder.writer.print("\x1b[?6{c}", .{@as(u8, if (saved_origin) 'h' else 'l')}) catch return null;
-        }
+        const saved_origin = enters_1049 and if (primary.saved_cursor) |saved| saved.origin else false;
+        if (saved_origin) builder.writer.writeAll("\x1b[?6h") catch return null;
         primary_fmt.format(&builder.writer) catch return null;
         writeCursorStyle(&builder.writer, term, primary);
 
@@ -968,7 +968,7 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         // The primary's pen, charset, and protection must not reach alt.
         builder.writer.print("\x1b[?{d}h\x1b[0m\x1b(B\x0f\x1b[0\"q\x1b[2J\x1b[H", .{mode}) catch return null;
         // Phase 2 sets the alternate screen's own DECOM.
-        if (enters_1049) builder.writer.writeAll("\x1b[?6l") catch return null;
+        if (saved_origin) builder.writer.writeAll("\x1b[?6l") catch return null;
     }
     format_term.modes.set(.alt_screen_legacy, false);
     format_term.modes.set(.alt_screen, false);
