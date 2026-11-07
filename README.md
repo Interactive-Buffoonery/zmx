@@ -21,6 +21,10 @@
 > - **AMX out-of-band protocol** — a status channel (`AMX_STATUS_FILE`/`AMX_STATUS_TOKEN`),
 >   `attached`/`session-end` events, and a cwd query, so the parent app can observe
 >   sessions without scraping the PTY.
+> - **Existing-only attach** — attach to a verified live session without creating one.
+> - **Typed roles and authority** — watch-only or interactive clients, explicit takeover,
+>   leaderless recovery with reconnect grace, and an ordered input/resize queue.
+> - **Framed list metadata** — Base64 paths and commands, with reserved label names.
 > - **Daemon-liveness verification** in `ensureSession`, with probe retry, so a stale
 >   socket is recreated instead of hanging.
 > - **Mouse-report gating fixes** — stale SGR mouse reports are dropped when the

@@ -69,8 +69,9 @@ session leaderless for 5 seconds first, so a phone that reconnects does not
 reflow the grid twice; other departures do not shorten the wait, and any
 claim, including a Mac pane's resize, ends it. A downgrade elects at once.
 Typed attachments, Watch and automation never recover leadership; the phone
-keeps its explicit claim. A re-attaching pane's queued claim is applied
-before its snapshot is serialized, so the snapshot matches its grid.
+keeps its explicit claim. Before serializing a re-attaching pane's snapshot,
+the daemon attempts to flush queued operations. If an earlier PTY write is
+blocked, recovery stays queued and the snapshot can use the previous grid.
 Automation is classified only before Init, so a client that sends Init and
 then Send or Run stays a legacy terminal.
 
@@ -85,7 +86,7 @@ per-batch acknowledgment; callers must not retry ambiguous sends. A full queue
 rejects the new operation without claiming leadership.
 
 Replies are accepted only from the current interactive leader and only for the
-current epoch. Explicit takeover, leader change, disconnect or leader downgrade
+current epoch. Explicit takeover, actual leader change, disconnect or leader downgrade
 changes the epoch. A size-only change broadcasts the grid without changing the
 epoch. Queued replies are checked again before forwarding. Already forwarded
 bytes cannot be withdrawn. Automation Send does not claim or resize. Watch
