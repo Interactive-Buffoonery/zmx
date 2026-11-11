@@ -3,11 +3,23 @@
 REPO_DIR="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
 
 setup() {
+  ZMX="${ZMX:-$REPO_DIR/zig-out/bin/zmx}"
+
   # Build once per test suite (skips if already built)
-  if [[ ! -x "$REPO_DIR/zig-out/bin/zmx" ]]; then
-    cd "$REPO_DIR" && zig build
+  if [[ ! -x "$ZMX" ]]; then
+    local os
+    os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+    local arch
+    arch="$(uname -m)"
+    local dist_tar
+    dist_tar=$(ls -1t "$REPO_DIR/zig-out/dist/zmx-"*"-${os}-${arch}.tar.gz" 2>/dev/null | head -n1 || true)
+    if [[ -n "$dist_tar" && -f "$dist_tar" ]]; then
+      mkdir -p "$(dirname "$ZMX")"
+      tar -xzf "$dist_tar" -C "$(dirname "$ZMX")"
+    else
+      cd "$REPO_DIR" && zig build
+    fi
   fi
-  ZMX="$REPO_DIR/zig-out/bin/zmx"
 
   # Isolate socket dir so tests don't interfere with real sessions or each other
   export ZMX_DIR="$BATS_TEST_TMPDIR/zmx-sockets"
@@ -55,11 +67,21 @@ wait_for_output() {
   return 1
 }
 
+# Decode the fork's framed list field for cwd assertions.
+list_with_cwd() {
+  "$ZMX" list | python3 -c '
+import base64, sys
+for row in sys.stdin:
+    fields = row.rstrip("\n").split("\t")
+    print("\t".join("cwd=" + base64.b64decode(field[8:]).decode() if field.startswith("cwd_b64=") else field for field in fields))
+'
+}
+
 # Helper: wait for a session's cwd to match expected substring (up to N seconds).
 wait_for_cwd() {
   local name="$1" pattern="$2" timeout="${3:-5}" i=0
   while (( i < timeout * 10 )); do
-    if "$ZMX" list 2>/dev/null | grep -F "name=$name" | grep -qF "$pattern"; then
+    if list_with_cwd 2>/dev/null | grep -F "name=$name" | grep -qF "$pattern"; then
       return 0
     fi
     sleep 0.1

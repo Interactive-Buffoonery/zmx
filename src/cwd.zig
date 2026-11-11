@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ipc = @import("ipc.zig");
-const cross = @import("cross.zig");
+const cross = @import("cross");
 const lib_posix = @import("posix.zig");
 
 extern "c" fn amx_proc_cwd(pid: c_int, buffer: [*]u8, capacity: usize) c_int;
@@ -33,7 +33,7 @@ pub fn cwdForSession(
     if (builtin.os.tag != .macos) return error.UnsupportedPlatform;
 
     if (pty_fd >= 0) {
-        const foreground_pgid = cross.c.tcgetpgrp(pty_fd);
+        const foreground_pgid = cross.tcgetpgrp(pty_fd);
         if (foreground_pgid > 0 and foreground_pgid != root_pid) {
             if (cwdForGroup(alloc, @intCast(foreground_pgid))) |path| {
                 return path;
@@ -110,7 +110,7 @@ test "cwdForSession prefers the foreground process group cwd" {
     const child_pid = cross.forkpty(&master_fd, null, null, null);
     if (child_pid < 0) return error.ForkPtyFailed;
     if (child_pid == 0) {
-        if (cross.c.chdir(tmp_path.ptr) != 0) lib_posix.exit(2);
+        if (cross.chdir(tmp_path.ptr) != 0) lib_posix.exit(2);
         _ = lib_posix.write(lib_posix.STDOUT_FILENO, "R") catch lib_posix.exit(3);
         var release: [1]u8 = undefined;
         _ = lib_posix.read(lib_posix.STDIN_FILENO, &release) catch lib_posix.exit(4);
@@ -173,10 +173,10 @@ test "cwdForSession follows a surviving group member when the leader exits" {
         const job_pid = lib_posix.fork() catch lib_posix.exit(2);
         if (job_pid == 0) {
             // Job leader: own group, spawn the surviving member, die.
-            if (cross.c.setpgid(0, 0) != 0) lib_posix.exit(3);
+            if (cross.setpgid(0, 0) != 0) lib_posix.exit(3);
             const member_pid = lib_posix.fork() catch lib_posix.exit(4);
             if (member_pid == 0) {
-                if (cross.c.chdir(tmp_path.ptr) != 0) lib_posix.exit(5);
+                if (cross.chdir(tmp_path.ptr) != 0) lib_posix.exit(5);
                 _ = lib_posix.write(lib_posix.STDOUT_FILENO, "R") catch lib_posix.exit(6);
                 var release: [1]u8 = undefined;
                 _ = lib_posix.read(lib_posix.STDIN_FILENO, &release) catch lib_posix.exit(7);
@@ -187,11 +187,11 @@ test "cwdForSession follows a surviving group member when the leader exits" {
         // Shell: create the job's group (racing the child's setpgid is the
         // standard both-sides pattern), make it the foreground group, reap the
         // job leader, then signal 'D' and idle until killed.
-        _ = cross.c.setpgid(job_pid, job_pid);
-        if (cross.c.tcsetpgrp(lib_posix.STDIN_FILENO, job_pid) != 0) lib_posix.exit(8);
+        _ = cross.setpgid(job_pid, job_pid);
+        if (cross.tcsetpgrp(lib_posix.STDIN_FILENO, job_pid) != 0) lib_posix.exit(8);
         _ = lib_posix.waitpid(job_pid, 0);
         _ = lib_posix.write(lib_posix.STDOUT_FILENO, "D") catch lib_posix.exit(9);
-        while (true) _ = cross.c.sleep(1);
+        while (true) _ = cross.sleep(1);
     }
 
     defer {

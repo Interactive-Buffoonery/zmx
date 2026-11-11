@@ -40,7 +40,11 @@ def fixture(root):
             while Path(root + '/blocked').exists():
                 Path(root + '/blocked-ready').touch()
                 time.sleep(.005)
-            pending += os.read(0, 4096)
+            chunk = os.read(0, 4096)
+            if Path(root + '/capture-raw').exists():
+                with open(root + '/raw-input', 'ab') as raw:
+                    raw.write(chunk)
+            pending += chunk
             while b'\n' in pending:
                 line, pending = pending.split(b'\n', 1)
                 out.write(json.dumps({'bytes': len(line), 'sha256': hashlib.sha256(line).hexdigest()}) + '\n')
@@ -84,7 +88,40 @@ def scenario(binary, kind):
             identity = wait(records)[0]
             a = Client(root + '/regression'); clients.append(a)
             w = Client(root + '/regression'); clients.append(w); w.attach(1)
-            if kind == 'controls':
+            if kind == 'cwd-idle':
+                for _ in range(2):
+                    time.sleep(.05)
+                    a.send(15)
+                    response = a.receive(16)
+                    assert len(response) == 260, len(response)
+                    length = struct.unpack('<H', response[:2])[0]
+                    assert response[2] == 0 and length > 0, response[:3]
+                    assert os.path.realpath(os.fsdecode(response[3:3 + length])) == os.path.realpath(os.getcwd())
+            elif kind == 'write-overflow':
+                Path(root + '/blocked').touch()
+                a.send(22, b'\n')
+                wait(lambda: Path(root + '/blocked-ready').exists())
+                Path(root + '/capture-raw').touch()
+                content = b'A' * 400000
+                destination = b'overflow.bin'
+                payload = struct.pack('<I', len(destination)) + destination + content
+                a.send(12, payload)
+                a.receive(10)
+                a.send(12, struct.pack('<I', 1) + b'x' + b'small')
+                assert a.sock.recv(1) == b'', 'rejected write was acknowledged'
+                os.kill(identity['pid'], 0)
+                os.kill(identity['daemon'], 0)
+                assert 'regression' in subprocess.check_output([binary, 'list', '--short'], env=env, text=True)
+                Path(root + '/blocked').unlink()
+                import base64
+                expected = b"printf '%s' '" + base64.b64encode(content) + b"' | base64 -d > 'overflow.bin'\r"
+                wait(lambda: Path(root + '/raw-input').exists() and Path(root + '/raw-input').stat().st_size == len(expected))
+                assert Path(root + '/raw-input').read_bytes() == expected
+                separator = Client(root + '/regression'); clients.append(separator)
+                separator.send(22, b'\n')
+                wait(lambda: len(records()) == 3)
+                w.state()
+            elif kind == 'controls':
                 # A typed leader keeps each fresh Mac pane a follower, so only the key can claim.
                 t = Client(root + '/regression'); clients.append(t); t.attach(2)
                 a.send(7, struct.pack('<HH', 24, 80))
@@ -361,7 +398,7 @@ if __name__ == '__main__':
         signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
         binary = os.path.abspath(sys.argv[1])
         report = {'binary_sha256': hashlib.sha256(Path(binary).read_bytes()).hexdigest(), 'sources': {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in [Path('src/loop.zig'), Path(__file__), Path('test/leadership.py')]}, 'scenarios': {}}
-        for kind in ['controls', 'watch-effects', 'same-leader-reply', 'legacy-resize-reply', 'nonclaiming-replies', 'claim-resize-leaderless-legacy', 'claim-resize-follower-legacy', 'claim-resize-leaderless-takeover', 'claim-resize-follower-user', 'claim-resize-blocked-legacy', 'claim-resize-blocked-user', 'claim-resize-blocked-takeover', 'claim-resize-blocked-intervening', 'claim-resize-blocked-downgrade', 'claim-resize-blocked-disconnect', 'history', 'typed-resize', 'legacy-resize', 'pixels', 'saturation', 'pressure']:
+        for kind in ['cwd-idle', 'write-overflow', 'controls', 'watch-effects', 'same-leader-reply', 'legacy-resize-reply', 'nonclaiming-replies', 'claim-resize-leaderless-legacy', 'claim-resize-follower-legacy', 'claim-resize-leaderless-takeover', 'claim-resize-follower-user', 'claim-resize-blocked-legacy', 'claim-resize-blocked-user', 'claim-resize-blocked-takeover', 'claim-resize-blocked-intervening', 'claim-resize-blocked-downgrade', 'claim-resize-blocked-disconnect', 'history', 'typed-resize', 'legacy-resize', 'pixels', 'saturation', 'pressure']:
             try:
                 report['scenarios'][kind] = pressure(binary) if kind == 'pressure' else scenario(binary, kind)
             except Exception as error:

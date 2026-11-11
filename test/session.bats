@@ -45,6 +45,13 @@ load test_helper
   [[ "$output" == *"session \"test-blocking\" created"* ]]
 }
 
+@test "run: -d after the command is passed to the command" {
+  run timeout 5 "$ZMX" run test-dash-d printf 'arg=%s\n' -d
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"command sent"* ]]
+  wait_for_output test-dash-d "arg=-d"
+}
+
 @test "run: requires a command argument" {
   run "$ZMX" run test-nocmd
   [ "$status" -ne 0 ]
@@ -305,4 +312,78 @@ load test_helper
   run "$ZMX" history test-long-cmd
   [[ "$output" != *"<1234567890"* ]]
   [[ "$output" == *"12345678901234567890"* ]]
+}
+
+
+# ============================================================================
+# Write
+# ============================================================================
+
+@test "write: a file larger than the PTY input buffer arrives whole" {
+  local src="$BATS_TEST_TMPDIR/src.bin" dst="$BATS_TEST_TMPDIR/dst.bin" i=0
+  head -c 400000 /dev/urandom > "$src"
+
+  run timeout 10 "$ZMX" run test-write-large echo write-ready-marker
+  [ "$status" -eq 0 ]
+  wait_for_output test-write-large write-ready-marker
+
+  run bash -c 'timeout 10 "$0" write test-write-large "$1" < "$2"' "$ZMX" "$dst" "$src"
+  [ "$status" -eq 0 ]
+
+  while (( i < 300 )) && ! cmp -s "$src" "$dst"; do
+    sleep 0.1
+    (( i++ )) || true
+  done
+  cmp "$src" "$dst"
+}
+
+@test "session prefix: resolves CLI and current session names once" {
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" run dev -d echo PREFIX_MARKER
+  [ "$status" -eq 0 ]
+  wait_for_session p.dev
+
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" set dev project=kept
+  [ "$status" -eq 0 ]
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" get dev project
+  [ "$status" -eq 0 ]
+  [[ "$output" == "kept" ]]
+  run env ZMX_SESSION_PREFIX=p. ZMX_SESSION=p.dev "$ZMX" get . project
+  [ "$status" -eq 0 ]
+  [[ "$output" == "kept" ]]
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" history dev
+  [ "$status" -eq 0 ]
+  [[ "$output" == *PREFIX_MARKER* ]]
+  run env ZMX_SESSION_PREFIX=p. ZMX_SESSION=p.dev "$ZMX" history
+  [ "$status" -eq 0 ]
+  [[ "$output" == *PREFIX_MARKER* ]]
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" print-env dev
+  [ "$status" -eq 0 ]
+  run env ZMX_SESSION_PREFIX=p. ZMX_SESSION=p.dev "$ZMX" detach
+  [ "$status" -eq 0 ]
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" clear dev
+  [ "$status" -eq 0 ]
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" get dev project
+  [ "$status" -ne 0 ]
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" kill dev
+  [ "$status" -eq 0 ]
+  [ ! -S "$ZMX_DIR/p.dev" ]
+
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" run p.dev -d echo LITERAL
+  [ "$status" -eq 0 ]
+  wait_for_session p.p.dev
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" set p.dev project=literal
+  [ "$status" -eq 0 ]
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" get p.dev project
+  [ "$status" -eq 0 ]
+  [[ "$output" == "literal" ]]
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" kill p.dev
+  [ "$status" -eq 0 ]
+  [ ! -S "$ZMX_DIR/p.p.dev" ]
+}
+
+@test "run: plain output consumes charset escape sequences" {
+  run timeout 5 "$ZMX" run charset printf '\033(BMARKER\n'
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | tr -d '\r' | rg '^MARKER$'
+  ! printf '%s\n' "$output" | tr -d '\r' | rg '^BMARKER$'
 }
