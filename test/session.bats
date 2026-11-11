@@ -380,3 +380,10 @@ load test_helper
   [ "$status" -eq 0 ]
   [ ! -S "$ZMX_DIR/p.p.dev" ]
 }
+
+@test "run: plain output consumes charset escape sequences" {
+  run timeout 5 "$ZMX" run charset printf '\033(BMARKER\n'
+  [ "$status" -eq 0 ]
+  printf '%s\n' "$output" | tr -d '\r' | rg '^MARKER$'
+  ! printf '%s\n' "$output" | tr -d '\r' | rg '^BMARKER$'
+}

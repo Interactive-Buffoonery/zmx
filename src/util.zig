@@ -541,8 +541,8 @@ pub fn stripAnsi(alloc: std.mem.Allocator, data: []const u8) ![]const u8 {
                     }
                 }
             } else {
-                // 2-byte escape sequence (e.g. ESC c)
-                i += 1;
+                while (i < data.len and data[i] >= 0x20 and data[i] <= 0x2f) : (i += 1) {}
+                if (i < data.len and data[i] >= 0x30 and data[i] <= 0x7e) i += 1;
             }
         } else {
             switch (c) {
