@@ -1646,6 +1646,7 @@ pub const Daemon = struct {
         defer if (resolved) |path| gpa.free(path);
         const response = if (resolved) |path| ipc.CwdResponse.fromPath(path) else ipc.CwdResponse.empty();
         try ipc.appendMessage(gpa, &client.write_buf, .CwdResponse, std.mem.asBytes(&response));
+        client.has_pending_output = true;
     }
 
     pub fn handleCapture(

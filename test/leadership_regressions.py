@@ -88,7 +88,16 @@ def scenario(binary, kind):
             identity = wait(records)[0]
             a = Client(root + '/regression'); clients.append(a)
             w = Client(root + '/regression'); clients.append(w); w.attach(1)
-            if kind == 'write-overflow':
+            if kind == 'cwd-idle':
+                for _ in range(2):
+                    time.sleep(.05)
+                    a.send(15)
+                    response = a.receive(16)
+                    assert len(response) == 260, len(response)
+                    length = struct.unpack('<H', response[:2])[0]
+                    assert response[2] == 0 and length > 0, response[:3]
+                    assert os.path.realpath(os.fsdecode(response[3:3 + length])) == os.path.realpath(os.getcwd())
+            elif kind == 'write-overflow':
                 Path(root + '/blocked').touch()
                 a.send(22, b'\n')
                 wait(lambda: Path(root + '/blocked-ready').exists())
@@ -389,7 +398,7 @@ if __name__ == '__main__':
         signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
         binary = os.path.abspath(sys.argv[1])
         report = {'binary_sha256': hashlib.sha256(Path(binary).read_bytes()).hexdigest(), 'sources': {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in [Path('src/loop.zig'), Path(__file__), Path('test/leadership.py')]}, 'scenarios': {}}
-        for kind in ['write-overflow', 'controls', 'watch-effects', 'same-leader-reply', 'legacy-resize-reply', 'nonclaiming-replies', 'claim-resize-leaderless-legacy', 'claim-resize-follower-legacy', 'claim-resize-leaderless-takeover', 'claim-resize-follower-user', 'claim-resize-blocked-legacy', 'claim-resize-blocked-user', 'claim-resize-blocked-takeover', 'claim-resize-blocked-intervening', 'claim-resize-blocked-downgrade', 'claim-resize-blocked-disconnect', 'history', 'typed-resize', 'legacy-resize', 'pixels', 'saturation', 'pressure']:
+        for kind in ['cwd-idle', 'write-overflow', 'controls', 'watch-effects', 'same-leader-reply', 'legacy-resize-reply', 'nonclaiming-replies', 'claim-resize-leaderless-legacy', 'claim-resize-follower-legacy', 'claim-resize-leaderless-takeover', 'claim-resize-follower-user', 'claim-resize-blocked-legacy', 'claim-resize-blocked-user', 'claim-resize-blocked-takeover', 'claim-resize-blocked-intervening', 'claim-resize-blocked-downgrade', 'claim-resize-blocked-disconnect', 'history', 'typed-resize', 'legacy-resize', 'pixels', 'saturation', 'pressure']:
             try:
                 report['scenarios'][kind] = pressure(binary) if kind == 'pressure' else scenario(binary, kind)
             except Exception as error:
