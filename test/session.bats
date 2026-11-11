@@ -336,3 +336,47 @@ load test_helper
   done
   cmp "$src" "$dst"
 }
+
+@test "session prefix: resolves CLI and current session names once" {
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" run dev -d echo PREFIX_MARKER
+  [ "$status" -eq 0 ]
+  wait_for_session p.dev
+
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" set dev project=kept
+  [ "$status" -eq 0 ]
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" get dev project
+  [ "$status" -eq 0 ]
+  [[ "$output" == "kept" ]]
+  run env ZMX_SESSION_PREFIX=p. ZMX_SESSION=p.dev "$ZMX" get . project
+  [ "$status" -eq 0 ]
+  [[ "$output" == "kept" ]]
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" history dev
+  [ "$status" -eq 0 ]
+  [[ "$output" == *PREFIX_MARKER* ]]
+  run env ZMX_SESSION_PREFIX=p. ZMX_SESSION=p.dev "$ZMX" history
+  [ "$status" -eq 0 ]
+  [[ "$output" == *PREFIX_MARKER* ]]
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" print-env dev
+  [ "$status" -eq 0 ]
+  run env ZMX_SESSION_PREFIX=p. ZMX_SESSION=p.dev "$ZMX" detach
+  [ "$status" -eq 0 ]
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" clear dev
+  [ "$status" -eq 0 ]
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" get dev project
+  [ "$status" -ne 0 ]
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" kill dev
+  [ "$status" -eq 0 ]
+  [ ! -S "$ZMX_DIR/p.dev" ]
+
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" run p.dev -d echo LITERAL
+  [ "$status" -eq 0 ]
+  wait_for_session p.p.dev
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" set p.dev project=literal
+  [ "$status" -eq 0 ]
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" get p.dev project
+  [ "$status" -eq 0 ]
+  [[ "$output" == "literal" ]]
+  run env ZMX_SESSION_PREFIX=p. "$ZMX" kill p.dev
+  [ "$status" -eq 0 ]
+  [ ! -S "$ZMX_DIR/p.p.dev" ]
+}

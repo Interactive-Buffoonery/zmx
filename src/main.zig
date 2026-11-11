@@ -1,5 +1,6 @@
 const std = @import("std");
 const zmx = @import("lib.zig");
+const client = @import("client.zig");
 const Environ = std.process.Environ;
 const build_options = @import("build_options");
 const ipc = @import("ipc.zig");
@@ -176,7 +177,7 @@ fn mainImpl(init: std.process.Init) !void {
         const raw_name = session_name orelse (if (sesh_env.len > 0) sesh_env else {
             return printError(io, "session name required (or run inside a zmx session)", .{});
         });
-        const sesh = try socket.getSeshName(gpa, raw_name);
+        const sesh = try socket.resolveSessionOrEnv(gpa, io, if (session_name != null) raw_name else null);
         defer gpa.free(sesh);
         return history(gpa, io, &cfg, sesh, format, scrollback_rows);
     } else if (std.mem.eql(u8, cmd, "cwd")) {
@@ -845,7 +846,7 @@ fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList
 
             // Fetch and print the last 20 lines of history for debugging
             const history_lines: usize = 20;
-            const history_text = zmx.history(alloc, io, session.name, .plain) catch null;
+            const history_text = client.historyRangeResolved(alloc, io, session.name, .plain, null) catch null;
             if (history_text) |text| {
                 defer alloc.free(text);
                 try stdout.print("\nLast {d} lines of {s} history:\n", .{ history_lines, session.name });
@@ -912,7 +913,7 @@ fn detachAll(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg) !void {
         return printError(io, "not inside a zmx session (ZMX_SESSION not set)", .{});
     }
     std.log.info("detach all session={s}", .{session_name});
-    zmx.detach(alloc, io, session_name) catch |err| switch (err) {
+    client.detachResolved(alloc, io, session_name) catch |err| switch (err) {
         error.BrokenPipe, error.ConnectionResetByPeer => return,
         else => return err,
     };
@@ -921,7 +922,7 @@ fn detachAll(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg) !void {
 fn kill(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, force: bool) !void {
     _ = cfg;
     std.log.info("kill session={s}", .{session_name});
-    const kill_status = zmx.kill(alloc, io, session_name, .{ .force = force }) catch |err| switch (err) {
+    const kill_status = client.killResolved(alloc, io, session_name, .{ .force = force }) catch |err| switch (err) {
         error.SessionNotFound => return error.SessionNotFound,
         error.SessionUnresponsive => return error.SessionUnresponsive,
         error.BrokenPipe, error.ConnectionResetByPeer => return,
@@ -968,7 +969,7 @@ fn labelGet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []con
     std.log.info("label get session={s}", .{session_name});
 
     const key = if (single_kv.len == 0) null else single_kv;
-    const val = zmx.get(alloc, io, session_name, key) catch |err| {
+    const val = client.getResolved(alloc, io, session_name, key) catch |err| {
         if (err == error.LabelKeyNotFound) {
             return printError(io, "label key \"{s}\" not found in session \"{s}\"", .{ single_kv, session_name });
         }
@@ -1110,7 +1111,7 @@ fn envGet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const
     std.log.info("env get session={s}", .{session_name});
 
     const key = if (single_kv.len > 0) single_kv else null;
-    const payload = zmx.printEnv(alloc, io, session_name, key) catch |err| {
+    const payload = client.printEnvResolved(alloc, io, session_name, key) catch |err| {
         printEnvError(io, session_name, err);
     };
     defer alloc.free(payload);
@@ -1153,7 +1154,7 @@ fn labelSet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []con
     std.log.info("label set session={s}", .{session_name});
 
     assertLabels(io, labels);
-    zmx.set(alloc, io, session_name, labels) catch |err| {
+    client.setResolved(alloc, io, session_name, labels) catch |err| {
         printLabelError(io, session_name, err);
     };
 }
@@ -1162,7 +1163,7 @@ fn labelClear(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []c
     _ = cfg;
     std.log.info("label clear session={s}", .{session_name});
 
-    zmx.clear(alloc, io, session_name) catch |err| {
+    client.clearResolved(alloc, io, session_name) catch |err| {
         printLabelError(io, session_name, err);
     };
 }
@@ -1171,7 +1172,7 @@ fn history(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []cons
     _ = cfg;
     std.log.info("history session={s}", .{session_name});
 
-    const data = zmx.historyRange(alloc, io, session_name, format, scrollback_rows) catch |err| switch (err) {
+    const data = client.historyRangeResolved(alloc, io, session_name, format, scrollback_rows) catch |err| switch (err) {
         error.SessionNotFound => return printError(io, "session \"{s}\" does not exist", .{session_name}),
         error.SessionUnresponsive => return printError(io, "session \"{s}\" is unresponsive (SessionUnresponsive)", .{session_name}),
         error.CaptureNotSupported => return printError(io, "session \"{s}\" does not support --screen/--scrollback (daemon too old?)", .{session_name}),

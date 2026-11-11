@@ -82,7 +82,7 @@ pub fn create(alloc: Allocator, io: Io, name: []const u8, opts: CreateOptions) !
     }
 
     if (opts.labels) |kvs| {
-        try set(alloc, io, sesh, kvs);
+        try setResolved(alloc, io, sesh, kvs);
     }
 
     return daemon.created_session;
@@ -157,7 +157,7 @@ fn attachClientOnly(alloc: Allocator, io: Io, name: []const u8, opts: AttachOpti
     }
 
     if (opts.labels) |kvs| {
-        try set(alloc, io, sesh, kvs);
+        try setResolved(alloc, io, sesh, kvs);
     }
 
     var probe = try verifyExistingSession(alloc, io, cfg.socket_dir, sesh, socket_path);
@@ -243,7 +243,7 @@ fn attachDaemon(
     // supervisor from leaving an unlabelled session behind if it dies in
     // between the two calls.
     if (labels) |kvs| {
-        try set(gpa, io, daemon.session_name, kvs);
+        try setResolved(gpa, io, daemon.session_name, kvs);
     }
 
     const client_sock = if (existing_only)
@@ -368,15 +368,14 @@ fn verifyExistingSession(
 
 /// Detach all clients from the specified session (or current ZMX_SESSION if "." or empty).
 pub fn detach(alloc: Allocator, io: Io, name: []const u8) !void {
-    signal.ignoreSigpipe();
-    const raw_name = if (name.len == 0 or std.mem.eql(u8, name, "."))
-        socket.getSeshNameFromEnv()
-    else
-        name;
-    if (raw_name.len == 0) return error.SessionNameRequired;
-
-    const sesh = try socket.getSeshName(alloc, raw_name);
+    const sesh = try socket.resolveSessionOrEnv(alloc, io, if (name.len == 0) null else name);
     defer alloc.free(sesh);
+    return detachResolved(alloc, io, sesh);
+}
+
+/// Internal entry point for a literal session name already resolved by the caller.
+pub fn detachResolved(alloc: Allocator, io: Io, sesh: []const u8) !void {
+    signal.ignoreSigpipe();
 
     var cfg = try Cfg.init(alloc, io);
     defer cfg.deinit(alloc);
@@ -415,9 +414,14 @@ pub const KillStatus = enum {
 
 /// Kill a session and wait for its socket to close.
 pub fn kill(alloc: Allocator, io: Io, name: []const u8, opts: KillOptions) !KillStatus {
-    signal.ignoreSigpipe();
     const sesh = try socket.getSeshName(alloc, name);
     defer alloc.free(sesh);
+    return killResolved(alloc, io, sesh, opts);
+}
+
+/// Internal entry point for a literal session name already resolved by the caller.
+pub fn killResolved(alloc: Allocator, io: Io, sesh: []const u8, opts: KillOptions) !KillStatus {
+    signal.ignoreSigpipe();
 
     var cfg = try Cfg.init(alloc, io);
     defer cfg.deinit(alloc);
@@ -887,9 +891,14 @@ pub fn write(alloc: Allocator, io: Io, name: []const u8, remote_path: []const u8
 
 /// Fetch session scrollback with optional row count.
 pub fn historyRange(alloc: Allocator, io: Io, name: []const u8, format: HistoryFormat, scrollback_rows: ?u32) ![]u8 {
-    signal.ignoreSigpipe();
-    const sesh = try socket.getSeshName(alloc, name);
+    const sesh = try socket.resolveSessionOrEnv(alloc, io, name);
     defer alloc.free(sesh);
+    return historyRangeResolved(alloc, io, sesh, format, scrollback_rows);
+}
+
+/// Internal entry point for a literal session name already resolved by the caller.
+pub fn historyRangeResolved(alloc: Allocator, io: Io, sesh: []const u8, format: HistoryFormat, scrollback_rows: ?u32) ![]u8 {
+    signal.ignoreSigpipe();
 
     var cfg = try Cfg.init(alloc, io);
     defer cfg.deinit(alloc);
@@ -950,9 +959,14 @@ pub fn history(alloc: Allocator, io: Io, name: []const u8, format: HistoryFormat
 
 /// Get session labels (all `k=v` pairs if `key == null`, or single value). Caller owns slice.
 pub fn get(alloc: Allocator, io: Io, name: []const u8, key: ?[]const u8) ![]u8 {
-    signal.ignoreSigpipe();
-    const sesh = try socket.getSeshName(alloc, name);
+    const sesh = try socket.resolveSessionOrEnv(alloc, io, name);
     defer alloc.free(sesh);
+    return getResolved(alloc, io, sesh, key);
+}
+
+/// Internal entry point for a literal session name already resolved by the caller.
+pub fn getResolved(alloc: Allocator, io: Io, sesh: []const u8, key: ?[]const u8) ![]u8 {
+    signal.ignoreSigpipe();
 
     var cfg = try Cfg.init(alloc, io);
     defer cfg.deinit(alloc);
@@ -973,14 +987,18 @@ pub fn get(alloc: Allocator, io: Io, name: []const u8, key: ?[]const u8) ![]u8 {
 
 /// Set or unset (`k=`) space-separated session labels.
 pub fn set(alloc: Allocator, io: Io, name: []const u8, kvs: []const u8) !void {
+    const sesh = try socket.resolveSessionOrEnv(alloc, io, name);
+    defer alloc.free(sesh);
+    return setResolved(alloc, io, sesh, kvs);
+}
+
+/// Internal entry point for a literal session name already resolved by the caller.
+pub fn setResolved(alloc: Allocator, io: Io, sesh: []const u8, kvs: []const u8) !void {
     signal.ignoreSigpipe();
     var it = label.LabelIterator.init(kvs);
     while (it.next()) |kv| {
         try label.assertLabel(kv.key, kv.value);
     }
-
-    const sesh = try socket.getSeshName(alloc, name);
-    defer alloc.free(sesh);
 
     var cfg = try Cfg.init(alloc, io);
     defer cfg.deinit(alloc);
@@ -993,9 +1011,14 @@ pub fn set(alloc: Allocator, io: Io, name: []const u8, kvs: []const u8) !void {
 
 /// Clear all labels on a session.
 pub fn clear(alloc: Allocator, io: Io, name: []const u8) !void {
-    signal.ignoreSigpipe();
-    const sesh = try socket.getSeshName(alloc, name);
+    const sesh = try socket.resolveSessionOrEnv(alloc, io, name);
     defer alloc.free(sesh);
+    return clearResolved(alloc, io, sesh);
+}
+
+/// Internal entry point for a literal session name already resolved by the caller.
+pub fn clearResolved(alloc: Allocator, io: Io, sesh: []const u8) !void {
+    signal.ignoreSigpipe();
 
     var cfg = try Cfg.init(alloc, io);
     defer cfg.deinit(alloc);
@@ -1008,9 +1031,14 @@ pub fn clear(alloc: Allocator, io: Io, name: []const u8) !void {
 
 /// Get tracked environment variables for the session leader (`zmx print-env`).
 pub fn printEnv(alloc: Allocator, io: Io, name: []const u8, key: ?[]const u8) ![]u8 {
-    signal.ignoreSigpipe();
-    const sesh = try socket.getSeshName(alloc, name);
+    const sesh = try socket.resolveSessionOrEnv(alloc, io, name);
     defer alloc.free(sesh);
+    return printEnvResolved(alloc, io, sesh, key);
+}
+
+/// Internal entry point for a literal session name already resolved by the caller.
+pub fn printEnvResolved(alloc: Allocator, io: Io, sesh: []const u8, key: ?[]const u8) ![]u8 {
+    signal.ignoreSigpipe();
 
     var cfg = try Cfg.init(alloc, io);
     defer cfg.deinit(alloc);
