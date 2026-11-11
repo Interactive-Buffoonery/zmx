@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib_posix = @import("posix.zig");
+const cross = @import("cross");
 
 pub var log_system = LogSystem{};
 
@@ -34,7 +35,17 @@ pub const LogSystem = struct {
         const file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
         errdefer std.Io.File.close(file, self.io);
 
-        self.current_size = (try std.Io.File.stat(file, self.io)).size;
+        // Use lseek(SEEK_END) instead of length() + seekTo() to avoid a
+        // TOCTOU race: after fork() the parent may still write to the log
+        // between our length() check and seekTo(), causing us to overwrite
+        // recent parent entries. lseek(fd, 0, SEEK_END) is atomic — it
+        // always positions at the true end of file at seek time.
+        const new_pos = cross.lseek(file.handle, 0, cross.SEEK_END);
+        if (new_pos == -1) {
+            std.Io.File.close(file, self.io);
+            return error.SeekFailed;
+        }
+        self.current_size = @as(u64, @intCast(new_pos));
         self.file = file;
     }
 

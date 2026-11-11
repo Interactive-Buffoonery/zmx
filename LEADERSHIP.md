@@ -147,3 +147,13 @@ also runs with legacy followers attached. Input and size-only changes from the s
 keep the reply epoch; explicit takeover still invalidates outstanding replies.
 Watch requires acceptance within one elapsed monotonic second, independent of
 output traffic; SessionEnd before acceptance is an unsupported failure.
+
+## Upstream package integration
+
+The AMX header stays eight bytes: tag at byte 0, little-endian payload length
+at bytes 1–4, and zeroed reserved bytes at 5–7. It does not adopt upstream's
+versioned header or renumber tags 14–33. The existing 552-byte Info payload
+retains daemon_pid in its tail. New Capture requests use tag 34 with an
+eight-byte payload (format u8, three reserved bytes, scrollback rows u32);
+Unsupported uses tag 255. Capture remains outside typed Watch and Interactive
+allowlists. Legacy history requests remain compatible with running AMX daemons.

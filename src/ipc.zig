@@ -1,5 +1,5 @@
 const std = @import("std");
-const cross = @import("cross.zig");
+const cross = @import("cross");
 const socket = @import("socket.zig");
 const lib_posix = @import("posix.zig");
 
@@ -38,21 +38,24 @@ pub const Tag = enum(u8) {
     TakeOver = 31,
     RequestedSize = 32,
     Downgrade = 33,
+    Capture = 34,
+    Unsupported = 255,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
-    // @enumFromInt, so out-of-range values are representable
+    // @fromBackingInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
     _,
 };
 
 comptime {
-    if (@typeInfo(Tag).@"enum".is_exhaustive) @compileError(
+    if (@typeInfo(Tag).@"enum".mode == .exhaustive) @compileError(
         "ipc.Tag must stay non-exhaustive -- old daemons rely on `_` to ignore unknown tags",
     );
 }
 
-pub const Header = packed struct {
+pub const Header = packed struct(u64) {
     tag: Tag,
     len: u32,
+    _reserved: u24 = 0,
 };
 
 pub const Resize = packed struct {
@@ -127,26 +130,33 @@ pub const CwdResponse = extern struct {
 };
 
 pub fn getTerminalSize(fd: i32) TerminalSize {
-    var ws: cross.c.struct_winsize = undefined;
-    if (cross.c.ioctl(fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
+    var ws: cross.struct_winsize = undefined;
+    if (cross.ioctl(fd, cross.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
         return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
     }
     inline for (.{ lib_posix.STDOUT_FILENO, lib_posix.STDIN_FILENO, lib_posix.STDERR_FILENO }) |fallback_fd| {
         if (fallback_fd != fd) {
-            if (cross.c.ioctl(fallback_fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
+            if (cross.ioctl(fallback_fd, cross.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
                 return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
             }
         }
     }
     if (lib_posix.open("/dev/tty", .{ .ACCMODE = .RDWR }, 0)) |tty_fd| {
         defer lib_posix.close(tty_fd);
-        if (cross.c.ioctl(tty_fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
+        if (cross.ioctl(tty_fd, cross.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
             return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
         }
     } else |_| {}
     return .{ .rows = 24, .cols = 120, .xpixel = 0, .ypixel = 0 };
 }
 
+pub const Capture = extern struct {
+    format: u8,
+    _reserved: [3]u8 = @splat(0),
+    rows: u32,
+};
+
+pub const MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub const MAX_CMD_LEN = 256;
 pub const MAX_CWD_LEN = 256;
 
@@ -313,6 +323,11 @@ pub const SocketBuffer = struct {
         if (available.len < total) return null;
 
         const hdr = std.mem.bytesToValue(Header, available[0..@sizeOf(Header)]);
+        if (hdr.len > MAX_PAYLOAD_LEN) {
+            self.buf.clearRetainingCapacity();
+            self.head = 0;
+            return null;
+        }
         const pay = available[@sizeOf(Header)..total];
 
         self.head += total;
@@ -492,8 +507,8 @@ test "Tag wire values are frozen" {
         .{ Tag.EnvSet, 24 },         .{ Tag.EnvData, 25 },      .{ Tag.AttachRole, 26 },
         .{ Tag.AttachAccepted, 27 }, .{ Tag.Authority, 28 },    .{ Tag.UserBatch, 29 },
         .{ Tag.TerminalReply, 30 },  .{ Tag.TakeOver, 31 },     .{ Tag.RequestedSize, 32 },
-        .{ Tag.Downgrade, 33 },
-    }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
+        .{ Tag.Downgrade, 33 },      .{ Tag.Capture, 34 },      .{ Tag.Unsupported, 255 },
+    }) |p| try std.testing.expectEqual(@as(u8, p[1]), @backingInt(p[0]));
 }
 
 pub fn roundTripForTag(

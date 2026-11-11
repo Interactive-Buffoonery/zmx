@@ -23,15 +23,15 @@ load test_helper
   "$ZMX" run test-update -d sleep 30
   wait_for_session test-update
 
-  run "$ZMX" set test-update status=busy
+  run "$ZMX" set test-update state=busy
   [ "$status" -eq 0 ]
-  run "$ZMX" set test-update status=done
+  run "$ZMX" set test-update state=done
   [ "$status" -eq 0 ]
 
   run "$ZMX" get test-update
   [ "$status" -eq 0 ]
-  [[ "$output" == *"status=done"* ]]
-  [[ "$output" != *"status=busy"* ]]
+  [[ "$output" == *"state=done"* ]]
+  [[ "$output" != *"state=busy"* ]]
 }
 
 @test "set: rejects reserved key 'name'" {

@@ -1,9 +1,8 @@
 const std = @import("std");
-const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
 const log = @import("log.zig");
 const util = @import("util.zig");
-const cross = @import("cross.zig");
+const cross = @import("cross");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
 const lib_posix = @import("posix.zig");
@@ -14,6 +13,8 @@ const daemonize = @import("daemonize.zig");
 const builtin = @import("builtin");
 const status = @import("status.zig");
 const cwd_mod = @import("cwd.zig");
+const terminal = @import("terminal.zig");
+const ghostty_vt = terminal.ghostty_vt;
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
@@ -26,7 +27,7 @@ pub fn clientLoop(
 ) !ClientResult {
     std.log.info("client loop fd={d}", .{client_sock_fd});
     const gpa: std.mem.Allocator = blk: {
-        if (builtin.mode == .Debug) {
+        if (builtin.mode == .debug) {
             const GPA = std.heap.DebugAllocator(.{});
             const Static = struct {
                 var gpa: GPA = .{};
@@ -38,7 +39,11 @@ pub fn clientLoop(
     defer lib_posix.close(client_sock_fd);
 
     try signal.openSignalPipe();
-    signal.installWakeHandler(@intFromEnum(lib_posix.SIG.WINCH));
+    defer signal.closeSignalPipe();
+    signal.installWakeHandler(@backingInt(lib_posix.SIG.WINCH));
+    signal.installWakeHandler(@backingInt(lib_posix.SIG.TERM));
+    signal.installWakeHandler(@backingInt(lib_posix.SIG.HUP));
+    signal.installWakeHandler(@backingInt(lib_posix.SIG.INT));
 
     // Make socket non-blocking to avoid blocking on writes
     var sock_flags = try lib_posix.fcntl(client_sock_fd, lib_posix.F.GETFL, 0);
@@ -134,7 +139,7 @@ pub fn clientLoop(
         _ = try lib_posix.poll(poll_fds.items, -1);
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
-            signal.drainSignalPipe();
+            try signal.drainSignalPipe();
             const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
             try ipc.appendTerminalSizeMessages(gpa, &sock_write_buf, .Resize, next_size);
         }
@@ -331,7 +336,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
     std.log.info("daemon started session={s} pty_fd={d}", .{ daemon.session_name, pty_fd });
 
     try signal.openSignalPipe();
-    signal.installWakeHandler(@intFromEnum(lib_posix.SIG.TERM));
+    signal.installWakeHandler(@backingInt(lib_posix.SIG.TERM));
     var poll_fds = try std.ArrayList(lib_posix.pollfd).initCapacity(gpa, 8);
     defer poll_fds.deinit(gpa);
 
@@ -407,7 +412,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
         daemon.now_ms = std.Io.Clock.awake.now(io).toMilliseconds();
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
-            signal.drainSignalPipe();
+            signal.drainSignalPipe() catch {};
             std.log.info(
                 "SIGTERM received, shutting down gracefully session={s}",
                 .{daemon.session_name},
@@ -465,11 +470,11 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     // short non-blocking grace period so we can publish its real
                     // status without hanging forever on a process that closed
                     // stdio but kept running.
-                    var wait_result = lib_posix.waitpid(daemon.pid, cross.c.WNOHANG);
+                    var wait_result = lib_posix.waitpid(daemon.pid, cross.WNOHANG);
                     var reap_polls: u8 = 0;
                     while (wait_result.pid != daemon.pid and reap_polls < 100) : (reap_polls += 1) {
                         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1), .real) catch {};
-                        wait_result = lib_posix.waitpid(daemon.pid, cross.c.WNOHANG);
+                        wait_result = lib_posix.waitpid(daemon.pid, cross.WNOHANG);
                     }
                     if (wait_result.pid != daemon.pid) {
                         lib_posix.kill(-daemon.pid, lib_posix.SIG.KILL) catch {};
@@ -652,13 +657,18 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .EnvSet => try daemon.handleEnvSet(gpa, client, msg.payload),
                         .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
                         .CwdQuery => try daemon.handleCwd(gpa, client),
+                        .Capture => try daemon.handleCapture(gpa, client, &term, msg.payload),
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
-                        .Ack, .AttachAccepted, .TaskComplete, .LabelData, .EnvData, .SessionEnd, .CwdResponse => {},
+                        .Ack, .AttachAccepted, .TaskComplete, .LabelData, .EnvData, .SessionEnd, .CwdResponse, .Unsupported => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
-                        _ => std.log.warn(
-                            "ignoring unknown IPC tag={d}",
-                            .{@intFromEnum(msg.header.tag)},
-                        ),
+                        _ => {
+                            std.log.warn(
+                                "ignoring unknown IPC tag={d}",
+                                .{@backingInt(msg.header.tag)},
+                            );
+                            ipc.appendMessage(gpa, &client.write_buf, .Unsupported, "") catch {};
+                            client.has_pending_output = true;
+                        },
                     }
                 }
             }
@@ -683,6 +693,12 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             }
 
             if (revents & (lib_posix.POLL.HUP | lib_posix.POLL.ERR | lib_posix.POLL.NVAL) != 0) {
+                // A client that writes and exits (`zmx send`, `zmx run -d`) is
+                // reported HUP with part of its message still unread: a pass
+                // reads at most 4 KiB. Closing now drops the rest. Leave it to
+                // the next pass, which reads on until EOF closes the client.
+                if (revents & lib_posix.POLL.IN != 0 and
+                    revents & (lib_posix.POLL.ERR | lib_posix.POLL.NVAL) == 0) continue;
                 const last = daemon.closeClient(gpa, client, i, false);
                 if (last) break :daemon_loop;
             }
@@ -788,7 +804,6 @@ pub const Daemon = struct {
     cwd_buf: [std.fs.max_path_bytes]u8 = undefined,
     cwd_path_buf: [std.fs.max_path_bytes]u8 = undefined,
     has_pty_output: bool = false,
-    has_had_client: bool = false,
     created_at: u64, // unix timestamp (ns)
     is_task_mode: bool = false, // flag for when session is run as a task
     task_id: [4]u8 = undefined,
@@ -798,6 +813,7 @@ pub const Daemon = struct {
     shell: []const u8 = "/bin/sh",
     child_reaped: bool = false,
     created_session: bool = false,
+    quiet: bool = false,
 
     /// Create a Daemon. Caller is responsible for freeing all variables passed
     /// into the init fn.
@@ -953,7 +969,7 @@ pub const Daemon = struct {
     fn run(self: *Daemon, io: std.Io, dir: std.Io.Dir, sesh_name: []const u8) !bool {
         std.log.info("creating session={s}", .{sesh_name});
         const server_sock_fd: lib_posix.socket_t = try socket.createSocket(self.socket_path);
-        const log_fd = log.log_system.file.?.handle;
+        const log_fd = if (log.log_system.file) |f| f.handle else -1;
 
         var keep_fds_open = [_]i32{ server_sock_fd, dir.handle, log_fd };
         const cmd = try daemonize.createCmdZ(self.shell, self.is_task_mode, self.command);
@@ -983,10 +999,12 @@ pub const Daemon = struct {
                 error.IsClientProc => {
                     self.created_session = true;
                     // send a msg to the client that the session was created.
-                    var w_buf: [2048]u8 = undefined;
-                    var w = std.Io.File.stdout().writer(io, &w_buf);
-                    try w.interface.print("session \"{s}\" created\n", .{sesh_name});
-                    try w.interface.flush();
+                    if (!self.quiet) {
+                        var w_buf: [2048]u8 = undefined;
+                        var w = std.Io.File.stdout().writer(io, &w_buf);
+                        try w.interface.print("session \"{s}\" created\n", .{sesh_name});
+                        try w.interface.flush();
+                    }
                     lib_posix.close(server_sock_fd);
                     return false;
                 },
@@ -1029,7 +1047,7 @@ pub const Daemon = struct {
         }
 
         const gpa: std.mem.Allocator = blk: {
-            if (builtin.mode == .Debug) {
+            if (builtin.mode == .debug) {
                 const GPA = std.heap.DebugAllocator(.{});
                 const Static = struct {
                     var gpa: GPA = .{};
@@ -1135,7 +1153,6 @@ pub const Daemon = struct {
                 defer if (restored.ptr != snapshot.ptr) gpa.free(restored);
                 try ipc.appendMessage(gpa, &client.write_buf, .Output, restored);
             }
-            self.has_had_client = true;
             return;
         }
         if (payload.len < 16 or client.role != .interactive) return;
@@ -1176,7 +1193,11 @@ pub const Daemon = struct {
     }
 
     fn queueOperation(self: *Daemon, gpa: std.mem.Allocator, value: Operation) !void {
-        if (self.queued_bytes + value.data.len > PTY_WRITE_BUF_MAX or self.operations.items.len >= 4096) return error.InputQueueFull;
+        return self.queueOperationLimit(gpa, value, PTY_WRITE_BUF_MAX);
+    }
+
+    fn queueOperationLimit(self: *Daemon, gpa: std.mem.Allocator, value: Operation, limit: usize) !void {
+        if (self.queued_bytes + value.data.len > limit or self.operations.items.len >= 4096) return error.InputQueueFull;
         try self.operations.ensureUnusedCapacity(gpa, 1);
         var op = value;
         op.data = try gpa.dupe(u8, value.data);
@@ -1275,8 +1296,8 @@ pub const Daemon = struct {
             }
             if (!op.started) {
                 if (op.kind == .user or op.kind == .takeover or op.kind == .resize or op.kind == .recover) {
-                    var ws: cross.c.struct_winsize = undefined;
-                    if (cross.c.ioctl(fd, cross.c.TIOCGWINSZ, &ws) != 0) {
+                    var ws: cross.struct_winsize = undefined;
+                    if (cross.ioctl(fd, cross.TIOCGWINSZ, &ws) != 0) {
                         self.removeOperation(gpa, 0);
                         continue;
                     }
@@ -1286,7 +1307,7 @@ pub const Daemon = struct {
                         ws.ws_xpixel = pixels.xpixel;
                         ws.ws_ypixel = pixels.ypixel;
                     }
-                    if (cross.c.ioctl(fd, cross.c.TIOCSWINSZ, &ws) != 0) {
+                    if (cross.ioctl(fd, cross.TIOCSWINSZ, &ws) != 0) {
                         self.removeOperation(gpa, 0);
                         continue;
                     }
@@ -1453,9 +1474,7 @@ pub const Daemon = struct {
             if (err != error.InputQueueFull) return err;
         };
 
-        // Only serialize on re-attach (has_had_client), not first attach, to avoid
-        // interfering with shell initialization (DA1 queries, etc.)
-        if (self.has_pty_output and self.has_had_client) {
+        if (self.has_pty_output) {
             const cursor = &term.screens.active.cursor;
             std.log.debug(
                 "cursor before serialize: x={d} y={d} pending_wrap={}",
@@ -1480,8 +1499,6 @@ pub const Daemon = struct {
                 client.has_pending_output = true;
             }
         }
-
-        self.has_had_client = true;
     }
 
     pub fn handleResize(
@@ -1624,6 +1641,22 @@ pub const Daemon = struct {
         defer if (resolved) |path| gpa.free(path);
         const response = if (resolved) |path| ipc.CwdResponse.fromPath(path) else ipc.CwdResponse.empty();
         try ipc.appendMessage(gpa, &client.write_buf, .CwdResponse, std.mem.asBytes(&response));
+    }
+
+    pub fn handleCapture(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        client: *Client,
+        term: *ghostty_vt.Terminal,
+        payload: []const u8,
+    ) !void {
+        if (payload.len != @sizeOf(ipc.Capture)) return;
+        const request = std.mem.bytesToValue(ipc.Capture, payload);
+        const format = std.enums.fromInt(util.HistoryFormat, request.format) orelse return;
+        self.setPwd(term);
+        const output = util.serializeTerminalRange(gpa, term, format, request.rows);
+        defer if (output) |text| gpa.free(text);
+        try ipc.appendMessage(gpa, &client.write_buf, .Capture, output orelse "");
         client.has_pending_output = true;
     }
 
@@ -1662,7 +1695,6 @@ pub const Daemon = struct {
 
         try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
         client.has_pending_output = true;
-        self.has_had_client = true;
         std.log.debug("run command len={d}", .{payload.len});
     }
 
@@ -1734,42 +1766,31 @@ pub const Daemon = struct {
         const file_path = payload[@sizeOf(u32)..][0..path_len];
         const file_content = payload[@sizeOf(u32) + path_len ..];
 
-        // Inject file creation through the PTY so it works over SSH.
-        // Base64-encode content and pipe through printf | base64 -d > file.
-        // Chunk large files to stay under command-line length limits.
-        // 48000 is divisible by 3 (clean base64 boundaries) and encodes
-        // to ~64KB, well under typical ARG_MAX.
-        const chunk_size = 48000;
-        var offset: usize = 0;
-        var is_first = true;
-
-        while (offset < file_content.len or is_first) {
-            const end = @min(offset + chunk_size, file_content.len);
-            const chunk = file_content[offset..end];
-
-            const encoded_len = std.base64.standard.Encoder.calcSize(chunk.len);
-            const encoded = try gpa.alloc(u8, encoded_len);
-            defer gpa.free(encoded);
-            _ = std.base64.standard.Encoder.encode(encoded, chunk);
-
-            self.queuePtyInput(gpa, "printf '%s' '");
-            self.queuePtyInput(gpa, encoded);
-            if (is_first) {
-                self.queuePtyInput(gpa, "' | base64 -d > '");
+        // Keep the bounded transfer in one shell command and one ordered
+        // operation. Later commands can be read while an earlier decoder owns
+        // the terminal, which corrupts large transfers during shell mode changes.
+        if (self.queued_bytes > PTY_WRITE_BUF_MAX) return error.InputQueueFull;
+        var commands: std.ArrayList(u8) = .empty;
+        defer commands.deinit(gpa);
+        const encoded_len = std.base64.standard.Encoder.calcSize(file_content.len);
+        const encoded = try gpa.alloc(u8, encoded_len);
+        defer gpa.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, file_content);
+        try commands.appendSlice(gpa, "printf '%s' '");
+        try commands.appendSlice(gpa, encoded);
+        try commands.appendSlice(gpa, "' | base64 -d > '");
+        for (file_path) |byte| {
+            if (byte == '\'') {
+                try commands.appendSlice(gpa, "'\\''");
             } else {
-                self.queuePtyInput(gpa, "' | base64 -d >> '");
+                try commands.append(gpa, byte);
             }
-            self.queuePtyInput(gpa, file_path);
-            self.queuePtyInput(gpa, "'");
-            self.queuePtyInput(gpa, "\r");
-
-            offset = end;
-            is_first = false;
         }
+        try commands.appendSlice(gpa, "'\r");
 
+        try self.queueOperationLimit(gpa, .{ .data = commands.items }, PTY_WRITE_BUF_MAX + commands.items.len);
         try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
         client.has_pending_output = true;
-        self.has_had_client = true;
         std.log.debug(
             "write command len={d} file_path={s}",
             .{ file_content.len, file_path },
