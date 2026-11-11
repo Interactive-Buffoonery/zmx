@@ -660,7 +660,12 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .Capture => try daemon.handleCapture(gpa, client, &term, msg.payload),
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
                         .Ack, .AttachAccepted, .TaskComplete, .LabelData, .EnvData, .SessionEnd, .CwdResponse, .Unsupported => {},
-                        .Write => try daemon.handleWrite(gpa, client, msg.payload),
+                        .Write => daemon.handleWrite(gpa, client, msg.payload) catch |err| {
+                            if (err != error.InputQueueFull and err != error.InvalidPayload) return err;
+                            std.log.warn("write rejected: {s}", .{@errorName(err)});
+                            _ = daemon.closeClient(gpa, client, i, false);
+                            continue :clients_loop;
+                        },
                         _ => {
                             std.log.warn(
                                 "ignoring unknown IPC tag={d}",
