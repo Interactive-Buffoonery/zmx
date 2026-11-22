@@ -237,7 +237,10 @@ pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo
             std.log.warn("failed to open /dev/null: {s}", .{@errorName(err)});
             return err;
         };
-        inline for (.{ lib_posix.STDIN_FILENO, lib_posix.STDOUT_FILENO, lib_posix.STDERR_FILENO }) |fd| {
+        for ([_]i32{ lib_posix.STDIN_FILENO, lib_posix.STDOUT_FILENO, lib_posix.STDERR_FILENO }) |fd| {
+            // A caller that closed stdio before opening its kept fds can
+            // receive one of these numbers, so leave those fds in place.
+            if (std.mem.indexOfScalar(i32, keep_fds_open, fd) != null) continue;
             _ = lib_posix.dup2(devnull, fd) catch |err| {
                 std.log.warn("dup2 /dev/null -> {d}: {s}", .{ fd, @errorName(err) });
                 return err;
