@@ -261,6 +261,7 @@ fn attachDaemon(
         try socket.sessionConnect(daemon.socket_path);
     if (!existing_only) {
         identity = ipc.probeSession(gpa, daemon.socket_path) catch null;
+        if (identity) |*probe| lib_posix.close(probe.takeFd());
     }
     status.StatusFile.emitAttached(
         gpa,
