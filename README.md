@@ -47,6 +47,7 @@
 - Send commands to a session without attaching to it
 - Print scrollback history of a terminal session in plain text
 - Works on mac and linux
+- Use `zmx` as a zig package
 - This project does **NOT** provide windows, tabs, or splits
 
 ## demos
@@ -54,63 +55,32 @@
 - [zmx - intro](https://youtu.be/UIXj0_rhPgI)
 - [zmx - ai portal](https://youtu.be/CV3skPYHP4Q)
 
-## install
+## docs
 
-### binaries
+The linked site describes upstream zmx. This fork keeps the AMX socket wire
+contract and the additions listed above; its CLI and Zig package must use a
+fork daemon. Upstream's versioned header and tag numbers are not interchangeable
+with AMX. See [LEADERSHIP.md](LEADERSHIP.md) for typed attachments.
 
-- https://zmx.sh/a/zmx-0.8.1-linux-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.8.1-linux-x86_64.tar.gz
-- https://zmx.sh/a/zmx-0.8.1-macos-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.8.1-macos-x86_64.tar.gz
+Full documentation is available at **[https://zmx.sh](https://zmx.sh)**:
 
-### homebrew
+- [Install & Usage](https://zmx.sh/getting-started)
+- [Shell Integration](https://zmx.sh/shell-integration)
+- [SSH Workflow](https://zmx.sh/ssh)
+- [Zig Package](https://zmx.sh/zig-package)
+- [Configuration & Debugging](https://zmx.sh/configuration)
+- [Architecture & Philosophy](https://zmx.sh/architecture)
+- [Community Tools](https://zmx.sh/community)
 
-```bash
-brew install neurosnap/tap/zmx
-```
+## build
 
-### mise-en-place
-
-```bash
-mise use zmx
-```
-
-### NixOS / nixpkgs
-
-Run immediately without installation:
-
-```sh
-nix run github:NixOS/nixpkgs/nixpkgs-unstable#zmx
-# or build main yourself
-nix run github:neurosnap/zmx
-```
-
-Start a shell with zmx available while it runs:
-
-```sh
-nix shell github:NixOS/nixpkgs/nixpkgs-unstable#zmx
-# or built main yourself
-nix run github:neurosnap/zmx
-```
-
-### packages (unofficial)
-
-- [Alpine Linux](https://pkgs.alpinelinux.org/package/edge/testing/x86_64/zmx)
-- [Arch AUR tracking releases](https://aur.archlinux.org/packages/zmx)
-- [Arch AUR tracking git](https://aur.archlinux.org/packages/zmx-git)
-- [openSUSE Tumbleweed](https://software.opensuse.org/package/zmx)
-- [Gentoo (overlay)](https://codeberg.org/samuelhautamaki/samuelhautamaki-gentoo)
-- [zmx-rpm packaging](https://github.com/engie/zmx-rpm/)
-
-### src
-
-- Requires zig `v0.16`
-- Clone the repo
-- Run build cmd
-
-Be sure to add `~/.local/bin` to your `PATH`:
+Requires Zig `v0.17.0`:
 
 ```bash
+# Build debug binary (./zig-out/bin/zmx)
+zig build
+
+# Install release binary to ~/.local/bin
 zig build -Doptimize=ReleaseSafe --prefix ~/.local
 ```
 

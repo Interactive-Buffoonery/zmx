@@ -64,3 +64,19 @@ load test_helper
   run "$ZMX" history test-args-only
   [[ "$output" == *"args-only-marker-999"* ]]
 }
+
+@test "run: stdin pipe session removes its socket on kill" {
+  run bash -c 'printf "echo stdin-kill-marker\n" | timeout 10 "$0" run test-stdin-kill' "$ZMX"
+  [ "$status" -eq 0 ]
+  wait_for_output test-stdin-kill stdin-kill-marker
+
+  run "$ZMX" kill test-stdin-kill
+  [ "$status" -eq 0 ]
+
+  local i=0
+  while [[ -e "$ZMX_DIR/test-stdin-kill" ]] && (( i < 50 )); do
+    sleep 0.1
+    (( i++ )) || true
+  done
+  [[ ! -e "$ZMX_DIR/test-stdin-kill" ]]
+}

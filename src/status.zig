@@ -1,5 +1,5 @@
 const std = @import("std");
-const cross = @import("cross.zig");
+const cross = @import("cross");
 const lib_posix = @import("posix.zig");
 
 const MAX_STATUS_LINE_LEN = 2048;
@@ -9,13 +9,13 @@ pub const StatusConfig = struct {
     token: ?[]const u8,
 
     pub fn takeFromEnv(alloc: std.mem.Allocator) !StatusConfig {
-        const path = if (cross.c.getenv("AMX_STATUS_FILE")) |raw|
+        const path = if (cross.getenv("AMX_STATUS_FILE")) |raw|
             try alloc.dupe(u8, std.mem.span(raw))
         else
             null;
         errdefer if (path) |p| alloc.free(p);
 
-        const token = if (cross.c.getenv("AMX_STATUS_TOKEN")) |raw|
+        const token = if (cross.getenv("AMX_STATUS_TOKEN")) |raw|
             try alloc.dupe(u8, std.mem.span(raw))
         else
             null;
@@ -108,10 +108,10 @@ pub const StatusFile = struct {
         }, 0o600);
         errdefer lib_posix.close(fd);
 
-        var st: cross.c.struct_stat = undefined;
-        if (cross.c.fstat(fd, &st) != 0) return error.InvalidStatusFile;
+        var st: cross.struct_stat = undefined;
+        if (cross.fstat(fd, &st) != 0) return error.InvalidStatusFile;
         if (st.st_uid != lib_posix.getuid()) return error.InvalidStatusFile;
-        if ((st.st_mode & cross.c.S_IFMT) != cross.c.S_IFREG) return error.InvalidStatusFile;
+        if ((st.st_mode & cross.S_IFMT) != cross.S_IFREG) return error.InvalidStatusFile;
         if ((st.st_mode & 0o777) != 0o600) return error.InvalidStatusFile;
 
         return fd;
@@ -162,11 +162,11 @@ fn appendJsonString(
 test "status env is copied without consuming attach parent state" {
     const alloc = std.testing.allocator;
 
-    _ = cross.c.setenv("AMX_STATUS_FILE", "/tmp/x", 1);
-    _ = cross.c.setenv("AMX_STATUS_TOKEN", "tok", 1);
+    _ = cross.setenv("AMX_STATUS_FILE", "/tmp/x", 1);
+    _ = cross.setenv("AMX_STATUS_TOKEN", "tok", 1);
     defer {
-        _ = cross.c.unsetenv("AMX_STATUS_FILE");
-        _ = cross.c.unsetenv("AMX_STATUS_TOKEN");
+        _ = cross.unsetenv("AMX_STATUS_FILE");
+        _ = cross.unsetenv("AMX_STATUS_TOKEN");
     }
 
     const cfg = try StatusConfig.takeFromEnv(alloc);
@@ -174,8 +174,8 @@ test "status env is copied without consuming attach parent state" {
 
     try std.testing.expectEqualStrings("/tmp/x", cfg.path.?);
     try std.testing.expectEqualStrings("tok", cfg.token.?);
-    try std.testing.expect(cross.c.getenv("AMX_STATUS_FILE") != null);
-    try std.testing.expect(cross.c.getenv("AMX_STATUS_TOKEN") != null);
+    try std.testing.expect(cross.getenv("AMX_STATUS_FILE") != null);
+    try std.testing.expect(cross.getenv("AMX_STATUS_TOKEN") != null);
 }
 
 test "emitAttached writes one JSON line with incarnation identity" {

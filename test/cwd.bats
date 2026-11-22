@@ -2,7 +2,7 @@
 # Working directory tracking tests for zmx.
 #
 # zmx learns a session's cwd from the OSC 7 the shell emits, which arrives as a
-# percent-encoded file://<host><path> URI. That URI is what `list` reports, so
+# percent-encoded file://<host><path> URI. The fork frames it in cwd_b64, so
 # the host stays visible and you can tell an SSH session apart from a local one.
 # These tests pin that output plus the thing it depends on: the URI is decoded
 # for the chdir, so a new session lands in a directory whose name needed
@@ -30,7 +30,7 @@ osc7_session() {
   wait_for_output test-cwd-uri marker-test-cwd-uri
   wait_for_cwd test-cwd-uri "cwd=file://$(hostname)${dir// /%20}"
 
-  run "$ZMX" list
+  run list_with_cwd
   [ "$status" -eq 0 ]
   [[ "$output" == *"cwd=file://$(hostname)${dir// /%20}"* ]]
 }
@@ -42,7 +42,7 @@ osc7_session() {
   wait_for_output test-cwd-remote marker-remote
   wait_for_cwd test-cwd-remote "cwd=file://some-remote-box/home/me"
 
-  run "$ZMX" list
+  run list_with_cwd
   [ "$status" -eq 0 ]
   [[ "$output" == *"cwd=file://some-remote-box/home/me"* ]]
 }
@@ -54,7 +54,7 @@ osc7_session() {
   "$ZMX" run test-cwd-encode -d sleep 30
   wait_for_session test-cwd-encode
 
-  run "$ZMX" list
+  run list_with_cwd
   [ "$status" -eq 0 ]
   [[ "$output" == *"cwd=file://$(hostname)/"* ]]
 }
