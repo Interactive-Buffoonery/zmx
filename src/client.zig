@@ -194,8 +194,17 @@ fn attachClientOnly(alloc: Allocator, io: Io, name: []const u8, opts: AttachOpti
         .detach => return,
         .switch_session => {
             if (looper.session_name) |target_name| {
+                // When `zmx attach <target>` moves this terminal to another
+                // session, leave raw mode so Ctrl C sends SIGINT instead of
+                // ordinary input. The user can then stop this client if
+                // connecting to the target session stalls.
+                if (stdin_is_tty) {
+                    _ = cross.tcsetattr(lib_posix.STDIN_FILENO, cross.TCSAFLUSH, &orig_termios);
+                }
                 _ = lib_posix.write(lib_posix.STDOUT_FILENO, restore_seq) catch {};
                 var new_opts = opts;
+                new_opts.labels = null;
+                new_opts.command = null;
                 if (looper.cwd) |new_cwd| new_opts.cwd = new_cwd;
                 return attachClientOnly(alloc, io, target_name, new_opts);
             }
@@ -316,6 +325,11 @@ fn attachDaemon(
         .detach => return,
         .switch_session => {
             if (looper.session_name) |session_name| {
+                // Leave raw mode so Ctrl C can stop this client if connecting
+                // to the target session stalls.
+                if (stdin_is_tty) {
+                    _ = cross.tcsetattr(lib_posix.STDIN_FILENO, cross.TCSAFLUSH, &orig_termios);
+                }
                 // Reset terminal modes when switching sessions
                 _ = lib_posix.write(lib_posix.STDOUT_FILENO, restore_seq) catch {};
 
@@ -331,6 +345,7 @@ fn attachDaemon(
                     ),
                     error.OutOfMemory => return err,
                 };
+                defer gpa.free(target_path);
 
                 var target_daemon = Daemon.init(io, daemon.cfg, session_name, target_path);
                 // Use the cwd from the previous daemon if available (sent by the daemon),
