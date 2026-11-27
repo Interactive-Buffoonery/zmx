@@ -73,7 +73,7 @@ fn exec(sesh_name: []const u8, cmd: Cmd) !noreturn {
     );
 
     if (cross.getenv("TERM")) |term_env| {
-        if (std.mem.eql(u8, std.mem.span(term_env), "dumb")) {
+        if (term_env[0] == 0 or std.mem.eql(u8, std.mem.span(term_env), "dumb")) {
             _ = cross.putenv(@constCast("TERM=xterm-256color"));
         }
     } else {

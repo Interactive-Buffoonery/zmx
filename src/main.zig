@@ -253,10 +253,13 @@ fn mainImpl(init: std.process.Init) !void {
         var cmd_args_raw: std.ArrayList([]const u8) = .empty;
         defer cmd_args_raw.deinit(gpa);
         var detached = false;
+        var vt = false;
         while (args.next()) |arg| {
             // Once the command has started, -d belongs to the command.
             if (cmd_args_raw.items.len == 0 and std.mem.startsWith(u8, arg, "-d")) {
                 detached = true;
+            } else if (cmd_args_raw.items.len == 0 and std.mem.eql(u8, arg, "--vt")) {
+                vt = true;
             } else {
                 try cmd_args_raw.append(gpa, arg);
             }
@@ -294,6 +297,7 @@ fn mainImpl(init: std.process.Init) !void {
 
         const exit_code = zmx.run(gpa, io, session_name, cmd_args_raw.items, .{
             .detached = detached,
+            .vt = vt,
             .cwd = cwd,
             .shell = shell_env,
             .stdin_bytes = stdin_bytes,
@@ -501,7 +505,7 @@ fn help(io: std.Io) !void {
         \\  [a]ttach [--existing] [--labels kv] <name> [command...]
         \\                                                Attach, creating unless --existing
         \\  watch <name>                              Watch an existing session (no input)
-        \\  [r]un <name> [-d] [command...]              Send command without attaching
+        \\  [r]un <name> [-d] [--vt] [command...]              Send command without attaching
         \\  [s]end <name> <text...>                     Send raw input to session PTY
         \\  [p]rint <name> <text...>                    Inject text into session display
         \\  [wr]ite <name> <file_path>                  Write stdin to file_path through the session
@@ -512,7 +516,7 @@ fn help(io: std.Io) !void {
         \\  [cl]ear <name>                              Clear all session labels
         \\  print-env [-s] <name> [key]                 Print tracked environment variables
         \\  [k]ill <name>... [--force]                  Kill session and all attached clients
-        \\  [hi]story <name> [--vt|--html]              Output session scrollback
+        \\  [hi]story <name> [--vt|--html] [--screen|--scrollback]  Output session scrollback
         \\  cwd <name>                                  Print active terminal job cwd
         \\  [w]ait <name>...                            Wait for session tasks to complete
         \\  [t]ail <name>...                            Follow session output
@@ -552,20 +556,17 @@ fn help(io: std.Io) !void {
         \\  Commands run inside a PTY using bash
         \\  Commands are passed as-is: do not wrap in quotes.
         \\  Commands run sequentially: do not send multiple in parallel.
-        \\  Stdin is redirected from /dev/null to prevent interactive programs
-        \\  (pagers, editors, prompts) from blocking. Use `zmx send` for
-        \\  commands that need user input, or pipe data directly:
-        \\    echo "data" | zmx run dev cat
+        \\  If no command-line arguments are specified, zmx reads from stdin.
         \\
         \\  `-d` will detach from the calling terminal. Use `wait` to track
         \\  its status.
+        \\  `--vt` preserves terminal escape sequences in the output.
         \\
         \\  Examples:
         \\    zmx run dev ls
         \\    zmx run dev zig build
         \\    zmx run dev grep -r TODO src
-        \\    zmx run dev git log --oneline          # pager won't block
-        \\    echo "hello" | zmx run dev cat         # piped stdin still works
+        \\    zmx run dev git --no-pager log --oneline
         \\
         \\    # heredoc
         \\    printf "cat << 'EOF'\r\nHello $USER\r\nToday is $(date).\r\nEOF" | zmx run dev
@@ -603,8 +604,7 @@ fn help(io: std.Io) !void {
         \\Write:
         \\  Writes stdin to file_path inside the session. Works over SSH.
         \\  file_path can be absolute or relative to the session shell's cwd.
-        \\  Requires base64 and printf in the remote environment.
-        \\  Large files are chunked automatically (~48KB per chunk).
+        \\  Requires sh, stty, head and base64 in the remote environment.
         \\  File path must not contain single quotes.
         \\
         \\  Examples:

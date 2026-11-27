@@ -213,10 +213,8 @@ fn serializeScreenHistory(screen: *const ghostty_vt.Screen, writer: *std.Io.Writ
             var sb_bottom = sb_bottom_row;
             sb_bottom.x = @intCast(pages.cols - 1);
 
-            // Keep history lines logical so they reflow. History only: phase 2's
-            // CUP assumes the source row layout. A session with DECAWM off stays
-            // hard-wrapped because a receiver reattached without RIS is still in
-            // that mode and would truncate an unwrapped line.
+            // Keep history lines logical so they reflow. With DECAWM off, a
+            // reattached receiver would truncate an unwrapped line.
             var scroll_fmt = ghostty_vt.formatter.ScreenFormatter.init(screen, .{
                 .emit = .vt,
                 .unwrap = unwrap,
@@ -244,7 +242,26 @@ fn serializeScreenHistory(screen: *const ghostty_vt.Screen, writer: *std.Io.Writ
     }
 }
 
-pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal, client_rows: u16) ?[]const u8 {
+fn canUnwrapViewport(term: *const ghostty_vt.Terminal, client_cols: u16) bool {
+    if (client_cols != term.cols or !term.modes.get(.wraparound)) return false;
+    const pages = &term.screens.active.pages;
+    var rows = pages.rowIterator(.right_down, .{ .active = .{ .x = 0, .y = 0 } }, null);
+    var previous_wrap = false;
+    while (rows.next()) |pin| {
+        const page = pin.node.page();
+        const row = pin.rowAndCell().row;
+        const cells = page.getCells(row);
+        if (row.wrap_continuation != previous_wrap) return false;
+        // An erased cell at the join needs an explicit row break. A CUF
+        // emitted before an auto-wrap would otherwise move on the prior row.
+        if (previous_wrap and !cells[0].hasText()) return false;
+        if (row.wrap and cells[pages.cols - 1].isEmpty()) return false;
+        previous_wrap = row.wrap;
+    }
+    return !previous_wrap;
+}
+
+pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal, client_rows: u16, client_cols: u16) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
 
@@ -305,7 +322,12 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     const pages = &term.screens.active.pages;
 
     // Phase 2: visible screen with full extras (modes, cursor, keyboard, etc.)
-    var vis_fmt = ghostty_vt.formatter.TerminalFormatter.init(&format_term, .vt);
+    var vis_fmt = ghostty_vt.formatter.TerminalFormatter.init(&format_term, .{
+        .emit = .vt,
+        // Cursor positioning assumes the source row layout. At the same width,
+        // auto-wrap produces those rows and preserves their logical grouping.
+        .unwrap = canUnwrapViewport(term, client_cols),
+    });
 
     // Restrict content to the active viewport only
     const active_tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } });
@@ -453,7 +475,7 @@ test "serializeTerminalState excludes synchronized output replay" {
     try testing.expect(term.modes.get(.bracketed_paste));
     try testing.expect(term.modes.get(.synchronized_output));
 
-    const output = serializeTerminalState(alloc, &term, term.screens.active.pages.rows) orelse return error.TestUnexpectedNull;
+    const output = serializeTerminalState(alloc, &term, term.rows, term.cols) orelse return error.TestUnexpectedNull;
     defer alloc.free(output);
 
     // The serialized output should contain bracketed paste (DECSET 2004)
@@ -474,7 +496,7 @@ test "serializeTerminalState restores synchronized output after a failed write" 
     stream.nextSlice("primary\x1b[?1049h\x1b[?2026halt");
 
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
-    try testing.expect(serializeTerminalState(failing.allocator(), &term, 24) == null);
+    try testing.expect(serializeTerminalState(failing.allocator(), &term, 24, 80) == null);
     try testing.expect(term.modes.get(.synchronized_output));
 }
 
@@ -494,7 +516,7 @@ test "serializeTerminalState replays the title" {
     stream.nextSlice("\x1b]2;my title\x07");
     stream.nextSlice("hello");
 
-    const output = serializeTerminalState(alloc, &term, term.screens.active.pages.rows) orelse return error.TestUnexpectedNull;
+    const output = serializeTerminalState(alloc, &term, term.rows, term.cols) orelse return error.TestUnexpectedNull;
     defer alloc.free(output);
 
     try testing.expect(std.mem.indexOf(u8, output, "\x1b]2;my title\x07") != null);
@@ -515,7 +537,7 @@ test "serializeTerminalState omits the title when none is set" {
 
     stream.nextSlice("hello");
 
-    const output = serializeTerminalState(alloc, &term, term.screens.active.pages.rows) orelse return error.TestUnexpectedNull;
+    const output = serializeTerminalState(alloc, &term, term.rows, term.cols) orelse return error.TestUnexpectedNull;
     defer alloc.free(output);
 
     try testing.expect(std.mem.indexOf(u8, output, "\x1b]2;") == null);
@@ -537,7 +559,7 @@ test "serializeTerminalState replays the pwd without a NUL sentinel" {
     stream.nextSlice("\x1b]7;file://myhost/private/tmp\x1b\\");
     stream.nextSlice("hello");
 
-    const output = serializeTerminalState(alloc, &term, term.screens.active.pages.rows) orelse return error.TestUnexpectedNull;
+    const output = serializeTerminalState(alloc, &term, term.rows, term.cols) orelse return error.TestUnexpectedNull;
     defer alloc.free(output);
 
     try testing.expect(std.mem.indexOf(u8, output, "\x1b]7;file://myhost/private/tmp\x1b\\") != null);
@@ -559,7 +581,7 @@ test "serializeTerminalState omits the pwd when none is set" {
 
     stream.nextSlice("hello");
 
-    const output = serializeTerminalState(alloc, &term, term.screens.active.pages.rows) orelse return error.TestUnexpectedNull;
+    const output = serializeTerminalState(alloc, &term, term.rows, term.cols) orelse return error.TestUnexpectedNull;
     defer alloc.free(output);
 
     try testing.expect(std.mem.indexOf(u8, output, "\x1b]7;") == null);
@@ -617,7 +639,7 @@ fn expectCursorAt(term: *ghostty_vt.Terminal, row: usize, col: usize) !void {
 }
 
 fn serializeRoundtrip(alloc: std.mem.Allocator, io: std.Io, source: *ghostty_vt.Terminal) !ghostty_vt.Terminal {
-    const serialized = serializeTerminalState(alloc, source, source.screens.active.pages.rows) orelse
+    const serialized = serializeTerminalState(alloc, source, source.rows, source.cols) orelse
         return error.SerializationFailed;
     defer alloc.free(serialized);
 
@@ -758,7 +780,7 @@ test "serializeTerminalState nested roundtrip preserves content" {
     const inner_cursor_y = inner.screens.active.cursor.y;
 
     // Serialize inner (simulates inner daemon re-attach to inner client)
-    const inner_serialized = serializeTerminalState(alloc, &inner, inner.screens.active.pages.rows) orelse
+    const inner_serialized = serializeTerminalState(alloc, &inner, inner.rows, inner.cols) orelse
         return error.SerializationFailed;
     defer alloc.free(inner_serialized);
 
@@ -803,6 +825,45 @@ test "serializeTerminalState alternate screen not leaked" {
     defer alloc.free(plain);
     try testing.expect(std.mem.indexOf(u8, plain, "ALT_MARK") == null);
     try testing.expect(std.mem.indexOf(u8, plain, "MAIN_MARK") != null);
+}
+
+test "serializeTerminalState keeps soft wraps so a wider client reflows them" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var term = try testCreateTerminal(alloc, io, 20, 5, "\x1b[2J\x1b[H" ++
+        "abcdefghijklmnopqrstuvwxyz0123");
+    defer term.deinit(alloc);
+
+    var client = try serializeRoundtrip(alloc, io, &term);
+    defer client.deinit(alloc);
+    try expectScreensMatch(alloc, &term, &client);
+
+    try term.resize(alloc, .{ .cols = 40, .rows = 5 });
+    try client.resize(alloc, .{ .cols = 40, .rows = 5 });
+    try expectScreensMatch(alloc, &term, &client);
+    try expectMarkerAtRow(alloc, &client, "abcdefghijklmnopqrstuvwxyz0123", 0);
+}
+
+test "serializeTerminalState keeps soft wraps in scrollback" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var term = try testCreateTerminal(alloc, io, 20, 3, "abcdefghijklmnopqrstuvwxyz0123\r\n" ++
+        "1\r\n2\r\n3\r\n4");
+    defer term.deinit(alloc);
+
+    var client = try serializeRoundtrip(alloc, io, &term);
+    defer client.deinit(alloc);
+
+    try term.resize(alloc, .{ .cols = 40, .rows = 3 });
+    try client.resize(alloc, .{ .cols = 40, .rows = 3 });
+    const expected = try term.screens.active.dumpStringAlloc(alloc, .{ .screen = .{ .x = 0, .y = 0 } });
+    defer alloc.free(expected);
+    const actual = try client.screens.active.dumpStringAlloc(alloc, .{ .screen = .{ .x = 0, .y = 0 } });
+    defer alloc.free(actual);
+    try testing.expectEqualStrings(expected, actual);
+    try testing.expect(std.mem.indexOf(u8, actual, "abcdefghijklmnopqrstuvwxyz0123") != null);
 }
 
 test "serializeTerminalState size mismatch roundtrip" {
@@ -854,7 +915,7 @@ test "serializeTerminalState scrollback + size mismatch nested roundtrip" {
     const inner_cursor_y = inner.screens.active.cursor.y;
 
     // Inner serialize → outer processes → outer serialize → client
-    const inner_ser = serializeTerminalState(alloc, &inner, inner.screens.active.pages.rows) orelse
+    const inner_ser = serializeTerminalState(alloc, &inner, inner.rows, inner.cols) orelse
         return error.SerializationFailed;
     defer alloc.free(inner_ser);
 

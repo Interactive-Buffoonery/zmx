@@ -40,16 +40,28 @@ load test_helper
 }
 
 @test "run: blocking returns after command completes" {
-  run timeout 5 env SHELL=/bin/bash "$ZMX" run test-blocking echo hello
+  run timeout --foreground 5 env SHELL="$BASH" "$ZMX" run test-blocking echo hello
   [ "$status" -eq 0 ]
   [[ "$output" == *"session \"test-blocking\" created"* ]]
 }
 
 @test "run: -d after the command is passed to the command" {
-  run timeout 5 "$ZMX" run test-dash-d printf 'arg=%s\n' -d
+  run timeout --foreground 5 "$ZMX" run test-dash-d printf 'arg=%s\n' -d
   [ "$status" -eq 0 ]
   [[ "$output" != *"command sent"* ]]
   wait_for_output test-dash-d "arg=-d"
+}
+
+@test "run: --vt preserves terminal escape sequences" {
+  local cmd=(sh -c 'printf "\033[31marg=%s\033[0m\033[K\n" "$1"; exit 7' sh --vt)
+  run timeout --foreground 5 "$ZMX" run test-plain "${cmd[@]}"
+  [ "$status" -eq 7 ]
+  [[ "$output" == *"arg=--vt"* ]]
+  [[ "$output" != *$'\033'* ]]
+
+  run timeout --foreground 5 "$ZMX" run test-vt --vt "${cmd[@]}"
+  [ "$status" -eq 7 ]
+  [[ "$output" == *$'\033[31marg=--vt\033[0m\033[K'* ]]
 }
 
 @test "run: requires a command argument" {
@@ -258,7 +270,7 @@ load test_helper
   wait_for_output test-wait done
 
   # `wait` should return once the command finishes
-  run timeout 10 "$ZMX" wait test-wait
+  run timeout --foreground 10 "$ZMX" wait test-wait
   [ "$status" -eq 0 ]
 }
 
@@ -319,15 +331,68 @@ load test_helper
 # Write
 # ============================================================================
 
+@test "write: the file is complete when write returns" {
+  local src="$BATS_TEST_TMPDIR/src.bin" dst="$BATS_TEST_TMPDIR/dst.bin"
+  head -c 200000 /dev/urandom > "$src"
+
+  run timeout 10 "$ZMX" run test-write-sync echo write-ready-marker
+  [ "$status" -eq 0 ]
+  wait_for_output test-write-sync write-ready-marker
+
+  run bash -c 'timeout 10 "$0" write test-write-sync "$1" < "$2"' "$ZMX" "$dst" "$src"
+  [ "$status" -eq 0 ]
+  cmp "$src" "$dst"
+}
+
+@test "write: input sent during a write stays out of the file" {
+  local src="$BATS_TEST_TMPDIR/src.bin" dst="$BATS_TEST_TMPDIR/dst.bin"
+  head -c 100000 /dev/urandom > "$src"
+
+  run timeout 10 "$ZMX" run test-write-input echo write-ready-marker
+  [ "$status" -eq 0 ]
+  wait_for_output test-write-input write-ready-marker
+
+  "$ZMX" send test-write-input "sleep 2"$'\r'
+  sleep 0.3
+  timeout 15 "$ZMX" write test-write-input "$dst" < "$src" &
+  local writer=$!
+  sleep 0.3
+  "$ZMX" send test-write-input abcd
+  wait "$writer"
+  cmp "$src" "$dst"
+}
+
+@test "write: fails when the file can't be created" {
+  run bash -c 'echo hi | timeout 10 "$0" write test-write-bad "$1"' "$ZMX" "$BATS_TEST_TMPDIR/missing/dst.bin"
+  [ "$status" -ne 0 ]
+}
+
+@test "write: empty file succeeds without head error" {
+  local dst="$BATS_TEST_TMPDIR/empty.bin"
+
+  run timeout 10 "$ZMX" run test-write-empty echo write-ready-marker
+  [ "$status" -eq 0 ]
+  wait_for_output test-write-empty write-ready-marker
+
+  run bash -c 'timeout 10 "$0" write test-write-empty "$1" < /dev/null' "$ZMX" "$dst"
+  [ "$status" -eq 0 ]
+  [ -f "$dst" ]
+  [ ! -s "$dst" ]
+
+  run "$ZMX" history test-write-empty
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"illegal byte count"* ]]
+}
+
 @test "write: a file larger than the PTY input buffer arrives whole" {
   local src="$BATS_TEST_TMPDIR/src.bin" dst="$BATS_TEST_TMPDIR/dst.bin" i=0
   head -c 400000 /dev/urandom > "$src"
 
-  run timeout 10 "$ZMX" run test-write-large echo write-ready-marker
+  run timeout --foreground 10 "$ZMX" run test-write-large echo write-ready-marker
   [ "$status" -eq 0 ]
   wait_for_output test-write-large write-ready-marker
 
-  run bash -c 'timeout 10 "$0" write test-write-large "$1" < "$2"' "$ZMX" "$dst" "$src"
+  run bash -c 'timeout --foreground 10 "$0" write test-write-large "$1" < "$2"' "$ZMX" "$dst" "$src"
   [ "$status" -eq 0 ]
 
   while (( i < 300 )) && ! cmp -s "$src" "$dst"; do

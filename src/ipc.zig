@@ -39,6 +39,10 @@ pub const Tag = enum(u8) {
     RequestedSize = 32,
     Downgrade = 33,
     Capture = 34,
+    /// Subscribe to live PTY output and task completion.
+    Tail = 35,
+    /// Write the same payload as Write, and acknowledge after execution.
+    WriteSync = 36,
     Unsupported = 255,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @fromBackingInt, so out-of-range values are representable
@@ -507,7 +511,8 @@ test "Tag wire values are frozen" {
         .{ Tag.EnvSet, 24 },         .{ Tag.EnvData, 25 },      .{ Tag.AttachRole, 26 },
         .{ Tag.AttachAccepted, 27 }, .{ Tag.Authority, 28 },    .{ Tag.UserBatch, 29 },
         .{ Tag.TerminalReply, 30 },  .{ Tag.TakeOver, 31 },     .{ Tag.RequestedSize, 32 },
-        .{ Tag.Downgrade, 33 },      .{ Tag.Capture, 34 },      .{ Tag.Unsupported, 255 },
+        .{ Tag.Downgrade, 33 },      .{ Tag.Capture, 34 },      .{ Tag.Tail, 35 },
+        .{ Tag.WriteSync, 36 },      .{ Tag.Unsupported, 255 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @backingInt(p[0]));
 }
 
