@@ -1266,7 +1266,19 @@ pub const Daemon = struct {
         op.data = try gpa.dupe(u8, value.data);
         op.id = self.next_operation_id;
         self.next_operation_id += 1;
-        self.operations.appendAssumeCapacity(op);
+        var index = self.operations.items.len;
+        if (self.pending_write != null and !self.pending_write.?.submitted and
+            (op.kind == .resize or op.kind == .recover or op.kind == .reply))
+        {
+            // Keep terminal control responsive while a write waits for its shell.
+            for (self.operations.items, 0..) |queued, i| {
+                if (queued.kind == .file_write and queued.offset == 0) {
+                    index = i;
+                    break;
+                }
+            }
+        }
+        self.operations.insertAssumeCapacity(index, op);
         self.queued_bytes += op.data.len;
     }
 

@@ -405,6 +405,8 @@ def write_during_job(binary, root, env, clients):
     wait(lambda: history_contains(b'shell-ready'))
     terminal = Client(root + '/regression'); clients.append(terminal)
     terminal.attach(2)
+    terminal.op(TAKE, struct.pack('<HH', 24, 80))
+    assert terminal.state()[0] == terminal.id
     writer = Client(root + '/regression'); clients.append(writer)
     call('send', 'regression', "sh -c 'printf BUSY_%s READY; exec sleep 30'\r")
     wait(lambda: history_contains(b'BUSY_READY'))
@@ -414,8 +416,10 @@ def write_during_job(binary, root, env, clients):
     writer.send(36, struct.pack('<I', len(path)) + path + b'file contents')
     writer.send(18)
     writer.receive(21)
-    size = struct.pack('<HH', 24, 80)
-    terminal.op(TAKE, size)
+    size = struct.pack('<HH', 30, 100)
+    terminal.op(SIZE, size)
+    assert terminal.state()[2:] == (30, 100), 'waiting file write blocked resize'
+    assert list(Path(root).glob('.zmx-write-*')), 'resize canceled the waiting write'
     terminal.op(USER, size + b'\x03')
     assert writer.receive(10) == b'\x01', 'file write was not canceled by terminal input'
     terminal.op(USER, size + b'printf "AFTER_%s" INTERRUPT\r')
