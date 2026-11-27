@@ -605,7 +605,7 @@ fn help(io: std.Io) !void {
         \\  Writes stdin to file_path once the session shell is in the foreground.
         \\  Over SSH, run zmx write on the host running the destination session.
         \\  file_path can be absolute or relative to the session shell's cwd.
-        \\  Requires sh, stty, head and base64 in the remote environment.
+        \\  Requires sh and cat on the session host.
         \\
         \\  Examples:
         \\    echo "hello" | zmx write dev /tmp/hello.txt

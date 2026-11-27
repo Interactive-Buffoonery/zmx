@@ -510,10 +510,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     // With no leader, answer DA queries even when legacy
                     // followers are attached: their replies lack authority.
                     // This prevents fish from waiting 10s for unanswered DA1.
-                    if (daemon.leader_client_fd == null and
-                        daemon.pending_write == null and
-                        daemon.queued_bytes < Daemon.PTY_WRITE_BUF_MAX)
-                    {
+                    if (daemon.leader_client_fd == null and daemon.queued_bytes < Daemon.PTY_WRITE_BUF_MAX) {
                         var replies: std.ArrayList(u8) = .empty;
                         defer replies.deinit(gpa);
                         util.respondToDeviceAttributes(gpa, &replies, buf[0..n]);
@@ -784,25 +781,30 @@ pub const Client = struct {
     }
 };
 
-const write_ready_marker = "ZMX_WRITE_READY";
 const write_done_marker = "ZMX_WRITE_DONE:";
 const write_status_busy = 255;
-const write_stall_ms = 60 * 1000;
+const write_timeout_ms = 60 * 1000;
 
 /// A `zmx write` waiting on the shell in the session.
 const PendingWrite = struct {
-    const carry_max = 32;
+    const Id = [32]u8;
+    const carry_max = write_done_marker.len + @sizeOf(Id) + 4;
 
     client: ?*Client,
-    encoded: []u8,
-    streaming: bool = false,
-    stream_failed: bool = false,
-    offset: usize = 0,
-    // When the shell last made progress, 0 until the next clock tick.
-    progress_ms: i64 = 0,
+    id: Id,
+    staging_path: []const u8,
+    submitted: bool = false,
+    deadline_ms: i64,
     // A marker can straddle two PTY reads.
     carry: [carry_max]u8 = undefined,
     carry_len: usize = 0,
+
+    fn deinit(self: PendingWrite, gpa: std.mem.Allocator, io: std.Io) void {
+        std.Io.Dir.deleteFileAbsolute(io, self.staging_path) catch |err| {
+            std.log.warn("failed to remove staged write: {s}", .{@errorName(err)});
+        };
+        gpa.free(self.staging_path);
+    }
 };
 
 /// Daemon is responsible for managing a zmx session.
@@ -888,7 +890,7 @@ pub const Daemon = struct {
         self.labels.deinit(gpa);
         for (self.operations.items) |op| gpa.free(op.data);
         self.operations.deinit(gpa);
-        if (self.pending_write) |pending| gpa.free(pending.encoded);
+        if (self.pending_write) |pending| pending.deinit(gpa, self.io);
     }
 
     pub fn shutdown(self: *Daemon, gpa: std.mem.Allocator) void {
@@ -939,7 +941,7 @@ pub const Daemon = struct {
         if (self.pending_write) |*pending| {
             if (pending.client == client) {
                 pending.client = null;
-                if (!self.writeCommandSubmitted()) self.finishWrite(gpa, 1) catch {};
+                if (!self.writeCommandStarted()) self.finishWrite(gpa, 1) catch {};
             }
         }
         client.deinit(gpa);
@@ -1083,6 +1085,7 @@ pub const Daemon = struct {
         var threaded: std.Io.Threaded = .init_single_threaded;
         defer threaded.deinit();
         const new_io = threaded.io();
+        self.io = new_io;
 
         { // re-initialize logs with the session name as the filename
             log.log_system.deinit();
@@ -1250,7 +1253,7 @@ pub const Daemon = struct {
     fn queueOperation(self: *Daemon, gpa: std.mem.Allocator, value: Operation) !void {
         try self.queueOperationLimit(gpa, value, PTY_WRITE_BUF_MAX);
         if ((value.kind == .user or value.kind == .takeover) and
-            self.pending_write != null and !self.writeCommandSubmitted())
+            self.pending_write != null and !self.writeCommandStarted())
         {
             try self.finishWrite(gpa, 1);
         }
@@ -1341,7 +1344,8 @@ pub const Daemon = struct {
         }
     }
 
-    fn writeCommandSubmitted(self: *const Daemon) bool {
+    fn writeCommandStarted(self: *const Daemon) bool {
+        if (self.pending_write.?.submitted) return true;
         if (self.operations.items.len == 0) return false;
         const op = self.operations.items[0];
         return op.kind == .file_write and op.offset != 0;
@@ -1355,11 +1359,7 @@ pub const Daemon = struct {
     fn hasWritableOperations(self: *const Daemon, fd: i32, term: *const ghostty_vt.Terminal) bool {
         if (self.operations.items.len == 0) return false;
         const op = self.operations.items[0];
-        if (op.kind != .file_write) return true;
-        if (op.offset == 0) return self.canSubmitWrite(fd, term);
-        if (op.offset < op.data.len) return true;
-        const pending = self.pending_write.?;
-        return pending.streaming and !pending.stream_failed and pending.offset < pending.encoded.len;
+        return op.kind != .file_write or op.offset != 0 or self.canSubmitWrite(fd, term);
     }
 
     fn flushOperations(self: *Daemon, gpa: std.mem.Allocator, fd: i32, term: *ghostty_vt.Terminal) !void {
@@ -1421,28 +1421,12 @@ pub const Daemon = struct {
                 };
                 if (n == 0) return;
                 op.offset += n;
-                if (op.kind == .file_write) self.pending_write.?.progress_ms = self.now_ms;
                 if (op.offset < op.data.len) return;
             }
             if (op.kind == .file_write) {
-                // Keep this operation at the head until the shell confirms
-                // it has stopped reading the file stream.
                 const pending = &self.pending_write.?;
-                if (pending.streaming and !pending.stream_failed and pending.offset < pending.encoded.len) {
-                    const n = lib_posix.write(fd, pending.encoded[pending.offset..]) catch |err| {
-                        if (err == error.WouldBlock) return;
-                        pending.stream_failed = true;
-                        if (pending.client) |c| {
-                            try ipc.appendMessage(gpa, &c.write_buf, .Ack, &[_]u8{1});
-                            c.has_pending_output = true;
-                            pending.client = null;
-                        }
-                        return;
-                    };
-                    pending.offset += n;
-                    if (n != 0) pending.progress_ms = self.now_ms;
-                }
-                return;
+                pending.submitted = true;
+                pending.deadline_ms = self.now_ms + write_timeout_ms;
             }
             self.removeOperation(gpa, 0);
         }
@@ -1883,15 +1867,14 @@ pub const Daemon = struct {
 
         const path = try util.shellQuote(gpa, file_path);
         defer gpa.free(path);
-        const encoded = try gpa.alloc(u8, std.base64.standard.Encoder.calcSize(file_content.len));
-        var transfer_owned = false;
-        defer if (!transfer_owned) gpa.free(encoded);
-        _ = std.base64.standard.Encoder.encode(encoded, file_content);
 
         var command: std.Io.Writer.Allocating = .init(gpa);
         defer command.deinit();
         if (!synchronous) {
             // Write was published as an ordered, fire-and-forget request.
+            const encoded = try gpa.alloc(u8, std.base64.standard.Encoder.calcSize(file_content.len));
+            defer gpa.free(encoded);
+            _ = std.base64.standard.Encoder.encode(encoded, file_content);
             try command.writer.print("printf '%s' '{s}' | base64 -d > {s}\r", .{ encoded, path });
             const bytes = command.written();
             try self.queueOperationLimit(gpa, .{ .data = bytes }, PTY_WRITE_BUF_MAX + bytes.len);
@@ -1900,34 +1883,56 @@ pub const Daemon = struct {
             return;
         }
 
-        if (encoded.len == 0) {
-            try command.writer.writeAll("sh -c 'if (: >\"$0\");then r=0;else r=1;fi;echo ZMX_WR\"\"ITE_DONE:$r' ");
-        } else {
-            try command.writer.print(
-                "sh -c 's=$(stty -g);if (: >\"$0\") && stty -icanon -echo;then echo ZMX_WR\"\"ITE_READY;" ++
-                    "head -c {d}|base64 -d >\"$0\";r=$?;stty \"$s\";else r=1;fi;echo ZMX_WR\"\"ITE_DONE:$r' ",
-                .{encoded.len},
-            );
-        }
-        try command.writer.print("{s}\r", .{path});
+        const pending = self.stageWrite(gpa, client, file_content) catch |err| {
+            std.log.warn("could not stage file write: {s}", .{@errorName(err)});
+            try ipc.appendMessage(gpa, &client.write_buf, .Ack, &[_]u8{1});
+            client.has_pending_output = true;
+            return;
+        };
+        errdefer pending.deinit(gpa, self.io);
+        const staging_path = try util.shellQuote(gpa, pending.staging_path);
+        defer gpa.free(staging_path);
+        // Open the staged input first. An expired command with a missing
+        // staging file must leave the destination untouched.
+        try command.writer.print(
+            "sh -c 'cat <\"$1\" >\"$2\";printf \"\\nZMX_WR\"\"ITE_DONE:%s:%s\\n\" \"$3\" \"$?\"' sh {s} {s} {s}\r",
+            .{ staging_path, path, pending.id },
+        );
         try self.queueOperation(gpa, .{ .kind = .file_write, .data = command.written() });
-        self.pending_write = .{ .client = client, .encoded = encoded, .progress_ms = self.now_ms };
-        transfer_owned = true;
+        self.pending_write = pending;
         std.log.debug(
             "write command len={d} file_path={s}",
             .{ file_content.len, file_path },
         );
     }
 
-    /// End the pending write and let the held input through.
+    fn stageWrite(self: *Daemon, gpa: std.mem.Allocator, client: *Client, content: []const u8) !PendingWrite {
+        var unique: [16]u8 = undefined;
+        try self.io.randomSecure(&unique);
+        const id = std.fmt.bytesToHex(unique, .lower);
+        const staging_path = try std.fmt.allocPrint(gpa, "{s}/.zmx-write-{s}", .{ self.cfg.socket_dir, id });
+        errdefer gpa.free(staging_path);
+
+        const file = try std.Io.Dir.createFileAbsolute(self.io, staging_path, .{
+            .exclusive = true,
+            .permissions = .fromMode(0o600),
+        });
+        errdefer std.Io.Dir.deleteFileAbsolute(self.io, staging_path) catch {};
+        defer file.close(self.io);
+        try file.writeStreamingAll(self.io, content);
+        return .{ .client = client, .id = id, .staging_path = staging_path, .deadline_ms = self.now_ms + write_timeout_ms };
+    }
+
     fn finishWrite(self: *Daemon, gpa: std.mem.Allocator, exit_status: u8) !void {
         const pending = self.pending_write.?;
-        gpa.free(pending.encoded);
         self.pending_write = null;
+        pending.deinit(gpa, self.io);
 
-        for (self.operations.items, 0..) |op, i| {
+        for (self.operations.items, 0..) |*op, i| {
             if (op.kind != .file_write) continue;
-            self.removeOperation(gpa, i);
+            // Finish sending any partial command so its trailing bytes do
+            // not become part of the next input line.
+            if (op.offset == 0) self.removeOperation(gpa, i) else op.kind = .automation;
             break;
         }
 
@@ -1937,52 +1942,31 @@ pub const Daemon = struct {
         }
     }
 
-    /// Time out the caller. Keep the input barrier if any command bytes were submitted.
     fn checkWriteDeadline(self: *Daemon, gpa: std.mem.Allocator, now_ms: i64) !void {
-        const pending = &self.pending_write.?;
-        if (pending.progress_ms == 0) pending.progress_ms = now_ms;
-        const idle_ms = now_ms - pending.progress_ms;
-        if (idle_ms < write_stall_ms) return;
-        if (!self.writeCommandSubmitted()) return self.finishWrite(gpa, 1);
-
-        if (pending.client) |c| {
-            try ipc.appendMessage(gpa, &c.write_buf, .Ack, &[_]u8{1});
-            c.has_pending_output = true;
-            pending.client = null;
-        }
+        if (now_ms >= self.pending_write.?.deadline_ms) try self.finishWrite(gpa, 1);
     }
 
-    /// Follow a pending write through the shell's output: stream the file
-    /// after READY, answer the client after DONE.
+    /// Acknowledge only the completion marker for this submitted write.
     fn scanWriteMarkers(self: *Daemon, gpa: std.mem.Allocator, data: []const u8) !void {
         const pending = if (self.pending_write) |*p| p else return;
-        const op = self.operations.items[0];
-        if (op.kind != .file_write or op.offset != op.data.len) return;
+        if (!pending.submitted) return;
 
         var scan_buf: [PendingWrite.carry_max + 4096]u8 = undefined;
         @memcpy(scan_buf[0..pending.carry_len], pending.carry[0..pending.carry_len]);
         @memcpy(scan_buf[pending.carry_len..][0..data.len], data);
-        var rest: []const u8 = scan_buf[0 .. pending.carry_len + data.len];
-
-        if (!pending.streaming) {
-            if (std.mem.indexOf(u8, rest, write_ready_marker)) |i| {
-                rest = rest[i + write_ready_marker.len ..];
-                pending.streaming = true;
-                pending.progress_ms = 0;
-            }
-        }
-
-        // DONE also comes without READY when the file can't be created.
-        if (std.mem.indexOf(u8, rest, write_done_marker)) |i| {
-            const tail = rest[i + write_done_marker.len ..];
-            if (std.mem.indexOfAny(u8, tail, "\r\n")) |end| {
-                try self.finishWrite(gpa, std.fmt.parseInt(u8, tail[0..end], 10) catch 1);
+        const output = scan_buf[0 .. pending.carry_len + data.len];
+        var marker_buffer: [write_done_marker.len + @sizeOf(PendingWrite.Id) + 1]u8 = undefined;
+        const marker = std.fmt.bufPrint(&marker_buffer, "{s}{s}:", .{ write_done_marker, pending.id }) catch unreachable;
+        if (std.mem.indexOf(u8, output, marker)) |start| {
+            const status_line = output[start + marker.len ..];
+            if (std.mem.indexOfAny(u8, status_line, "\r\n")) |end| {
+                try self.finishWrite(gpa, std.fmt.parseInt(u8, status_line[0..end], 10) catch 1);
                 return;
             }
         }
 
-        pending.carry_len = @min(PendingWrite.carry_max, rest.len);
-        @memcpy(pending.carry[0..pending.carry_len], rest[rest.len - pending.carry_len ..]);
+        pending.carry_len = @min(PendingWrite.carry_max, output.len);
+        @memcpy(pending.carry[0..pending.carry_len], output[output.len - pending.carry_len ..]);
     }
 
     fn handleEnvGet(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {

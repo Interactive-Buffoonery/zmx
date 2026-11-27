@@ -418,6 +418,7 @@ def write_during_job(binary, root, env, clients):
     terminal.op(USER, size + b'printf "AFTER_%s" INTERRUPT\r')
     wait(lambda: history_contains(b'AFTER_INTERRUPT'))
     assert not destination.exists()
+    assert not list(Path(root).glob('.zmx-write-*')), 'canceled write left a staged payload'
 
 
 def passive_tail_completion(binary, root, env, clients):
@@ -440,6 +441,32 @@ def passive_tail_completion(binary, root, env, clients):
     assert tail.receive(13) == b'\x07'
 
 
+def write_during_shell_read(binary, root, env, clients):
+    def call(*args):
+        return subprocess.check_output([binary, *args], env=env, timeout=5)
+
+    def history_contains(marker):
+        return marker in call('history', 'regression')
+
+    call('run', 'regression', 'echo', 'shell-ready')
+    terminal = Client(root + '/regression'); clients.append(terminal)
+    terminal.attach(2)
+    writer = Client(root + '/regression'); clients.append(writer)
+    call('send', 'regression', 'printf "WAIT_%s\\n" READ; read -r value; printf "READ_%s\\n" DONE\r')
+    wait(lambda: history_contains(b'WAIT_READ'))
+
+    destination = Path(root, 'must-not-exist')
+    path = os.fsencode(destination)
+    writer.send(36, struct.pack('<I', len(path)) + path + b'file contents')
+    wait(lambda: history_contains(b'READ_DONE'))
+    size = struct.pack('<HH', 24, 80)
+    terminal.op(USER, size + b'printf "AFTER_%s\\n" READ\r')
+    wait(lambda: history_contains(b'AFTER_READ'))
+    assert not destination.exists()
+    staged = list(Path(root).glob('.zmx-write-*'))
+    assert len(staged) == 1 and staged[0].stat().st_mode & 0o777 == 0o600, staged
+
+
 def session_regression(binary, check):
     with tempfile.TemporaryDirectory(prefix='zmx-sync-regression-') as root:
         env = environment(root)
@@ -451,6 +478,7 @@ def session_regression(binary, check):
             for client in clients:
                 client.close()
             cleanup(binary, env, root)
+            wait(lambda: not list(Path(root).glob('.zmx-write-*')))
 
 
 if __name__ == '__main__':
@@ -465,7 +493,7 @@ if __name__ == '__main__':
                 report['scenarios'][kind] = pressure(binary) if kind == 'pressure' else scenario(binary, kind)
             except Exception as error:
                 report['scenarios'][kind] = dict(result='fail', error=repr(error))
-        for check in (write_during_job, passive_tail_completion):
+        for check in (write_during_job, passive_tail_completion, write_during_shell_read):
             try:
                 report['scenarios'][check.__name__] = session_regression(binary, check)
             except Exception as error:
