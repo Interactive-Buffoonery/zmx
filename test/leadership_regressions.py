@@ -107,6 +107,9 @@ def scenario(binary, kind):
                 payload = struct.pack('<I', len(destination)) + destination + content
                 a.send(12, payload)
                 a.receive(10)
+                a.send(36, struct.pack('<I', 1) + b'x' + b'small')
+                assert a.receive(10) == b'\x01', 'rejected synchronous write did not report failure'
+                assert not list(Path(root).glob('.zmx-write-*')), 'rejected write left a staged payload'
                 a.send(12, struct.pack('<I', 1) + b'x' + b'small')
                 assert a.sock.recv(1) == b'', 'rejected write was acknowledged'
                 os.kill(identity['pid'], 0)

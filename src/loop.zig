@@ -1898,7 +1898,13 @@ pub const Daemon = struct {
             "sh -c 'cat <\"$1\" >\"$2\";printf \"\\nZMX_WR\"\"ITE_DONE:%s:%s\\n\" \"$3\" \"$?\"' sh {s} {s} {s}\r",
             .{ staging_path, path, pending.id },
         );
-        try self.queueOperation(gpa, .{ .kind = .file_write, .data = command.written() });
+        self.queueOperation(gpa, .{ .kind = .file_write, .data = command.written() }) catch |err| {
+            if (err != error.InputQueueFull) return err;
+            try ipc.appendMessage(gpa, &client.write_buf, .Ack, &[_]u8{1});
+            client.has_pending_output = true;
+            pending.deinit(gpa, self.io);
+            return;
+        };
         self.pending_write = pending;
         std.log.debug(
             "write command len={d} file_path={s}",
