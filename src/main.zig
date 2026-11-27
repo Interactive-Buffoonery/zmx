@@ -602,10 +602,10 @@ fn help(io: std.Io) !void {
         \\    zmx print dev "$(printf '\\r\\nalert\\r\\n')"
         \\
         \\Write:
-        \\  Writes stdin to file_path inside the session. Works over SSH.
+        \\  Writes stdin to file_path once the session shell is in the foreground.
+        \\  Over SSH, run zmx write on the host running the destination session.
         \\  file_path can be absolute or relative to the session shell's cwd.
         \\  Requires sh, stty, head and base64 in the remote environment.
-        \\  File path must not contain single quotes.
         \\
         \\  Examples:
         \\    echo "hello" | zmx write dev /tmp/hello.txt

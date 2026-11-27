@@ -388,7 +388,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
         });
 
         var pty_events: i16 = lib_posix.POLL.IN;
-        if (daemon.hasWritableOperations()) {
+        if (daemon.hasWritableOperations(pty_fd, &term)) {
             pty_events |= lib_posix.POLL.OUT;
         }
         try poll_fds.append(gpa, .{
@@ -538,9 +538,10 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
 
                             std.log.info("task completed exit_code={d}", .{exit_code});
 
-                            // Notify connected clients
+                            // A passive tail may be behind on output, but it
+                            // still needs the one terminal task notification.
                             for (daemon.clients.items) |c| {
-                                if (!c.receivesOutput()) continue;
+                                if (!c.wants_output and c.has_request) continue;
                                 ipc.appendMessage(gpa, &c.write_buf, .TaskComplete, &[_]u8{exit_code}) catch {};
                                 c.has_pending_output = true;
                             }
@@ -787,8 +788,6 @@ const write_ready_marker = "ZMX_WRITE_READY";
 const write_done_marker = "ZMX_WRITE_DONE:";
 const write_status_busy = 255;
 const write_stall_ms = 60 * 1000;
-// A full-screen app may have eaten the command, so READY never comes.
-const write_abandon_ms = 10 * 60 * 1000;
 
 /// A `zmx write` waiting on the shell in the session.
 const PendingWrite = struct {
@@ -938,7 +937,10 @@ pub const Daemon = struct {
         }
         self.dropSource(gpa, client.attachment_id);
         if (self.pending_write) |*pending| {
-            if (pending.client == client) pending.client = null;
+            if (pending.client == client) {
+                pending.client = null;
+                if (!self.writeCommandSubmitted()) self.finishWrite(gpa, 1) catch {};
+            }
         }
         client.deinit(gpa);
         gpa.destroy(client);
@@ -1246,7 +1248,12 @@ pub const Daemon = struct {
     }
 
     fn queueOperation(self: *Daemon, gpa: std.mem.Allocator, value: Operation) !void {
-        return self.queueOperationLimit(gpa, value, PTY_WRITE_BUF_MAX);
+        try self.queueOperationLimit(gpa, value, PTY_WRITE_BUF_MAX);
+        if ((value.kind == .user or value.kind == .takeover) and
+            self.pending_write != null and !self.writeCommandSubmitted())
+        {
+            try self.finishWrite(gpa, 1);
+        }
     }
 
     fn queueOperationLimit(self: *Daemon, gpa: std.mem.Allocator, value: Operation, limit: usize) !void {
@@ -1334,10 +1341,23 @@ pub const Daemon = struct {
         }
     }
 
-    fn hasWritableOperations(self: *const Daemon) bool {
+    fn writeCommandSubmitted(self: *const Daemon) bool {
         if (self.operations.items.len == 0) return false;
         const op = self.operations.items[0];
-        if (op.kind != .file_write or op.offset < op.data.len) return true;
+        return op.kind == .file_write and op.offset != 0;
+    }
+
+    fn canSubmitWrite(self: *const Daemon, fd: i32, term: *const ghostty_vt.Terminal) bool {
+        // A foreground job or alternate-screen app may leave the helper unread.
+        return term.screens.active_key == .primary and cross.tcgetpgrp(fd) == self.pid;
+    }
+
+    fn hasWritableOperations(self: *const Daemon, fd: i32, term: *const ghostty_vt.Terminal) bool {
+        if (self.operations.items.len == 0) return false;
+        const op = self.operations.items[0];
+        if (op.kind != .file_write) return true;
+        if (op.offset == 0) return self.canSubmitWrite(fd, term);
+        if (op.offset < op.data.len) return true;
         const pending = self.pending_write.?;
         return pending.streaming and !pending.stream_failed and pending.offset < pending.encoded.len;
     }
@@ -1345,6 +1365,7 @@ pub const Daemon = struct {
     fn flushOperations(self: *Daemon, gpa: std.mem.Allocator, fd: i32, term: *ghostty_vt.Terminal) !void {
         while (self.operations.items.len > 0) {
             const op = &self.operations.items[0];
+            if (op.kind == .file_write and op.offset == 0 and !self.canSubmitWrite(fd, term)) return;
             var source: ?*Client = null;
             for (self.clients.items) |c| {
                 if (c.attachment_id == op.source and c.revision == op.revision and c.role != .watch) source = c;
@@ -1916,22 +1937,19 @@ pub const Daemon = struct {
         }
     }
 
-    /// Give up on a write the shell stopped answering.
+    /// Time out the caller. Keep the input barrier if any command bytes were submitted.
     fn checkWriteDeadline(self: *Daemon, gpa: std.mem.Allocator, now_ms: i64) !void {
         const pending = &self.pending_write.?;
         if (pending.progress_ms == 0) pending.progress_ms = now_ms;
         const idle_ms = now_ms - pending.progress_ms;
+        if (idle_ms < write_stall_ms) return;
+        if (!self.writeCommandSubmitted()) return self.finishWrite(gpa, 1);
 
-        if (idle_ms >= write_stall_ms) {
-            if (pending.client) |c| {
-                try ipc.appendMessage(gpa, &c.write_buf, .Ack, &[_]u8{1});
-                c.has_pending_output = true;
-                pending.client = null;
-            }
+        if (pending.client) |c| {
+            try ipc.appendMessage(gpa, &c.write_buf, .Ack, &[_]u8{1});
+            c.has_pending_output = true;
+            pending.client = null;
         }
-        // A stalled stream may still own stdin. Sending later input would
-        // corrupt the file. Keep the barrier until DONE or session exit.
-        if (!pending.streaming and idle_ms >= write_abandon_ms) try self.finishWrite(gpa, 1);
     }
 
     /// Follow a pending write through the shell's output: stream the file

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Socket regressions for #827; kernel geometry is sampled independently of reads."""
-import fcntl, hashlib, json, os, signal, struct, subprocess, sys, tempfile, threading, time, tty
+import fcntl, hashlib, json, os, signal, socket, struct, subprocess, sys, tempfile, threading, time, tty
 from pathlib import Path
 from leadership import Client, HEADER, USER, SIZE, TAKE, STATE, DOWN, REPLY, environment, wait, read_receipts
 import termios
@@ -391,6 +391,68 @@ def pressure(binary):
             cleanup(binary, env, root)
 
 
+def write_during_job(binary, root, env, clients):
+    def call(*args):
+        return subprocess.check_output([binary, *args], env=env, timeout=5)
+
+    def history_contains(marker):
+        return marker in call('history', 'regression')
+
+    call('run', 'regression', 'echo', 'shell-ready')
+    wait(lambda: history_contains(b'shell-ready'))
+    terminal = Client(root + '/regression'); clients.append(terminal)
+    terminal.attach(2)
+    writer = Client(root + '/regression'); clients.append(writer)
+    call('send', 'regression', "sh -c 'printf BUSY_%s READY; exec sleep 30'\r")
+    wait(lambda: history_contains(b'BUSY_READY'))
+
+    destination = Path(root, 'must-not-exist')
+    path = os.fsencode(destination)
+    writer.send(36, struct.pack('<I', len(path)) + path + b'file contents')
+    writer.send(18)
+    writer.receive(21)
+    size = struct.pack('<HH', 24, 80)
+    terminal.op(TAKE, size)
+    terminal.op(USER, size + b'\x03')
+    assert writer.receive(10) == b'\x01', 'file write was not canceled by terminal input'
+    terminal.op(USER, size + b'printf "AFTER_%s" INTERRUPT\r')
+    wait(lambda: history_contains(b'AFTER_INTERRUPT'))
+    assert not destination.exists()
+
+
+def passive_tail_completion(binary, root, env, clients):
+    release = Path(root, 'release')
+    subprocess.run([
+        binary, 'run', 'regression', '-d', '/bin/sh', '-c',
+        'while [ ! -f "$1" ]; do sleep .02; done; exit 7',
+        'sh', str(release),
+    ], env=env, capture_output=True, check=True, timeout=5)
+    tail = Client(root + '/regression'); clients.append(tail)
+    tail.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    publisher = Client(root + '/regression'); clients.append(publisher)
+    # Fill the passive client's backlog without involving shell throughput.
+    publisher.send(1, b'\0' * 1048576)
+    publisher.send(18)
+    publisher.receive(21)
+    release.touch()
+    completed = subprocess.run([binary, 'wait', 'regression'], env=env, capture_output=True, timeout=10)
+    assert completed.returncode == 7, completed
+    assert tail.receive(13) == b'\x07'
+
+
+def session_regression(binary, check):
+    with tempfile.TemporaryDirectory(prefix='zmx-sync-regression-') as root:
+        env = environment(root)
+        clients = []
+        try:
+            check(binary, root, env, clients)
+            return dict(result='pass')
+        finally:
+            for client in clients:
+                client.close()
+            cleanup(binary, env, root)
+
+
 if __name__ == '__main__':
     if sys.argv[1] == '--fixture':
         fixture(sys.argv[2])
@@ -403,6 +465,11 @@ if __name__ == '__main__':
                 report['scenarios'][kind] = pressure(binary) if kind == 'pressure' else scenario(binary, kind)
             except Exception as error:
                 report['scenarios'][kind] = dict(result='fail', error=repr(error))
+        for check in (write_during_job, passive_tail_completion):
+            try:
+                report['scenarios'][check.__name__] = session_regression(binary, check)
+            except Exception as error:
+                report['scenarios'][check.__name__] = dict(result='fail', error=repr(error))
         Path(sys.argv[2]).write_text(json.dumps(report, indent=2) + '\n')
         print(json.dumps(report, indent=2))
         sys.exit(any(r['result'] != 'pass' for r in report['scenarios'].values()))

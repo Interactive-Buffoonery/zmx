@@ -247,16 +247,33 @@ fn canUnwrapViewport(term: *const ghostty_vt.Terminal, client_cols: u16) bool {
     const pages = &term.screens.active.pages;
     var rows = pages.rowIterator(.right_down, .{ .active = .{ .x = 0, .y = 0 } }, null);
     var previous_wrap = false;
+    var previous_wide_spacer = false;
     while (rows.next()) |pin| {
         const page = pin.node.page();
         const row = pin.rowAndCell().row;
-        const cells = page.getCells(row);
+        const cells = page.getCells(row)[0..pages.cols];
         if (row.wrap_continuation != previous_wrap) return false;
-        // An erased cell at the join needs an explicit row break. A CUF
-        // emitted before an auto-wrap would otherwise move on the prior row.
         if (previous_wrap and !cells[0].hasText()) return false;
-        if (row.wrap and cells[pages.cols - 1].isEmpty()) return false;
+        if (previous_wide_spacer and cells[0].wide != .wide) return false;
         previous_wrap = row.wrap;
+        previous_wide_spacer = false;
+        if (!row.wrap) continue;
+
+        // The replay needs a printed glyph at the wrap edge. Erasure and
+        // cursor movement (including colored blanks) cannot set pending wrap.
+        previous_wide_spacer = cells[cells.len - 1].wide == .spacer_head;
+        const end = cells.len - @intFromBool(previous_wide_spacer);
+        if (end == 0) return false;
+        const edge = cells[end - 1];
+        switch (edge.wide) {
+            .narrow => if (!edge.hasText()) return false,
+            .spacer_tail => {
+                if (end < 2) return false;
+                const glyph = cells[end - 2];
+                if (glyph.wide != .wide or !glyph.hasText()) return false;
+            },
+            .wide, .spacer_head => return false,
+        }
     }
     return !previous_wrap;
 }
