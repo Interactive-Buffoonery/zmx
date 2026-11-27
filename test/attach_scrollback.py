@@ -291,6 +291,9 @@ def main(binary):
         for name, rows, cols, payload in [
             ('stale', 6, 20, b'\x1b[6G\x1b[12Gabcdefghijk\x1b[2K\x1b[2Kabcdefghijkl\r\nEND'),
             ('blank', 6, 20, b'123456789012345678901\x1b[1;1H\x1b[2K\x1b[3;1HEND'),
+            ('colored-wrap-edge', 6, 5, b'ABCDEf\x1b[1;5H\x1b[41m\x1b[@\x1b[0m\x1b[4;1HEND'),
+            ('wide-wrap-edge', 6, 5, 'abc界f\r\nEND'.encode()),
+            ('wide-wrap-spacer', 6, 5, 'abcd界f\r\nEND'.encode()),
         ]:
             start(name, payload, rows, cols)
             c = Client(root, name)

@@ -42,6 +42,7 @@ pub const AttachOptions = struct {
 
 pub const RunOptions = struct {
     detached: bool = false,
+    vt: bool = false,
     cwd: ?[]const u8 = null,
     shell: ?[]const u8 = null,
     stdin_bytes: ?[]const u8 = null,
@@ -473,11 +474,35 @@ pub fn killResolved(alloc: Allocator, io: Io, sesh: []const u8, opts: KillOption
     return .killed;
 }
 
+fn skipCommandEcho(bytes: []const u8, first_line: *bool) []const u8 {
+    if (!first_line.*) return bytes;
+    const nl = std.mem.indexOfScalar(u8, bytes, '\n') orelse return bytes[bytes.len..];
+    first_line.* = false;
+    return bytes[nl + 1 ..];
+}
+
+test "command echo split across reads" {
+    const input = "make; echo ZMX_TASK_COMPLETED:abcd:$?\r\n\x1b[33mwarning\x1b[0m\r\n";
+    const expected = "\x1b[33mwarning\x1b[0m\r\n";
+    for (1..input.len + 1) |chunk_size| {
+        var first_line = true;
+        var output: std.ArrayList(u8) = .empty;
+        defer output.deinit(std.testing.allocator);
+        var offset: usize = 0;
+        while (offset < input.len) {
+            const end = @min(offset + chunk_size, input.len);
+            try output.appendSlice(std.testing.allocator, skipCommandEcho(input[offset..end], &first_line));
+            offset = end;
+        }
+        try std.testing.expectEqualStrings(expected, output.items);
+    }
+}
+
 fn tailInternal(
     alloc: Allocator,
     client_socket_fds: []const i32,
     detached: bool,
-    is_run_cmd: bool,
+    mode: enum { tail, run, run_vt },
     writer: ?*Io.Writer,
 ) !u8 {
     var poll_fds = try std.ArrayList(lib_posix.pollfd).initCapacity(alloc, client_socket_fds.len + 1);
@@ -543,24 +568,18 @@ fn tailInternal(
                         .Output => {
                             if (msg.payload.len > 0) {
                                 var payload = msg.payload;
-                                if (!detached and is_run_cmd and is_first_line) {
-                                    if (std.mem.indexOfScalar(u8, payload, '\n')) |nl| {
-                                        is_first_line = false;
-                                        payload = payload[nl + 1 ..];
-                                    } else {
-                                        is_first_line = false;
-                                        payload = payload[payload.len..];
-                                    }
+                                if (!detached and mode != .tail) {
+                                    payload = skipCommandEcho(payload, &is_first_line);
                                 }
 
                                 if (payload.len > 0) {
-                                    const plain = util.stripAnsi(alloc, payload) catch continue;
-                                    defer alloc.free(plain);
-                                    if (plain.len > 0) {
+                                    const output = if (mode == .run_vt) payload else util.stripAnsi(alloc, payload) catch continue;
+                                    defer if (mode != .run_vt) alloc.free(output);
+                                    if (output.len > 0) {
                                         if (writer) |w| {
-                                            try w.writeAll(plain);
+                                            try w.writeAll(output);
                                         } else {
-                                            try out_buf.appendSlice(alloc, plain);
+                                            try out_buf.appendSlice(alloc, output);
                                         }
                                     }
                                 }
@@ -681,7 +700,7 @@ pub fn run(
     };
 
     const fds = [_]i32{client_sock};
-    return tailInternal(alloc, &fds, opts.detached, true, opts.output_writer);
+    return tailInternal(alloc, &fds, opts.detached, if (opts.vt) .run_vt else .run, opts.output_writer);
 }
 
 /// Wait for one or more task-mode sessions to complete and return aggregate exit code.
@@ -801,9 +820,10 @@ pub fn tail(alloc: Allocator, io: Io, names: []const []const u8, writer: ?*Io.Wr
         defer alloc.free(socket_path);
         const sock = try socket.sessionConnect(socket_path);
         try fds.append(alloc, sock);
+        try ipc.send(sock, .Tail, "");
     }
 
-    return tailInternal(alloc, fds.items, false, false, writer);
+    return tailInternal(alloc, fds.items, false, .tail, writer);
 }
 
 /// Send raw input bytes to a session's PTY (fire-and-forget, like `zmx send`).
@@ -888,7 +908,7 @@ pub fn write(alloc: Allocator, io: Io, name: []const u8, remote_path: []const u8
     try wire_buf.appendSlice(alloc, remote_path);
     try wire_buf.appendSlice(alloc, content);
 
-    ipc.send(result.fd, .Write, wire_buf.items) catch |err| switch (err) {
+    ipc.send(result.fd, .WriteSync, wire_buf.items) catch |err| switch (err) {
         error.BrokenPipe, error.ConnectionResetByPeer => return,
         else => return err,
     };
@@ -896,13 +916,25 @@ pub fn write(alloc: Allocator, io: Io, name: []const u8, remote_path: []const u8
     var sb = try ipc.SocketBuffer.init(alloc);
     defer sb.deinit();
 
-    const n = sb.read(result.fd) catch return error.ReadFailed;
-    if (n == 0) return error.ConnectionClosed;
+    // Older daemons only acknowledge queue admission. Retry with the legacy
+    // request only when the daemon explicitly rejects the new tag.
+    var using_legacy_write = false;
+    while (true) {
+        const n = sb.read(result.fd) catch return error.ReadFailed;
+        if (n == 0) return error.ConnectionClosed;
 
-    while (sb.next()) |msg| {
-        if (msg.header.tag == .Ack) return;
+        while (sb.next()) |msg| {
+            if (msg.header.tag == .Unsupported and !using_legacy_write) {
+                try ipc.send(result.fd, .Write, wire_buf.items);
+                using_legacy_write = true;
+                continue;
+            }
+            if (msg.header.tag != .Ack) continue;
+            if (msg.payload.len == 0 or msg.payload[0] == 0) return;
+            if (msg.payload[0] == 255) return error.WriteAlreadyRunning;
+            return error.WriteFailed;
+        }
     }
-    return error.NoAckReceived;
 }
 
 /// Fetch session scrollback with optional row count.

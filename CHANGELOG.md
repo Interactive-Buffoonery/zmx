@@ -4,11 +4,23 @@ Use spec: https://common-changelog.org/
 
 ## Staged
 
+- Keep soft-wrapped lines wrapped when replaying a session on attach, so they reflow when the client is resized instead of staying cut at the old width
+
+### Added
+
+- `zmx run <name> --vt` preserves terminal escape sequences in the command output
+
+## v1.0.2 - 2026-11-24
+
 ### Fixed
 
+- Default an empty `TERM` to `xterm-256color` when starting a session
 - Allow Ctrl C, SIGTERM, and SIGHUP to stop the client while `zmx attach` moves its terminal to another session
 - Prevent daemon shutdown crashes caused by freeing the caller-owned socket path with a different allocator
 - Stop applying a switching client's original `--labels` and command to the session it switches to ([#319](https://github.com/neurosnap/zmx/issues/319))
+- Stop rewriting OSC `133;A` prompt marks, which left duplicate multi-line prompts after a resize ([#326](https://github.com/neurosnap/zmx/issues/326))
+- `zmx write` race condition causing output to be written during canonical mode gets cut-off
+- Subscribe clients to output before broadcasting
 
 # v1.0.1 - 2026-11-06
 
